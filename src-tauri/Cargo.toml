@@ -50,6 +50,13 @@ windows-sys = { version = "0.61", features = ["Win32_UI_Input_KeyboardAndMouse"]
 async-trait = "0.1"
 which = "7"
 tokio = { version = "1", features = ["process", "sync", "rt", "macros", "time"] }
+# Task 13: conversation model — `Conversation::created_at` is a
+# `chrono::DateTime<chrono::Utc>` so persisted conversations carry a
+# human-readable, timezone-aware timestamp (Task 14 db / Task 15 chat read
+# it back). chrono is already a transitive dep via Tauri (see Cargo.lock,
+# 0.4.x); promoted to a direct dep with `serde` so `Conversation` derives
+# `Serialize`/`Deserialize` and round-trips through the persistence layer.
+chrono = { version = "0.4", features = ["serde"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

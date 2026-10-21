@@ -31,6 +31,16 @@ pub mod opencode;
 // heaviest backend; the testable pure surface is `handle_event` + the
 // request builders + `extract_session_id` (no subprocess).
 pub mod codex;
+// Task 13: conversation model + session resume / history replay. Owns
+// the persisted types (`StoredMessage`, `Conversation`), the
+// `resume_or_replay` decision (resume via the agent-native
+// `session_id` when present, else embed the history as a context-prefixed
+// prompt), and `run_turn` — which drives one turn through a `Backend`
+// while buffering the full message stream into an `Arc<Mutex<Vec<...>>>`
+// so the panel hiding mid-stream (dropping its receivers) does NOT drop
+// the backend's turn (Review Focus #3). Task 14 (db) + Task 15 (chat)
+// consume these types.
+pub mod conversation;
 
 use std::collections::HashMap;
 use std::fmt;
