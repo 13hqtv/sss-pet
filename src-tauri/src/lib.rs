@@ -2,6 +2,11 @@ mod config;
 pub mod state;
 mod tray;
 mod window;
+// Task 6: pure-Rust idle detection + follow-activity throttle. Not wired
+// into the Tauri app yet — Task 7 will poll `activity::idle_since()` and
+// drive `timers::FollowActivityThrottle` from the activity-poll thread.
+pub mod activity;
+pub mod timers;
 
 use tauri::Manager;
 
