@@ -1,0 +1,121 @@
+/* Task 7 — per-state styling + animations for the desktop pet.
+ *
+ * ONLY state-standby and state-thinking animate (light keyframes).
+ * state-sleep, state-has-something, state-needs-you are NEAR-STATIC:
+ *
+ *   state-sleep has NO keyframe animation at all (Review Focus #1:
+ *   idle CPU ≈ 0 when asleep — no rAF, no CSS animation loop). The
+ *   Rust tick loop (brain.rs) emits `pet_state` only on state change,
+ *   so the webview receives zero events while the pet stays asleep —
+ *   no re-renders, no animation frames. The structural guarantee
+ *   (no CSS `animation` property on `.state-sleep`) is the other half.
+ *
+ *   state-has-something and state-needs-you are also static (a colored
+ *   filter tint signals the state; no motion). The `!`/`?` glyphs are
+ *   fixed `<text>` elements, not animated.
+ *
+ * The activity-nudge is a one-shot 1s wiggle (not a loop) layered on
+ * top of whatever state is active. Suppressed when asleep by the JS
+ * handler (which checks `state === "Sleep"` before setting the flag).
+ * The throttle also suppresses nudges while idle > 3min (AWAY_THRESHOLD),
+ * so by the time the pet sleeps (5min) nudges are already off.
+ */
+
+/* ---------------------------------------------------------------------------
+ * Sleep — dimmed, NO animation (no @keyframes, no `animation` property).
+ * --------------------------------------------------------------------------- */
+.robot.state-sleep {
+  opacity: 0.5;
+  filter: drop-shadow(0 2px 3px rgba(15, 23, 42, 0.2));
+}
+
+/* ---------------------------------------------------------------------------
+ * Standby — slow blink (~4s cycle). Eyes scale Y to ~0.1 briefly.
+ * This is the ONLY idle animation on the awake pet; very light.
+ * --------------------------------------------------------------------------- */
+@keyframes standby-blink {
+  0%,
+  90%,
+  100% {
+    transform: scaleY(1);
+  }
+  94% {
+    transform: scaleY(0.1);
+  }
+}
+
+.robot.state-standby .eye {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: standby-blink 4s ease-in-out infinite;
+}
+
+/* ---------------------------------------------------------------------------
+ * Thinking — cog spins (2s linear loop). The gear above the head rotates.
+ * --------------------------------------------------------------------------- */
+@keyframes thinking-cog-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.robot.state-thinking .cog {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: thinking-cog-spin 2s linear infinite;
+}
+
+/* ---------------------------------------------------------------------------
+ * HasSomething — static. A warm tint signals "perked up"; the `!` glyph
+ * is a fixed `<text>`. No @keyframes.
+ * --------------------------------------------------------------------------- */
+.robot.state-has-something {
+  filter: drop-shadow(0 2px 4px rgba(250, 204, 21, 0.5));
+}
+
+/* ---------------------------------------------------------------------------
+ * NeedsYou — static. A red tint signals "needs attention"; the `?` glyph
+ * is a fixed `<text>`. No @keyframes.
+ * --------------------------------------------------------------------------- */
+.robot.state-needs-you {
+  filter: drop-shadow(0 2px 4px rgba(239, 68, 68, 0.5));
+}
+
+/* ---------------------------------------------------------------------------
+ * Activity nudge — a one-shot ~1s wiggle layered on top of any state.
+ * NOT infinite: runs once for 1s (matching the JS timeout that clears
+ * the flag). The JS handler does not set the flag when asleep, so this
+ * animation never fires during sleep.
+ *
+ * Re-triggering: the JS toggles `nudgeActivity` true (class added →
+ * animation runs) then false after 1s (class removed). The next nudge
+ * re-adds the class. Two nudges within 1s are moot — the throttle
+ * spaces them ≥15min apart.
+ * --------------------------------------------------------------------------- */
+@keyframes activity-nudge-wiggle {
+  0% {
+    transform: rotate(0deg);
+  }
+  20% {
+    transform: rotate(-8deg);
+  }
+  40% {
+    transform: rotate(6deg);
+  }
+  60% {
+    transform: rotate(-4deg);
+  }
+  80% {
+    transform: rotate(2deg);
+  }
+  100% {
+    transform: rotate(0deg);
+  }
+}
+
+.robot.activity-nudge {
+  animation: activity-nudge-wiggle 1s ease-in-out;
+}

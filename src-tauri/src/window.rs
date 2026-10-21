@@ -103,7 +103,13 @@ const PET_MARGIN_PX: i32 = 8;
 static PET_VISIBLE: AtomicBool = AtomicBool::new(true);
 
 /// Whether the pet overlay window is currently visible, per [`PET_VISIBLE`].
-fn pet_is_visible() -> bool {
+///
+/// `pub(crate)` so the Task 7 brain tick loop (`brain.rs`) can gate its
+/// work on pet visibility — same pattern as the click-through poller: when
+/// the pet is hidden, the brain skips its tick (no state machine work, no
+/// emit) and just sleeps at [`TICK_INTERVAL`] cadence until the pet
+/// reappears.
+pub(crate) fn pet_is_visible() -> bool {
     PET_VISIBLE.load(Ordering::Acquire)
 }
 

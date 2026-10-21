@@ -63,16 +63,85 @@
   // the very start of the mousedown handler (no await) so it lands before
   // Tauri's drag-region listener takes over in the common case; if it loses
   // the ordering race, the backstops above still clear it on drag end.
+  //
+  // ## Task 7 — pet state rendering (5 states + sleep=static + activity nudge)
+  //
+  // The Rust "brain" tick loop (`brain.rs`) drives the state machine from
+  // live idle time and emits two events to this window:
+  //   - `pet_state`       — the new `PetState` (serialized as the variant
+  //                         name string: "Sleep"/"Standby"/"Thinking"/
+  //                         "HasSomething"/"NeedsYou"). Emitted only on
+  //                         change, so zero events while the state is stable.
+  //   - `pet_activity_nudge` — a transient "glance" event from the follow-
+  //                         activity throttle (≥15min spacing). Does NOT
+  //                         change the state; just plays a 1s wiggle.
+  //
+  // This component subscribes to both, switches a CSS state class on the
+  // SVG root, and renders per-state face/decoration elements (5 poses).
+  // ONLY state-standby (slow blink) and state-thinking (cog spin) animate;
+  // state-sleep has NO keyframe at all (Review Focus #1: idle CPU ≈ 0 when
+  // asleep). The activity-nudge is a one-shot 1s wiggle layered on top,
+  // suppressed when asleep (both in JS and by the throttle's away-
+  // threshold, which kicks in at 3min idle, before the 5min sleep boundary).
+  //
+  // A dev-only `dev_trigger_state` Tauri command (in `lib.rs`) can inject
+  // `ReminderDue`/`Error`/`AgentBusy`/`Dismissed`/`PanelOpened` signals to
+  // verify the `!`/`?`/thinking poses without the real agent/reminder wiring.
 
   import { invoke } from "@tauri-apps/api/core";
   import { getCurrentWindow } from "@tauri-apps/api/window";
+  import { listen } from "@tauri-apps/api/event";
+  import { onMount } from "svelte";
+  import "./states.css";
 
-  // Brief visual nudge when the robot is clicked — proves it received the
-  // click. `nudge` toggles a CSS transform for ~100ms. Kept for the click
-  // (non-drag) path; a drag does not nudge.
+  // ---------------------------------------------------------------------------
+  // Task 7: pet state + activity nudge.
+  // ---------------------------------------------------------------------------
+
+  /// The 5 pet states, as serialized by Rust's `PetState` (serde → variant
+  /// name string). Default "Standby" until the first `pet_state` event.
+  type PetStateName =
+    | "Sleep"
+    | "Standby"
+    | "Thinking"
+    | "HasSomething"
+    | "NeedsYou";
+
+  let state = $state<PetStateName>("Standby");
+
+  /// Map a serialized `PetState` string to the CSS class that drives the
+  /// per-state styling + animation (or lack thereof) in `states.css`.
+  /// Falls back to `state-standby` if an unknown string arrives (defensive
+  /// — shouldn't happen, but a future Rust variant added without updating
+  /// this map should not break the pet).
+  const STATE_CLASS: Record<PetStateName, string> = {
+    Sleep: "state-sleep",
+    Standby: "state-standby",
+    Thinking: "state-thinking",
+    HasSomething: "state-has-something",
+    NeedsYou: "state-needs-you",
+  };
+
+  /// The CSS class for the current state. `state-standby` is the default
+  /// and also the fallback for any unknown state string.
+  let stateClass = $derived(STATE_CLASS[state] ?? "state-standby");
+
+  /// Brief visual nudge when the robot is clicked — proves it received the
+  /// click. `nudge` toggles a CSS transform for ~100ms. Kept for the click
+  /// (non-drag) path; a drag does not nudge.
+  /// Task 2 carry: `nudgeTimer` is now cleared on component destroy (see
+  /// `onMount` cleanup below) — previously it leaked on unmount.
   let nudge = $state(false);
   let nudgeTimer: ReturnType<typeof setTimeout> | null = null;
 
+  /// Activity-nudge flag from the follow-activity throttle (Rust
+  /// `pet_activity_nudge` event). Plays a ~1s wiggle WITHOUT changing the
+  /// state class. Only set when the pet is awake (asleep pet ignores
+  /// nudges — respect quiet, Review Focus #1).
+  let nudgeActivity = $state(false);
+  let nudgeActivityTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // ---------------------------------------------------------------------------
   // Drag tracking state. `dragStart` records the pet's outer position at
   // mousedown; `dragArmed` tracks whether a drag is in-flight (so the
   // window-level mouseup/pointerup + safety timeout + blur backstop can all
@@ -80,9 +149,80 @@
   // DRAGGING flag and — if the pet moved more than 2px — invokes
   // `save_pet_pos`. Plain `let` (not `$state`) because none of these are
   // read by the template — they're only touched in event handlers.
+  // ---------------------------------------------------------------------------
   let dragStart: { x: number; y: number } | null = null;
   let dragArmed = false;
   let dragSafetyTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // ---------------------------------------------------------------------------
+  // Tauri event listeners + cleanup (Task 7).
+  //
+  // `onMount` subscribes to `pet_state` and `pet_activity_nudge`. Returns a
+  // cleanup function that unlistens + clears all pending timers (nudge,
+  // nudgeActivity, dragSafety). This closes the Task 2 carry "nudgeTimer
+  // leaks on unmount" and ensures no dangling setTimeout fires after the
+  // component tears down.
+  //
+  // `listen` is async (returns a Promise<UnlistenFn>); we guard against the
+  // race where the component unmounts before the promises resolve by
+  // tracking a `cancelled` flag — if unmounted, we immediately unlisten
+  // the just-resolved handle.
+  // ---------------------------------------------------------------------------
+  onMount(() => {
+    let cancelled = false;
+    // Stash the unlisten handles; null until the promises resolve.
+    let unlistenState: (() => void) | null = null;
+    let unlistenNudge: (() => void) | null = null;
+
+    listen<PetStateName>("pet_state", (e) => {
+      state = e.payload;
+    }).then((u) => {
+      if (cancelled) {
+        u();
+        return;
+      }
+      unlistenState = u;
+    });
+
+    listen("pet_activity_nudge", () => {
+      // Respect quiet: asleep pet ignores nudges (Review Focus #1).
+      // The throttle also suppresses nudges while idle > 3min, so this
+      // double-check is defense-in-depth (the pet transitions to Sleep
+      // at 5min, and 3 < 5, so by the time we're asleep the throttle
+      // already stopped firing — but the frontend doesn't trust the
+      // backend's timing).
+      if (state === "Sleep") return;
+      if (nudgeActivityTimer) clearTimeout(nudgeActivityTimer);
+      nudgeActivity = true;
+      nudgeActivityTimer = setTimeout(() => {
+        nudgeActivity = false;
+        nudgeActivityTimer = null;
+      }, 1000);
+    }).then((u) => {
+      if (cancelled) {
+        u();
+        return;
+      }
+      unlistenNudge = u;
+    });
+
+    return () => {
+      cancelled = true;
+      unlistenState?.();
+      unlistenNudge?.();
+      // Clear all pending timers so the component can tear down without a
+      // dangling setTimeout firing after destroy. (Task 2 carry: the
+      // click-nudge `nudgeTimer` previously leaked here.)
+      if (nudgeTimer) {
+        clearTimeout(nudgeTimer);
+        nudgeTimer = null;
+      }
+      if (nudgeActivityTimer) {
+        clearTimeout(nudgeActivityTimer);
+        nudgeActivityTimer = null;
+      }
+    };
+  });
 
   // The single funnel for "drag end". Idempotent: the first call does the
   // work, subsequent calls (e.g. mouseup + pointerup + safety timeout all
@@ -268,74 +408,155 @@
 </script>
 
 <main class="pet">
-  {#snippet robot()}
-    <!--
-      待命 (standby) pose: antenna up, eyes open, alert. One static pose.
-      Task 7 will branch this into per-state variants; `data-pose` tags the
-      current pose for that future work. No state machinery here (YAGNI).
+  <!--
+    The robot SVG. `data-tauri-drag-region` on the root makes Tauri call
+    `start_dragging` on mousedown, so grabbing the robot body drags the pet
+    window. The click-through poller keeps ignore=false while the cursor is
+    on the robot, so the mousedown reaches us. We pair it with our own
+    onmousedown to (a) pin the Rust-side DRAGGING flag and (b) record the
+    drag start position. The drag-end (DRAGGING release + save_pet_pos /
+    click-vs-drag) is handled by WINDOW-level mouseup/pointerup + blur
+    listeners registered in the $effect above.
 
-      `data-tauri-drag-region` makes Tauri call start_dragging on mousedown,
-      so grabbing the robot body drags the pet window. The click-through
-      poller keeps ignore=false while the cursor is on the robot, so the
-      mousedown reaches us. We pair it with our own onmousedown to (a) pin
-      the Rust-side DRAGGING flag and (b) record the drag start position.
-      The drag-end (DRAGGING release + save_pet_pos / click-vs-drag) is
-      handled by WINDOW-level mouseup/pointerup + blur listeners registered
-      in the $effect above — NOT by an element-level onmouseup, because the
-      OS modal drag loop can swallow the element-level mouseup on Windows.
-      See the DRAGGING-clear guarantee comment in <script> for the full
-      rationale.
-    -->
-    <svg
-      class="robot"
-      class:nudge
-      data-pose="standby"
-      data-tauri-drag-region
-      viewBox="0 0 96 96"
-      width="96"
-      height="96"
-      role="button"
-      tabindex="0"
-      aria-label="桌面宠物机器人 · 待命"
-      onmousedown={onRobotMouseDown}
-      onkeydown={onRobotKeydown}
-    >
-      <!-- antenna -->
-      <line x1="48" y1="10" x2="48" y2="22" stroke="#334155" stroke-width="2.5"
+    Task 7: the SVG root carries the per-state CSS class (`stateClass`)
+    which drives styling + animation (or lack thereof) from `states.css`.
+    Only state-standby (blink) and state-thinking (cog spin) animate;
+    state-sleep has NO keyframe (idle CPU ≈ 0). The `activity-nudge` class
+    is layered on top for the one-shot 1s wiggle.
+
+    The shared body (antenna, ears, head, status LED) is always rendered;
+    the face/decoration branch per-state below.
+  -->
+  <svg
+    class="robot {stateClass}"
+    class:nudge
+    class:activity-nudge={nudgeActivity}
+    data-tauri-drag-region
+    viewBox="0 0 96 96"
+    width="96"
+    height="96"
+    role="button"
+    tabindex="0"
+    aria-label="桌面宠物机器人 · {state}"
+    onmousedown={onRobotMouseDown}
+    onkeydown={onRobotKeydown}
+  >
+    <!-- ============ shared body (all states) ============ -->
+
+    <!-- antenna -->
+    <line x1="48" y1="10" x2="48" y2="22" stroke="#334155" stroke-width="2.5"
+      stroke-linecap="round" />
+    <circle cx="48" cy="7" r="4" fill="#22d3ee" />
+
+    <!-- ears -->
+    <rect x="9" y="36" width="7" height="18" rx="3.5" fill="#94a3b8" />
+    <rect x="80" y="36" width="7" height="18" rx="3.5" fill="#94a3b8" />
+
+    <!-- head -->
+    <rect
+      x="15"
+      y="22"
+      width="66"
+      height="54"
+      rx="16"
+      fill="#e2e8f0"
+      stroke="#334155"
+      stroke-width="2.5"
+    />
+
+    <!-- ============ per-state face + decoration ============ -->
+
+    {#if state === "Sleep"}
+      <!--
+        Sleep: dimmed (CSS opacity), eyes closed (short lines), slight
+        frown mouth, Zzz floating above. NO animation (states.css has no
+        keyframe for .state-sleep — Review Focus #1: idle CPU ≈ 0).
+      -->
+      <!-- closed eyes (horizontal lines) -->
+      <line x1="29" y1="46" x2="43" y2="46" stroke="#0f172a" stroke-width="2.5"
         stroke-linecap="round" />
-      <circle cx="48" cy="7" r="4" fill="#22d3ee" />
+      <line x1="53" y1="46" x2="67" y2="46" stroke="#0f172a" stroke-width="2.5"
+        stroke-linecap="round" />
+      <!-- slight frown mouth -->
+      <path d="M 36 64 Q 48 60 60 64" stroke="#0f172a" stroke-width="2.5"
+        fill="none" stroke-linecap="round" />
+      <!-- Zzz text (floating, no animation) -->
+      <text x="68" y="14" font-size="10" fill="#64748b" font-family="system-ui"
+        font-weight="600">Zzz</text>
 
-      <!-- ears -->
-      <rect x="9" y="36" width="7" height="18" rx="3.5" fill="#94a3b8" />
-      <rect x="80" y="36" width="7" height="18" rx="3.5" fill="#94a3b8" />
+    {:else if state === "Thinking"}
+      <!--
+        Thinking: eyes looking up (pupils shifted), spinning cog above head
+        (class="cog" — animated by states.css @keyframes thinking-cog-spin).
+        The cog is the ONLY animated element in this state.
+      -->
+      <!-- eyes with pupils looking up -->
+      <circle cx="36" cy="46" r="6.5" fill="#f8fafc" stroke="#0f172a" stroke-width="1.5" />
+      <circle cx="60" cy="46" r="6.5" fill="#f8fafc" stroke="#0f172a" stroke-width="1.5" />
+      <circle cx="36" cy="43" r="3" fill="#0f172a" />
+      <circle cx="60" cy="43" r="3" fill="#0f172a" />
+      <!-- mouth (thinking: small circle, "o") -->
+      <circle cx="48" cy="64" r="3" fill="#0f172a" />
+      <!-- spinning cog above head -->
+      <g class="cog" transform="translate(48 14)">
+        <circle cx="0" cy="0" r="5" fill="none" stroke="#64748b" stroke-width="1.5" />
+        <rect x="-1" y="-7" width="2" height="4" fill="#64748b" />
+        <rect x="-1" y="3" width="2" height="4" fill="#64748b" />
+        <rect x="-7" y="-1" width="4" height="2" fill="#64748b" />
+        <rect x="3" y="-1" width="4" height="2" fill="#64748b" />
+      </g>
 
-      <!-- head -->
-      <rect
-        x="15"
-        y="22"
-        width="66"
-        height="54"
-        rx="16"
-        fill="#e2e8f0"
-        stroke="#334155"
-        stroke-width="2.5"
-      />
+    {:else if state === "HasSomething"}
+      <!--
+        HasSomething: perked up, wide eyes, open mouth (O), `!` above head
+        (amber). Static — no animation (states.css has no keyframe).
+      -->
+      <!-- wide eyes -->
+      <circle cx="36" cy="46" r="7" fill="#0f172a" />
+      <circle cx="60" cy="46" r="7" fill="#0f172a" />
+      <circle cx="38" cy="44" r="2.2" fill="#f8fafc" />
+      <circle cx="62" cy="44" r="2.2" fill="#f8fafc" />
+      <!-- open mouth (surprise circle) -->
+      <circle cx="48" cy="64" r="4" fill="#0f172a" />
+      <!-- `!` above head (amber) -->
+      <text x="44" y="14" font-size="14" fill="#f59e0b" font-family="system-ui"
+        font-weight="700">!</text>
 
-      <!-- eyes (open / alert) -->
-      <circle cx="36" cy="46" r="6.5" fill="#0f172a" />
-      <circle cx="60" cy="46" r="6.5" fill="#0f172a" />
+    {:else if state === "NeedsYou"}
+      <!--
+        NeedsYou: forward-looking eyes (pupils centered, "looking at
+        you"), `?` above head (red). Static — no animation.
+      -->
+      <!-- eyes looking forward (centered pupils) -->
+      <circle cx="36" cy="46" r="6.5" fill="#f8fafc" stroke="#0f172a" stroke-width="1.5" />
+      <circle cx="60" cy="46" r="6.5" fill="#f8fafc" stroke="#0f172a" stroke-width="1.5" />
+      <circle cx="36" cy="46" r="3" fill="#0f172a" />
+      <circle cx="60" cy="46" r="3" fill="#0f172a" />
+      <!-- mouth (slight frown, uncertain) -->
+      <path d="M 38 64 Q 48 62 58 64" stroke="#0f172a" stroke-width="2.5"
+        fill="none" stroke-linecap="round" />
+      <!-- `?` above head (red) -->
+      <text x="43" y="15" font-size="14" fill="#ef4444" font-family="system-ui"
+        font-weight="700">?</text>
+
+    {:else}
+      <!--
+        Standby (default): alert, eyes open with highlights, neutral
+        mouth bar. Slow blink animated by states.css
+        (@keyframes standby-blink on .eye elements).
+      -->
+      <!-- eyes (open / alert) — class="eye" for the blink animation -->
+      <circle class="eye" cx="36" cy="46" r="6.5" fill="#0f172a" />
+      <circle class="eye" cx="60" cy="46" r="6.5" fill="#0f172a" />
       <circle cx="38" cy="44" r="2" fill="#f8fafc" />
       <circle cx="62" cy="44" r="2" fill="#f8fafc" />
-
       <!-- mouth (neutral alert bar) -->
       <rect x="34" y="62" width="28" height="4.5" rx="2.25" fill="#0f172a" />
+    {/if}
 
-      <!-- status LED -->
-      <circle cx="72" cy="32" r="3" fill="#34d399" />
-    </svg>
-  {/snippet}
-
-  {@render robot()}
+    <!-- status LED (shared, always rendered; green for OK states) -->
+    <circle cx="72" cy="32" r="3" fill="#34d399" />
+  </svg>
 </main>
 
 <style>
@@ -360,7 +581,9 @@
     /* Only the robot itself is a DOM click/drag target. */
     pointer-events: auto;
     cursor: pointer;
-    /* Subtle drop shadow so the bot reads against any backdrop. */
+    /* Subtle drop shadow so the bot reads against any backdrop.
+       Per-state tints (sleep dim, has-something amber, needs-you red) are
+       applied in states.css, overriding this base. */
     filter: drop-shadow(0 2px 3px rgba(15, 23, 42, 0.35));
     transition: transform 90ms ease-out;
     will-change: transform;

@@ -7,8 +7,19 @@ mod window;
 // drive `timers::FollowActivityThrottle` from the activity-poll thread.
 pub mod activity;
 pub mod timers;
+// Task 7: the "pet brain" — a 1Hz tick loop that feeds live idle time
+// into the state machine, runs the HasSomething auto-clear timer, fires
+// the follow-activity nudge via the throttle, and emits `pet_state` /
+// `pet_activity_nudge` to the pet webview. Spawned from `setup` below.
+mod brain;
 
-use tauri::Manager;
+use std::sync::Mutex;
+use std::time::Instant;
+
+use tauri::{Emitter, Manager};
+
+use brain::{BrainState, PetBrain};
+use state::machine::Signal;
 
 /// Toggle click-through on the pet overlay window from the frontend.
 ///
@@ -47,6 +58,51 @@ fn open_panel_above_pet(app: tauri::AppHandle) -> Result<(), String> {
     window::open_panel_above_pet(&app)
 }
 
+/// Dev-only hook (Task 7) to manually trigger a state for visual
+/// verification of the `!`/`?`/thinking poses without waiting for the
+/// real agent/reminder wiring (Tasks 9+/16). Accepts a `target` string
+/// and applies the corresponding [`Signal`] to the [`PetBrain`]'s state
+/// machine, then emits the resulting [`PetState`] immediately (so the
+/// frontend updates without waiting for the next 1s tick).
+///
+/// Recognized `target` values:
+/// - `"has-something"` → `Signal::ReminderDue` (perks up, `!`)
+/// - `"needs-you"` → `Signal::Error` (`?`, sticky until dismissed)
+/// - `"thinking"` → `Signal::AgentBusy` (cog spins)
+/// - `"dismissed"` → `Signal::Dismissed` (clears `?`)
+/// - `"panel"` → `Signal::PanelOpened` (clears `!`)
+///
+/// **NOT for production** — this is a verification affordance for Task 7.
+/// Later tasks that wire the real signals will naturally make this
+/// obsolete (and it can be feature-gated or removed then).
+#[tauri::command]
+fn dev_trigger_state(app: tauri::AppHandle, target: String) -> Result<(), String> {
+    // `app.state::<BrainState>()` returns `State<'_, Mutex<PetBrain>>`
+    // which derefs to `&Mutex<PetBrain>`; `&*` recovers the reference.
+    let brain = &*app.state::<BrainState>();
+    let new_state = {
+        let mut guard = brain
+            .lock()
+            .map_err(|e| format!("PetBrain mutex poisoned: {e}"))?;
+        let signal = match target.as_str() {
+            "has-something" => Signal::ReminderDue,
+            "needs-you" => Signal::Error,
+            "thinking" => Signal::AgentBusy,
+            "dismissed" => Signal::Dismissed,
+            "panel" => Signal::PanelOpened,
+            other => return Err(format!("unknown dev target: {other}")),
+        };
+        // Apply the signal and mark it as already-emitted so the tick
+        // loop doesn't double-emit on its next tick.
+        guard.apply_and_stage_emit(signal)
+    };
+    // Emit immediately so the frontend updates without waiting for the
+    // next 1s tick. Best-effort — errors are surfaced to the caller.
+    app.emit_to("pet", "pet_state", new_state)
+        .map_err(|e| format!("emit pet_state failed: {e}"))?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -63,6 +119,11 @@ pub fn run() {
             config::load_window_state,
             config::load_pet_pos,
             config::load_panel_state,
+            // Task 7 dev-only hook for manually triggering pet states
+            // (has-something / needs-you / thinking / dismissed / panel)
+            // to verify the SVG/CSS poses without the real agent/reminder
+            // wiring (Tasks 9+/16). Obsolete once those land; remove then.
+            dev_trigger_state,
         ])
         .setup(|app| {
             // Default the pet overlay to click-through (pass-through) so the
@@ -85,6 +146,18 @@ pub fn run() {
                     let _ = pet.set_position(tauri::PhysicalPosition::new(x, y));
                 }
             }
+            // Task 7: manage the PetBrain (state machine + follow-activity
+            // throttle + HasSomething auto-clear timer) as Tauri state so
+            // the tick thread and the dev_trigger_state command share one
+            // Mutex-guarded instance. Constructed at `now` so the throttle's
+            // first reaction is ≥ 15min after launch (no startup burst).
+            app.manage(Mutex::new(PetBrain::new(Instant::now())));
+            // Task 7: spawn the brain tick loop (1Hz std::thread). Reads
+            // idle time each tick, drives the state machine, fires the
+            // follow-activity nudge, and emits `pet_state` / `pet_activity_
+            // nudge` to the pet webview. Gated on pet visibility (skips
+            // while hidden). Named `pet-brain-tick` for debugging.
+            brain::spawn_brain_tick(app.app_handle().clone());
             // Background cursor poll that flips the pet window out of
             // click-through when the cursor is over the robot, and back to
             // pass-through when it leaves. Runs in Rust because the frontend

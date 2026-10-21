@@ -40,6 +40,7 @@
 //! least-surprising reading of the design doc's "`!`/`?` 清除规则":
 //! sticky states stay until the explicit clearing signal arrives.
 
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 /// Idle threshold that transitions the pet from `Standby` to `Sleep`.
@@ -55,7 +56,14 @@ pub const SLEEP_AFTER: Duration = Duration::from_secs(5 * 60);
 ///
 /// Variants are ordered loosely by "escalation" for readability, not for
 /// `PartialOrd` semantics (the derive is `Eq`, not `Ord`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Serialize` is derived (Task 7) so the tick loop can emit the current
+/// state to the pet webview via `app.emit_to("pet", "pet_state", state)`;
+/// serde serializes each unit variant as its bare name string (`"Sleep"`,
+/// `"Standby"`, etc.), which the frontend maps to a CSS state class.
+/// `Deserialize` is derived for symmetry (future tasks may round-trip the
+/// state through a command boundary).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PetState {
     /// Asleep: dimmed, head down, `Zzz`. Static frame — no animation loop
     /// (idle CPU ≈ 0). Reached after [`SLEEP_AFTER`] of inactivity or when
@@ -132,6 +140,13 @@ pub enum Signal {
     /// The user dismissed the current `?`. Clears `NeedsYou` → `Standby`
     /// (or `Sleep` if focus is on or the last idle was long).
     Dismissed,
+    /// The Task 7 auto-clear timer fired (5s after entering `HasSomething`
+    /// without a [`Signal::PanelOpened`]). Clears `HasSomething` →
+    /// `Standby`; no-op for every other state. The timer only runs while
+    /// the machine is in `HasSomething`, but the arm is defensive: if it
+    /// fires late (after a transition already moved the state), it
+    /// doesn't clobber the new state.
+    HasSomethingExpired,
 }
 
 /// The desktop pet state machine. Holds the current [`PetState`], the
@@ -245,6 +260,18 @@ impl StateMachine {
                 }
             }
 
+            // HasSomethingExpired: the Task 7 auto-clear timer (5s TTL in
+            // brain.rs) fired. Clears HasSomething → Standby only; no-op
+            // for every other state (the timer only runs while in
+            // HasSomething, but defensive against a late fire after a
+            // transition). Under focus the current state is never
+            // HasSomething, so the `!self.focus` guard is defensive.
+            Signal::HasSomethingExpired => {
+                if !self.focus && self.current == PetState::HasSomething {
+                    self.current = PetState::Standby;
+                }
+            }
+
             // IdleFor: always remember the latest duration (used on
             // FocusMode(false) resume), then transition — but only if not
             // in a sticky state and not under focus.
@@ -334,5 +361,45 @@ mod tests {
         m.apply(Signal::Error);
         assert_eq!(m.current(), PetState::NeedsYou);
         assert_eq!(m.apply(Signal::Dismissed), PetState::Standby);
+    }
+
+    // Task 7: HasSomethingExpired auto-clears HasSomething → Standby,
+    // and is a no-op for every other state (including under focus).
+    #[test]
+    fn has_something_expired_clears_to_standby() {
+        let mut m = StateMachine::new();
+        // Enter HasSomething via ReminderDue.
+        m.apply(Signal::ReminderDue);
+        assert_eq!(m.current(), PetState::HasSomething);
+        // Auto-clear fires → Standby.
+        assert_eq!(m.apply(Signal::HasSomethingExpired), PetState::Standby);
+        // No-op when not in HasSomething.
+        assert_eq!(m.apply(Signal::HasSomethingExpired), PetState::Standby);
+        // No-op for other non-HasSomething states: Thinking.
+        m.apply(Signal::AgentBusy);
+        assert_eq!(m.current(), PetState::Thinking);
+        assert_eq!(m.apply(Signal::HasSomethingExpired), PetState::Thinking);
+        // No-op under focus (focus forces Sleep; HasSomethingExpired
+        // doesn't override it).
+        m.apply(Signal::FocusMode(true));
+        assert_eq!(m.current(), PetState::Sleep);
+        assert_eq!(m.apply(Signal::HasSomethingExpired), PetState::Sleep);
+    }
+
+    // Task 7 (Review Focus #1): 20 consecutive IdleFor(SLEEP_AFTER+1)
+    // ticks drive the machine to Sleep and it stays there. The "no
+    // animation" half of sleep=static is enforced structurally — the
+    // frontend sleep CSS has no keyframe, and the tick loop emits
+    // `pet_state` only on change (so zero events while asleep). This
+    // test asserts the state-machine half: after 20 long-idle ticks
+    // the machine is in Sleep and did not wander.
+    #[test]
+    fn sleep_is_static_after_idle_ticks() {
+        let mut m = StateMachine::new();
+        let long_idle = SLEEP_AFTER + Duration::from_secs(1);
+        for _ in 0..20 {
+            m.apply(Signal::IdleFor(long_idle));
+        }
+        assert_eq!(m.current(), PetState::Sleep);
     }
 }
