@@ -577,6 +577,20 @@ pub fn reminder_delete(conn: &Connection, id: i64) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Mark a reminder as fired (sets `fired = 1`). Called by Task 16's
+/// reminder scheduler after it has delivered the toast + applied
+/// `Signal::ReminderDue` to the brain — so the scheduler doesn't
+/// re-fire the same reminder on the next tick. Idempotent: re-marking
+/// an already-fired reminder is a no-op (the UPDATE just writes the
+/// same value).
+pub fn reminder_mark_fired(conn: &Connection, id: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE reminders SET fired = 1 WHERE id = ?1",
+        rusqlite::params![id],
+    )?;
+    Ok(())
+}
+
 // ===========================================================================
 // Pet state log (Task 7/16)
 // ===========================================================================

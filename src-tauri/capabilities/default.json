@@ -5,6 +5,7 @@
   "windows": ["pet", "panel"],
   "permissions": [
     "core:default",
-    "opener:default"
+    "opener:default",
+    "notification:default"
   ]
 }

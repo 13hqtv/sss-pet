@@ -18,10 +18,16 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-# `tray-icon` enables `tauri::tray::{TrayIconBuilder, TrayIconEvent, ...}` used by
-# `tray.rs` (Task 3 — system tray + context menu + left-click behavior).
+# Tauri plugins.
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
+# Task 16: Windows toast notifications for due reminders. The plugin
+# wraps the WinRT `ToastNotificationManager` (and registers the
+# AppUserModelID under Tauri's identifier) so a background tokio task
+# can fire a toast via `app.notification().builder()…show()` without
+# the app needing to do its own AUMID registration. Used by
+# `notify::toast` (a thin wrapper the reminder scheduler calls).
+tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Cross-platform global cursor query. Used by window.rs's click-through poller

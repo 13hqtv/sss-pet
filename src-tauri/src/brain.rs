@@ -46,7 +46,7 @@
 //!
 //! [`HasSomething`]: crate::state::machine::PetState::HasSomething
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -173,17 +173,68 @@ impl PetBrain {
         self.last_emitted = new_state;
         new_state
     }
+
+    /// Apply a signal to the state machine WITHOUT staging an emit.
+    /// Used by Task 16 paths that want the tick loop to observe + emit
+    /// the new state on its next 1s tick (rather than emitting it
+    /// immediately from outside the tick loop):
+    ///
+    /// - The reminder scheduler applies `Signal::ReminderDue` here so
+    ///   the brain enters `HasSomething`; the tick loop emits
+    ///   `pet_state` on its next tick (1s latency is fine for a `!`
+    ///   alert — the toast already gave the immediate feedback).
+    /// - The focus / 勿扰 toggle from `config.focus.enabled` applies
+    ///   `Signal::FocusMode(bool)` here on startup + on settings
+    ///   change; the tick loop emits the resulting `Sleep`/`Standby`.
+    ///
+    /// The tick loop's `last_emitted` diff logic handles the emit: when
+    /// `current()` differs from `last_emitted` on the next tick, it
+    /// emits + advances. So this helper just runs the transition.
+    ///
+    /// Also keeps `has_since` in sync (same rule as
+    /// [`Self::apply_and_stage_emit`]): start the TTL clock on
+    /// `HasSomething` entry, clear it on exit.
+    pub fn apply_signal(&mut self, signal: Signal) -> PetState {
+        let new_state = self.machine.apply(signal);
+        if new_state == PetState::HasSomething {
+            if self.has_since.is_none() {
+                self.has_since = Some(Instant::now());
+            }
+        } else {
+            self.has_since = None;
+        }
+        // NOTE: do NOT advance `last_emitted` here — let the tick loop
+        // observe the diff and emit. If we advanced, a transition
+        // applied between ticks would never be emitted (the diff would
+        // be zero on the next tick).
+        new_state
+    }
 }
 
-/// Managed Tauri state: a `Mutex`-wrapped [`PetBrain`]. Held via
-/// `app.manage(Mutex::new(PetBrain::new(now)))` in `lib.rs::setup`,
-/// retrieved in the tick thread via `app.state::<BrainState>()` and
-/// in the `dev_trigger_state` command via the same path.
+/// Managed Tauri state: an `Arc<Mutex>`-wrapped [`PetBrain`]. Held via
+/// `app.manage(Arc::new(Mutex::new(PetBrain::new(now))))` in
+/// `lib.rs::setup`, retrieved in the tick thread via
+/// `app.state::<BrainState>()` and in the `dev_trigger_state` /
+/// `dismiss_pet_alert` / `apply_focus_to_brain` commands via the same
+/// path.
 ///
-/// `Mutex<PetBrain>` is `Send + Sync + 'static` because `PetBrain` is
-/// `Send` (its `FollowActivityThrottle` holds a `Box<dyn FnMut + Send>`,
-/// which is `Send` but not `Sync` — exactly what `Mutex` requires).
-pub type BrainState = Mutex<PetBrain>;
+/// `Arc<Mutex<PetBrain>>` (Task 16 wrap): the reminder scheduler's
+/// spawned tokio task needs to OWN a brain handle (it outlives any
+/// single Tauri command call — the task runs for the process's
+/// lifetime). The previous `Mutex<PetBrain>` wasn't `Clone`, so the
+/// spawn couldn't get its own handle without re-managing. Wrapping in
+/// `Arc` lets `lib.rs::setup` clone the Arc into the spawn AND keep
+/// the same single `Mutex<PetBrain>` (one brain, two holders). The
+/// `State<'_, Arc<Mutex<PetBrain>>>` from `app.state` derefs through
+/// `Arc` to `&Mutex<PetBrain>` transparently, so the existing
+/// `brain.lock()` call sites in `tick` / `dev_trigger_state` /
+/// `dismiss_pet_alert` / `apply_focus_to_brain` work unchanged.
+///
+/// `Arc<Mutex<PetBrain>>` is `Send + Sync + 'static` because
+/// `PetBrain` is `Send` (its `FollowActivityThrottle` holds a
+/// `Box<dyn FnMut + Send>`, which is `Send` but not `Sync` — exactly
+/// what `Mutex` requires).
+pub type BrainState = Arc<Mutex<PetBrain>>;
 
 /// Run one brain tick. Pure of I/O except for the two `emit_to` calls
 /// (best-effort — errors are logged to stderr, not propagated, so a

@@ -273,11 +273,11 @@ pub fn load_history(
 /// returns immediately. The frontend then receives `chat_message` +
 /// `chat_result` events (dispatched by conv_id via `stream.ts`).
 ///
-/// `cwd` is the current working directory the agent CLI is spawned in
-/// (so file tools resolve relative to the project). We use
-/// `std::env::current_dir()` for now — the design spec leaves a
-/// "project_dir" config field for a future tightening (Task 14's
-/// `Config` doesn't carry one yet).
+/// `cwd` is the working directory the agent CLI is spawned in (so
+/// file tools resolve relative to the project). Task 16 carry: read
+/// from `config::resolve_agent_cwd()` so the user-pinned 工作目录
+/// (SettingsView) takes precedence over the process's cwd (which is
+/// the exe dir — usually NOT where the user's project lives).
 #[tauri::command]
 pub async fn chat_send(
     app: tauri::AppHandle,
@@ -286,7 +286,7 @@ pub async fn chat_send(
     prompt: String,
     provider: String,
 ) -> Result<(), String> {
-    let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
+    let cwd = crate::config::resolve_agent_cwd();
     let cfg = BackendConfig::default();
     let backend = agent::new(&provider, cfg).map_err(|e| format!("agent::new({provider}): {e}"))?;
     // The emit closure: wraps `app.emit(event, payload)`. Captures the

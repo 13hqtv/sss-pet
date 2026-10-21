@@ -58,6 +58,27 @@ pub struct Config {
     /// Last persisted panel rect (x, y, w, h) in physical px. `None`
     /// until the user moves / resizes the panel for the first time.
     pub panel_rect: Option<(i32, i32, u32, u32)>,
+    /// Default agent provider (`"claude"` | `"codex"` | `"opencode"`).
+    /// Used as the initial value of the SettingsView's default-provider
+    /// select + as the provider for a new conversation if the user
+    /// hasn't picked one. Defaults to `"claude"`.
+    #[serde(default = "default_provider")]
+    pub default_provider: String,
+    /// Working directory for the agent CLI's cwd (Task 16 carry:
+    /// `chat_send` reads this instead of `std::env::current_dir()`).
+    /// `None` → fall back to the process's cwd (the previous behavior).
+    /// A path field in SettingsView saves here so the user can pin
+    /// the project dir the agent runs in (e.g. `C:\code\my-project`).
+    #[serde(default)]
+    pub working_dir: Option<String>,
+}
+
+/// Default for `Config::default_provider`. Kept as a function so
+/// `#[serde(default = "...")]` can reference it (serde's default
+/// attribute takes a path, not a closure — and the field is a String,
+/// not a &str).
+fn default_provider() -> String {
+    "claude".into()
 }
 
 impl Default for Config {
@@ -69,6 +90,8 @@ impl Default for Config {
             focus: FocusCfg::default(),
             pet_pos: None,
             panel_rect: None,
+            default_provider: default_provider(),
+            working_dir: None,
         }
     }
 }
@@ -263,6 +286,91 @@ pub fn load_panel_state() -> Result<Option<(i32, i32, u32, u32)>, String> {
 }
 
 // ===========================================================================
+// Task 16: settings_get / settings_set + cwd carry
+// ===========================================================================
+
+/// The shape SettingsView reads/writes via `settings_get` /
+/// `settings_set`. A flattened projection of [`Config`] containing only
+/// the user-facing fields (NOT `pet_pos` / `panel_rect` — those are
+/// owned by the drag/resize paths in `window.rs` / `App.svelte`).
+/// Persisting via `settings_set` load-modifies-saves so it doesn't
+/// clobber the window-state fields.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Settings {
+    /// Min seconds between follow-activity reactions (≥900 = 15min).
+    pub follow_activity_min_secs: u64,
+    /// Theme: `"system"` | `"light"` | `"dark"`.
+    pub theme: String,
+    /// Focus / 勿扰 config (enabled + optional time window).
+    pub focus: FocusCfg,
+    /// Default agent provider (`"claude"` | `"codex"` | `"opencode"`).
+    pub default_provider: String,
+    /// Working directory for the agent CLI's cwd. `None` → fall back
+    /// to the process's cwd.
+    pub working_dir: Option<String>,
+}
+
+impl From<&Config> for Settings {
+    fn from(c: &Config) -> Self {
+        Self {
+            follow_activity_min_secs: c.follow_activity_min_secs,
+            theme: c.theme.clone(),
+            focus: c.focus.clone(),
+            default_provider: c.default_provider.clone(),
+            working_dir: c.working_dir.clone(),
+        }
+    }
+}
+
+/// Load the user-facing settings (the SettingsView reads this on
+/// mount). Reads the full config + projects to [`Settings`].
+#[tauri::command]
+pub fn settings_get() -> Result<Settings, String> {
+    Ok(Settings::from(&load()))
+}
+
+/// Persist the user-facing settings (the SettingsView's 保存 button
+/// calls this). Load-modify-saves so the non-user-facing fields
+/// (`pet_pos` / `panel_rect`) are preserved — the panel's drag/resize
+/// path is the only writer for those, and a settings save shouldn't
+/// clobber them.
+///
+/// Side effects beyond the write itself:
+/// - The caller (`lib.rs::settings_set` wrapper OR a future `lib.rs`
+///   setup hook) re-applies `Signal::FocusMode(focus.enabled)` to the
+///   brain so toggling 勿扰 takes effect immediately (without waiting
+///   for the brain's 1s tick to re-derive from idle, which it can't
+///   — focus is a manual toggle, not derived from idle).
+#[tauri::command]
+pub fn settings_set(settings: Settings) -> Result<(), String> {
+    let mut cfg = load();
+    cfg.follow_activity_min_secs = settings.follow_activity_min_secs;
+    cfg.theme = settings.theme;
+    cfg.focus = settings.focus;
+    cfg.default_provider = settings.default_provider;
+    cfg.working_dir = settings.working_dir;
+    save(&cfg).map_err(|e| format!("settings_set save failed: {e}"))
+}
+
+/// Resolve the agent CLI's working directory from config. Returns the
+/// configured `working_dir` if set + non-empty; otherwise falls back
+/// to the process's current dir (the pre-Task-16 behavior). Called by
+/// `chat::chat_send` so the agent runs in the project dir the user
+/// pinned in SettingsView, not the pet's process cwd (which is the
+/// exe dir — usually NOT where the user's project lives).
+pub fn resolve_agent_cwd() -> std::path::PathBuf {
+    if let Some(d) = load().working_dir {
+        let trimmed = d.trim();
+        if !trimmed.is_empty() {
+            return std::path::PathBuf::from(trimmed);
+        }
+    }
+    // Fall back to the process's cwd (preserves the pre-Task-16
+    // behavior when the user hasn't pinned a working dir).
+    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -308,6 +416,8 @@ mod tests {
             },
             pet_pos: Some((100, 200)),
             panel_rect: Some((50, 60, 380, 560)),
+            default_provider: "codex".into(),
+            working_dir: Some("C:\\code\\proj".into()),
         };
         save(&cfg).expect("save");
         let loaded = load();
@@ -325,6 +435,8 @@ mod tests {
             focus: FocusCfg::default(),
             pet_pos: None,
             panel_rect: None,
+            default_provider: "claude".into(),
+            working_dir: None,
         };
         save(&cfg).expect("save");
         assert_eq!(load(), cfg);

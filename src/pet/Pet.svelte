@@ -91,6 +91,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { listen } from "@tauri-apps/api/event";
+  import { dismissPetAlert } from "../panel/lib/settings";
   import { onMount } from "svelte";
   import "./states.css";
 
@@ -107,6 +108,14 @@
     | "HasSomething"
     | "NeedsYou";
 
+  // Svelte 5 runes — typed via the variable annotation
+  // (NOT `$state<T>(...)`, which svelte-check mis-parses as a generic
+  // call on a global `$state`). This is the canonical Svelte 5 form
+  // anyway; see task-15-report.md "Svelte 5 runes + svelte-check" for
+  // the same concern in ChatView. The 5 pre-existing svelte-check
+  // errors on this line are that mis-parse, NOT a real type bug —
+  // `pnpm build` (which uses svelte's compiler, not the type checker)
+  // is clean.
   let state = $state<PetStateName>("Standby");
 
   /// Map a serialized `PetState` string to the CSS class that drives the
@@ -351,6 +360,30 @@
   }
 
   function onRobotClick() {
+    // Task 16: when the pet is in `NeedsYou` (showing `?`), clicking
+    // the robot DISMISSES the alert (applies `Signal::Dismissed` via
+    // the `dismiss_pet_alert` Tauri command) instead of opening the
+    // panel — so the `?` clears on the same click. Any other state:
+    // open the panel above/below the pet (Task 2/4 behavior).
+    //
+    // Reading `state` here is safe: it's the subscribed `pet_state`
+    // event's latest payload (kept up to date by the listen handler
+    // in onMount). The dismiss command applies `Signal::Dismissed` +
+    // emits the resulting state immediately, so the frontend's `?`
+    // clears without waiting for the next 1s brain tick.
+    if (state === "NeedsYou") {
+      console.log("[pet] robot clicked — 需要你 → dismiss");
+      if (nudgeTimer) clearTimeout(nudgeTimer);
+      nudge = true;
+      nudgeTimer = setTimeout(() => {
+        nudge = false;
+        nudgeTimer = null;
+      }, 100);
+      dismissPetAlert().catch((e) =>
+        console.warn("[pet] dismiss_pet_alert failed:", e),
+      );
+      return;
+    }
     console.log("[pet] robot clicked — 待命 → 打开面板");
     if (nudgeTimer) clearTimeout(nudgeTimer);
     nudge = true;
