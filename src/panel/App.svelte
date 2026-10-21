@@ -1,25 +1,48 @@
 <script lang="ts">
-  // Task 4 placeholder panel UI with a draggable top bar.
+  // Task 15: panel tab shell. Task 4's draggable top bar STAYS at the
+  // very top (the bar's `data-tauri-drag-region` makes Tauri call
+  // `start_dragging` on mousedown anywhere in it, so the panel is
+  // movable by grabbing the bar). Below the bar, a pill-style tab
+  // strip switches between four views: 对话 (Task 15 ChatView),
+  // 代办 / 提醒 / 设置 (Task 16 placeholders).
   //
-  // Task 15 will build the real tab shell (conversation / todos / reminders
-  // / settings) below this top bar — for Task 4 only the bar itself is
-  // needed so the panel is draggable and so we can persist its rect on
-  // move/resize end.
+  // Persistence (Task 4, unchanged): `onMoved`/`onResized` fire on
+  // every tick of a drag/resize; we debounce by 200ms so the
+  // `save_panel_state` invoke only fires once the user has stopped
+  // moving (the brief says "on move/resize end"). Task 14 backed this
+  // with a real TOML file next to the exe (or %APPDATA% fallback) so
+  // the rect survives restarts.
   //
-  // Persistence: `onMoved`/`onResized` fire on every tick of a drag/resize;
-  // we debounce by 200ms so the `save_panel_state` invoke only fires once
-  // the user has stopped moving (the brief says "on move/resize end"). The
-  // store is in-memory (Task 4); Task 15 swaps it for a TOML file so the
-  // rect survives restarts. Within a session, Tauri's own hide/show
-  // already preserves the rect, so the in-memory copy is mostly for
-  // forward-compatibility — but the brief requires the wiring now.
-  //
-  // The bar is `data-tauri-drag-region` so Tauri's start_dragging handles
-  // the OS-level drag; we don't call startDragging ourselves. The bar's
-  // pointer cursor and slight gradient hint at "draggable" affordance.
+  // The bar is `data-tauri-drag-region` so Tauri's start_dragging
+  // handles the OS-level drag; we don't call startDragging ourselves.
 
   import { invoke } from "@tauri-apps/api/core";
   import { getCurrentWindow } from "@tauri-apps/api/window";
+
+  import ChatView from "./views/ChatView.svelte";
+  import TodosView from "./views/TodosView.svelte";
+  import RemindersView from "./views/RemindersView.svelte";
+  import SettingsView from "./views/SettingsView.svelte";
+
+  type TabId = "chat" | "todos" | "reminders" | "settings";
+
+  interface Tab {
+    id: TabId;
+    label: string;
+  }
+
+  const TABS: Tab[] = [
+    { id: "chat", label: "对话" },
+    { id: "todos", label: "代办" },
+    { id: "reminders", label: "提醒" },
+    { id: "settings", label: "设置" },
+  ];
+
+  // Active tab — defaults to 对话 (the main view). Svelte 5 runes:
+  // typed via the variable annotation (NOT `$state<T>(...)`, which
+  // svelte-check mis-parses — see task-15-report.md "Svelte 5 runes
+  // + svelte-check" concern).
+  let activeTab: TabId = $state("chat");
 
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -81,22 +104,50 @@
       }
     };
   });
+
+  function switchTab(id: TabId) {
+    activeTab = id;
+  }
 </script>
 
 <main class="panel">
   <!--
     Draggable top bar. `data-tauri-drag-region` makes Tauri call
-    start_dragging on mousedown anywhere in this bar, so the user can move
-    the panel by grabbing the bar. Task 15 will add the tab strip below
-    this bar (the bar stays).
+    start_dragging on mousedown anywhere in this bar, so the user can
+    move the panel by grabbing the bar. The bar stays at the very top
+    (Task 4); the Task 15 tab strip lives below it.
   -->
   <header class="dragbar" data-tauri-drag-region>
     <span class="title">桌面宠物</span>
   </header>
 
-  <!-- Placeholder body — Task 15 replaces this with the tab shell. -->
+  <!-- Pill-style tab strip. Each pill switches the active view below.
+       The strip is NOT a drag-region so the pills are clickable. -->
+  <nav class="tabs">
+    {#each TABS as tab (tab.id)}
+      <button
+        class="tab"
+        class:active={activeTab === tab.id}
+        onclick={() => switchTab(tab.id)}
+      >
+        {tab.label}
+      </button>
+    {/each}
+  </nav>
+
+  <!-- Active view fills the remaining space. Each view owns its own
+       layout (ChatView is a two-pane sidebar + main; the placeholders
+       are centered labels). -->
   <section class="body">
-    <p>面板占位</p>
+    {#if activeTab === "chat"}
+      <ChatView />
+    {:else if activeTab === "todos"}
+      <TodosView />
+    {:else if activeTab === "reminders"}
+      <RemindersView />
+    {:else if activeTab === "settings"}
+      <SettingsView />
+    {/if}
   </section>
 </main>
 
@@ -117,6 +168,7 @@
     /* A fixed-height bar that reads as a title strip. Tall enough to grab
        easily (~28px); short enough not to eat the body. */
     height: 28px;
+    flex: 0 0 28px;
     display: flex;
     align-items: center;
     padding: 0 12px;
@@ -144,17 +196,43 @@
     pointer-events: none;
   }
 
-  .body {
-    flex: 1;
-    padding: 1rem;
-    /* Body is not a drag-region so future widgets (buttons, inputs) work
-       normally. */
-    overflow: auto;
+  .tabs {
+    flex: 0 0 auto;
+    display: flex;
+    gap: 2px;
+    padding: 6px 8px;
+    background: #e2e8f0;
+    border-bottom: 1px solid #94a3b8;
   }
 
-  .body p {
-    margin: 0;
-    color: #64748b;
-    font-size: 0.9rem;
+  .tab {
+    padding: 4px 12px;
+    font-size: 0.8rem;
+    border: none;
+    border-radius: 12px;
+    background: transparent;
+    color: #475569;
+    cursor: pointer;
+    transition: background 0.1s, color 0.1s;
+  }
+
+  .tab:hover {
+    background: #cbd5e1;
+  }
+
+  .tab.active {
+    background: #2563eb;
+    color: white;
+  }
+
+  .body {
+    flex: 1;
+    min-height: 0;
+    /* Body is not a drag-region so the views' buttons / inputs work
+       normally. Each view manages its own overflow (ChatView scrolls
+       its message list internally). */
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
   }
 </style>

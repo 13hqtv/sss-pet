@@ -25,13 +25,19 @@ mod brain;
 // real agent calls yet.
 pub mod agent;
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use tauri::{Emitter, Manager};
 
 use brain::{BrainState, PetBrain};
 use state::machine::Signal;
+// Task 15: chat-turn controller — `run_chat_turn` core + the four
+// Tauri commands (`list_conversations`, `new_conversation`,
+// `load_history`, `chat_send`) the panel's ChatView consumes. Owns
+// the `chat_survives_hide` test (Review Focus #3 — run_chat_turn +
+// FakeBackend + no-op emit).
+pub mod chat;
 
 /// Toggle click-through on the pet overlay window from the frontend.
 ///
@@ -137,6 +143,16 @@ pub fn run() {
             // to verify the SVG/CSS poses without the real agent/reminder
             // wiring (Tasks 9+/16). Obsolete once those land; remove then.
             dev_trigger_state,
+            // Task 15: chat commands — `list_conversations` (sidebar),
+            // `new_conversation` (新建 button), `load_history` (select
+            // conversation), `chat_send` (composer send — kicks off
+            // `run_chat_turn` + spawns the stream-drain task). All four
+            // share a managed `Arc<Mutex<Connection>>` (opened + migrated
+            // in `setup` below — Task 14 db).
+            chat::list_conversations,
+            chat::new_conversation,
+            chat::load_history,
+            chat::chat_send,
         ])
         .setup(|app| {
             // Default the pet overlay to click-through (pass-through) so the
@@ -165,6 +181,33 @@ pub fn run() {
             // Mutex-guarded instance. Constructed at `now` so the throttle's
             // first reaction is ≥ 15min after launch (no startup burst).
             app.manage(Mutex::new(PetBrain::new(Instant::now())));
+            // Task 15: open + migrate the SQLite db at startup, manage it
+            // as `Arc<Mutex<Connection>>` so the four chat commands
+            // (`list_conversations` / `new_conversation` / `load_history`
+            // / `chat_send`) + the spawned stream-drain task (which calls
+            // `save_turn_record` on turn completion) all share one
+            // connection. Errors are surfaced (fail launch) because a
+            // desktop pet that can't persist conversations is useless;
+            // the portable + %APPDATA% fallback in `db::resolve_data_dir`
+            // makes a real failure here rare (Program Files → appdata).
+            //
+            // NB: a `Mutex<Connection>` is NOT a `tauri::async_runtime`
+            // blocking hazard because the chat commands hold the lock
+            // only for the duration of the synchronous rusqlite calls
+            // (list/load/save) — the long-running agent stream is driven
+            // in a spawned task that does NOT hold the lock while
+            // waiting on the backend (it only re-locks briefly to call
+            // `save_turn_record` on completion).
+            let conn = {
+                let mut c = db::open().map_err(|e| {
+                    format!("Task 15 db::open failed at setup: {e}")
+                })?;
+                db::migrate(&mut c).map_err(|e| {
+                    format!("Task 15 db::migrate failed at setup: {e}")
+                })?;
+                c
+            };
+            app.manage(Arc::new(Mutex::new(conn)));
             // Task 7: spawn the brain tick loop (1Hz std::thread). Reads
             // idle time each tick, drives the state machine, fires the
             // follow-activity nudge, and emits `pet_state` / `pet_activity_
