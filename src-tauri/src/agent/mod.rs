@@ -19,6 +19,11 @@ pub mod stream_json;
 // Claude Code CLI in stream-json mode, parses stdout via `stream_json`).
 // Owns the testable `drain_stream` pure-async line-draining helper.
 pub mod claude;
+// Task 11: opencode backend — `Backend` impl for `OpencodeBackend` (spawns the
+// opencode CLI in json-events mode, prompt via stdin, parsed via opencode's
+// own json event vocabulary — NOT stream_json, which is claude-specific).
+// Owns its testable `drain_stream` pure-async line-draining helper.
+pub mod opencode;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -223,23 +228,11 @@ pub struct CodexBackend {
     pub cfg: BackendConfig,
 }
 
-// `ClaudeBackend`'s `Backend` impl lives in `claude.rs` (Task 10) so the
-// stream-json line-draining + subprocess wiring stays colocated with its
-// tests. The struct itself remains defined here so the frozen factory
-// (`new`) and the re-exported name stay stable.
-
-#[async_trait]
-impl Backend for OpencodeBackend {
-    async fn execute(
-        &self,
-        _prompt: &str,
-        _opts: ExecOptions,
-    ) -> Result<Session, BackendError> {
-        Err(BackendError::Exec(
-            "opencode execute not yet implemented (Task 11)".into(),
-        ))
-    }
-}
+// `ClaudeBackend`'s and `OpencodeBackend`'s `Backend` impls live in
+// `claude.rs` (Task 10) and `opencode.rs` (Task 11) respectively, so the
+// stream-json / json-events line-draining + subprocess wiring stays
+// colocated with their tests. The structs themselves remain defined here so
+// the frozen factory (`new`) and the re-exported names stay stable.
 
 #[async_trait]
 impl Backend for CodexBackend {
@@ -347,27 +340,23 @@ mod tests {
         assert!(std::error::Error::source(&BackendError::Exec("x".into())).is_none());
     }
 
-    /// The placeholder backend impls (opencode + codex — claude landed in
-    /// Task 10) must return `BackendError::Exec` so Tasks 11+ can route
-    /// the error before their impls land. We don't test claude here — its
-    /// `execute` is now real (returns `Ok(Session)` or a `BackendError`
-    /// carrying the spawn error, not the placeholder message).
+    /// The last remaining placeholder backend impl (codex — claude landed
+    /// in Task 10, opencode in Task 11) must return `BackendError::Exec` so
+    /// Task 12 can route the error before its impl lands.
     #[tokio::test]
-    async fn remaining_placeholders_return_exec_err() {
+    async fn codex_placeholder_returns_exec_err() {
         let opts = ExecOptions {
             cwd: std::env::current_dir().unwrap(),
             model: None,
             resume_session_id: None,
             timeout: None,
         };
-        for name in &["opencode", "codex"] {
-            let backend = new(name, BackendConfig::default()).expect("supported");
-            let res = backend.execute("hi", opts.clone()).await;
-            assert!(
-                matches!(res, Err(BackendError::Exec(_))),
-                "{name} placeholder should return Exec, got {res:?}"
-            );
-        }
+        let backend = new("codex", BackendConfig::default()).expect("supported");
+        let res = backend.execute("hi", opts).await;
+        assert!(
+            matches!(res, Err(BackendError::Exec(_))),
+            "codex placeholder should return Exec, got {res:?}"
+        );
     }
 
     /// `spawn` must succeed for a real command. We spawn `cargo

@@ -53,6 +53,13 @@ pub fn spawn(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    // `kill_on_drop(true)` so a `Child` dropped on an early-return error path
+    // (e.g. a backend's stdin-write failure between `spawn` and the
+    // drain/wait task taking ownership) kills the process instead of
+    // orphaning it. Closes the Task 10 "process leak on early-return" minor
+    // for ALL backends (claude / opencode / codex). The success path is
+    // unaffected — the drain task owns the child through to `wait()`.
+    command.kill_on_drop(true);
     // `env_clear` is NOT called — we inherit the parent env so the agent
     // CLI sees the user's login / PATH / config dir (matching multica's
     // "reuse the user's CLI login state" design). `env` then layers on
