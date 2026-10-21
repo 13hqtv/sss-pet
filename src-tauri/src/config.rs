@@ -1,188 +1,483 @@
-//! In-memory placeholder for per-window state (Task 4).
+//! Task 14: TOML-backed `Config` (portable + `%APPDATA%` fallback).
 //!
-//! Persists the pet's position and the panel's rect (`x`/`y`/`w`/`h`) for the
-//! lifetime of the process so the same-session behaviors the brief requires
-//! work end-to-end:
+//! Replaces Task 4's in-memory `Mutex<HashMap<...>>` placeholder with
+//! a real `config.toml` next to the exe (portable), falling back to
+//! `%APPDATA%\swd-pet\config.toml` when the exe dir is read-only.
+//! Path resolution is shared with [`crate::db`] — both files always
+//! live in the same dir.
 //!
-//! - drag the pet to a new spot → on `mouseup` the frontend calls
-//!   [`save_pet_pos`] with the new coordinates;
-//! - hide the pet via the tray `显示/隐藏`, then show it again → [`load_pet_pos`]
-//!   returns the dragged spot (not the bottom-right default);
-//! - drag/resize the panel → [`save_panel_state`] records the new rect;
-//! - reopen the panel → it reappears at the saved rect (within the session).
+//! The five Task 4 Tauri commands ([`save_pet_pos`], [`save_panel_state`],
+//! [`load_window_state`], [`load_pet_pos`], [`load_panel_state`]) AND
+//! the four Rust-side helpers ([`save_pet_pos_state`] etc.) keep their
+//! signatures — they now persist via `Config::load` / `save` instead of
+//! the in-memory HashMap. Callers in `window.rs` and `lib.rs` are
+//! unchanged.
 //!
-//! ## Why in-memory (and what Task 15 will change)
-//!
-//! The store is a single `Mutex<Option<HashMap<String, WindowState>>>` static.
-//! That makes the persistence wiring verifiable for Task 4 without the
-//! additional surface area of picking a path + a TOML encoder. Task 15 will
-//! replace *only* [`get`]/[`put`] (and grow a `flush` helper) with a TOML file
-//! next to the executable; the five Tauri commands and [`WindowState`] stay
-//! the same, so the frontend code calling them is forward-compatible.
+//! Design ref: `docs/superpowers/specs/2026-10-21-desktop-pet-design.md`
+//! ("便携回退" + "配置"): TOML/JSON next to the exe for theme /
+//! follow-activity interval / provider creds / focus window / persisted
+//! window rect.
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// The persisted state for one window.
+use crate::db;
+
+// ===========================================================================
+// Config struct + sub-structs
+// ===========================================================================
+
+/// Top-level app config. Serialized as `config.toml` next to the exe
+/// (or in `%APPDATA%\swd-pet\config.toml` on fallback). Defaults are
+/// sensible for a first run with no file — `Config::default()` is what
+/// `load()` returns when the file is missing / unreadable.
 ///
-/// For the `"pet"` window only `x`/`y` are meaningful — the pet is a fixed
-/// 120×120 declared in `tauri.conf.json`, so its size is not persisted (the
-/// `w`/`h` fields stay `None`). For the `"panel"` window all four fields are
-/// populated because the panel is user-resizable.
+/// `pet_pos` / `panel_rect` are `Option` because they're absent on
+/// first run (the user hasn't dragged / resized yet) — Task 4's
+/// `load_pet_pos_state` returns `None` then and `lib.rs::run` falls
+/// back to the real bottom-right default.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Config {
+    /// Min seconds between "follow activity" reactions (the pet
+    /// glances / shifts when the user types / moves). Default 900 =
+    /// 15min, the design spec's floor. Configurable so a future
+    /// settings tab can raise it; random variant (spec's "可选随机")
+    /// also has 15min as its floor.
+    pub follow_activity_min_secs: u64,
+    /// Per-provider config (executable path overrides / env / creds).
+    /// Empty placeholder — Task 15+ fills it in.
+    pub providers: ProvidersCfg,
+    /// Theme: `"system"` (default) | `"light"` | `"dark"`.
+    pub theme: String,
+    /// Focus / do-not-disturb config.
+    pub focus: FocusCfg,
+    /// Last persisted pet position (physical px). `None` until the
+    /// user drags the pet for the first time.
+    pub pet_pos: Option<(i32, i32)>,
+    /// Last persisted panel rect (x, y, w, h) in physical px. `None`
+    /// until the user moves / resizes the panel for the first time.
+    pub panel_rect: Option<(i32, i32, u32, u32)>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            follow_activity_min_secs: 900,
+            providers: ProvidersCfg::default(),
+            theme: "system".into(),
+            focus: FocusCfg::default(),
+            pet_pos: None,
+            panel_rect: None,
+        }
+    }
+}
+
+/// Per-provider config. Placeholder for now (Task 15+ adds
+/// `executable_path` / `env` / `model` per provider, mirroring
+/// multica's `MULTICA_<X>_PATH`). Kept as a struct (not a unit) so the
+/// TOML has a `[providers]` section ready to extend without a
+/// breaking schema change.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ProvidersCfg {}
+
+/// Focus / do-not-disturb config. `enabled` is the manual toggle
+/// (the spec's "手动开关"); `window` is an optional `[start, end]` time
+/// range (e.g. `("22:00", "07:00")`) for the spec's "可选时段".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FocusCfg {
+    pub enabled: bool,
+    pub window: Option<(String, String)>,
+}
+
+impl Default for FocusCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            window: None,
+        }
+    }
+}
+
+// ===========================================================================
+// load / save (portable + fallback path)
+// ===========================================================================
+
+/// Resolved path to `config.toml` — same dir as `swd-pet.db` (shared
+/// with [`crate::db::resolve_data_dir`]). `None` if neither exe dir
+/// nor appdata is writable.
+fn resolve_config_path() -> Option<PathBuf> {
+    db::resolve_data_dir().map(|d| d.join("config.toml"))
+}
+
+/// Load the config. If the file is missing / unreadable / malformed,
+/// returns [`Config::default`] (a first run is indistinguishable from
+/// a corrupted file at this layer — Task 15's settings tab can surface
+/// parse errors later if needed; for now, defaults are safe).
+pub fn load() -> Config {
+    let path = match resolve_config_path() {
+        Some(p) => p,
+        None => return Config::default(),
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(s) => toml::from_str(&s).unwrap_or_default(),
+        Err(_) => Config::default(),
+    }
+}
+
+/// Save the config to the resolved path (exe dir, or appdata
+/// fallback). Creates the dir if missing. Returns an error if the path
+/// can't be resolved OR the write fails — callers (the Tauri
+/// commands) surface it as a string.
+pub fn save(cfg: &Config) -> std::io::Result<()> {
+    let path = resolve_config_path().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no writable data dir for config.toml",
+        )
+    })?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let s = toml::to_string_pretty(cfg)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    std::fs::write(path, s)
+}
+
+// ===========================================================================
+// Task 4's WindowState — kept for `load_window_state`'s signature.
+// ===========================================================================
+
+/// The persisted state for one window. Kept (not replaced by the new
+/// `Config.pet_pos` / `panel_rect` tuples) so [`load_window_state`]'s
+/// signature stays stable for Task 4's frontend callers — the command
+/// converts from the TOML tuples to this struct on the way out.
 ///
-/// `w`/`h` are `Option` rather than a separate pet-state/panel-state pair so
-/// the same struct + the same [`load_window_state`] command can serve both
-/// windows; the frontend picks the fields it cares about.
+/// For the `"pet"` window only `x`/`y` are meaningful (the pet is a
+/// fixed 120×120 declared in `tauri.conf.json`, so its size isn't
+/// persisted — the `w`/`h` fields stay `None`). For the `"panel"`
+/// window all four fields are populated because the panel is
+/// user-resizable.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct WindowState {
-    /// Outer-window x in physical pixels (matches `outer_position().x`).
     pub x: i32,
-    /// Outer-window y in physical pixels (matches `outer_position().y`).
     pub y: i32,
-    /// Outer-window width in physical pixels (`None` for the pet).
     pub w: Option<u32>,
-    /// Outer-window height in physical pixels (`None` for the pet).
     pub h: Option<u32>,
 }
 
 impl WindowState {
-    /// Build a pet-only state (just position; size is left `None` because the
-    /// pet's size is fixed by `tauri.conf.json`).
     pub fn pet(x: i32, y: i32) -> Self {
-        Self {
-            x,
-            y,
-            w: None,
-            h: None,
-        }
+        Self { x, y, w: None, h: None }
     }
-
-    /// Build a panel state (position + size).
     pub fn panel(x: i32, y: i32, w: u32, h: u32) -> Self {
-        Self {
-            x,
-            y,
-            w: Some(w),
-            h: Some(h),
-        }
+        Self { x, y, w: Some(w), h: Some(h) }
     }
 }
 
-/// In-memory store. Single mutex-guarded HashMap keyed by window label
-/// (`"pet"`, `"panel"`). `Option<HashMap>` rather than `HashMap` so the
-/// static initializer can stay `Mutex::new(None)` (no const `HashMap::new`
-/// needed across older toolchains). Task 15 swaps this for a TOML file.
-static STATE: Mutex<Option<HashMap<String, WindowState>>> = Mutex::new(None);
+// ===========================================================================
+// Rust-side helpers (used by window.rs / lib.rs)
+// ===========================================================================
 
-/// Read a key out of the store. Returns a `Copy` so callers don't hold the
-/// lock across an `await` point or an IPC boundary. `None` if the key has no
-/// entry yet (first run, or the window was never moved/resized this session).
-fn get(key: &str) -> Option<WindowState> {
-    let guard = STATE.lock().ok()?;
-    guard.as_ref()?.get(key).copied()
-}
-
-/// Insert (or overwrite) a key. Initializes the HashMap on first use so the
-/// static can start as `None`.
-fn put(key: &str, state: WindowState) {
-    let Ok(mut guard) = STATE.lock() else {
-        // Poisoned mutex means a panic while holding the lock; for an
-        // in-memory best-effort store, dropping the write is preferable to
-        // propagating the panic into the calling Tauri command.
-        return;
-    };
-    if guard.is_none() {
-        *guard = Some(HashMap::new());
-    }
-    if let Some(map) = guard.as_mut() {
-        map.insert(key.to_string(), state);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Helper fns used from elsewhere in the crate (not Tauri commands).
-//
-// These exist so Rust-side callers (the click-through poller, the `lib.rs`
-// startup-position logic) can read/write the store without going through the
-// IPC boundary. The Tauri commands below are thin wrappers that call these.
-// ---------------------------------------------------------------------------
-
-/// Persist the pet's position from Rust. Used by the `lib.rs` startup-position
-/// code path if it ever needs to write back; drag-time persistence is via the
-/// [`save_pet_pos`] *command* from `Pet.svelte`.
+/// Persist the pet's position via TOML. Loads the current config,
+/// updates `pet_pos`, saves. Best-effort: errors are silently dropped
+/// (mirrors Task 4's "in-memory best-effort store" behavior — a
+/// failed save shouldn't crash the drag handler).
 pub fn save_pet_pos_state(x: i32, y: i32) {
-    put("pet", WindowState::pet(x, y));
+    let mut cfg = load();
+    cfg.pet_pos = Some((x, y));
+    let _ = save(&cfg);
 }
 
-/// Persist the panel's rect from Rust. The frontend path is the
-/// [`save_panel_state`] command; this helper is the symmetric write entry point
-/// for Rust callers (none in Task 4, but the symmetry keeps Task 15's
-/// file-backed version honest).
+/// Persist the panel's rect via TOML. Same load-modify-save pattern.
 pub fn save_panel_state_state(x: i32, y: i32, w: u32, h: u32) {
-    put("panel", WindowState::panel(x, y, w, h));
+    let mut cfg = load();
+    cfg.panel_rect = Some((x, y, w, h));
+    let _ = save(&cfg);
 }
 
-/// Load the pet's persisted position (or `None`). Used by `lib.rs::run` setup
-/// to decide whether to restore a dragged spot or fall back to the real
-/// bottom-right default for first run.
+/// Load the pet's persisted position, or `None` (first run).
 pub fn load_pet_pos_state() -> Option<(i32, i32)> {
-    get("pet").map(|s| (s.x, s.y))
+    load().pet_pos
 }
 
-/// Load the panel's persisted rect (or `None`). Used by
-/// [`crate::window::open_panel_above_pet`] to honor a user-resized panel when
-/// re-opening (otherwise the OS default `380×560` from `tauri.conf.json` is
-/// used, which is fine on first run).
+/// Load the panel's persisted rect, or `None` (first run).
 pub fn load_panel_state_state() -> Option<(i32, i32, u32, u32)> {
-    get("panel").and_then(|s| Some((s.x, s.y, s.w?, s.h?)))
+    load().panel_rect
 }
 
-// ---------------------------------------------------------------------------
-// Tauri commands (called from the frontend via `invoke`).
-//
-// All five are sync (no `async`) because the store is in-memory and the
-// operations are O(1) HashMap reads/writes — no I/O to await. Task 15 may
-// make the load/save fns `async` when the backing store becomes a TOML file
-// on disk.
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// Tauri commands (frontend-facing, signatures unchanged from Task 4)
+// ===========================================================================
 
-/// Persist the pet's position. Called from `Pet.svelte` on `mouseup` after a
-/// `data-tauri-drag-region` drag completes.
+/// Persist the pet's position. Called from `Pet.svelte` on `mouseup`
+/// after a `data-tauri-drag-region` drag completes.
 #[tauri::command]
 pub fn save_pet_pos(x: i32, y: i32) -> Result<(), String> {
     save_pet_pos_state(x, y);
     Ok(())
 }
 
-/// Persist the panel's rect (position + size). Called from `panel/App.svelte`
-/// at the end of a move/resize (debounced via `onMoved`/`onResized`).
+/// Persist the panel's rect (position + size). Called from
+/// `panel/App.svelte` at the end of a move/resize (debounced via
+/// `onMoved` / `onResized`).
 #[tauri::command]
 pub fn save_panel_state(x: i32, y: i32, w: u32, h: u32) -> Result<(), String> {
     save_panel_state_state(x, y, w, h);
     Ok(())
 }
 
-/// Generic load by window label. Returns the full [`WindowState`] (with `w`/`h`
-/// as `Option` so the pet's `None` size is preserved) or `None` if no state is
-/// stored. Useful for future tasks that want to query arbitrary windows.
+/// Generic load by window label. Returns the full [`WindowState`] (with
+/// `w` / `h` as `Option` so the pet's `None` size is preserved) or
+/// `None` if no state is stored. Reads from TOML on each call —
+/// cheap (a small file), and keeps the in-memory and on-disk views
+/// consistent (no stale cache to invalidate).
 #[tauri::command]
 pub fn load_window_state(label: String) -> Result<Option<WindowState>, String> {
-    Ok(get(&label))
+    let cfg = load();
+    let state = match label.as_str() {
+        "pet" => cfg.pet_pos.map(|(x, y)| WindowState::pet(x, y)),
+        "panel" => cfg
+            .panel_rect
+            .map(|(x, y, w, h)| WindowState::panel(x, y, w, h)),
+        _ => None,
+    };
+    Ok(state)
 }
 
-/// Load just the pet's persisted position (or `None`) as a `(x, y)` tuple.
-/// Convenience command for the frontend — `load_window_state("pet")` returns
-/// the same data with the `x`/`y` fields and `None` size.
+/// Load just the pet's persisted position (or `None`) as a `(x, y)`
+/// tuple. Convenience command for the frontend —
+/// `load_window_state("pet")` returns the same data with the `x`/`y`
+/// fields and `None` size.
 #[tauri::command]
 pub fn load_pet_pos() -> Result<Option<(i32, i32)>, String> {
     Ok(load_pet_pos_state())
 }
 
-/// Load the panel's persisted rect (or `None`) as a `(x, y, w, h)` tuple so
-/// the frontend can pass it straight to `setPosition`/`setSize`.
+/// Load the panel's persisted rect (or `None`) as a `(x, y, w, h)`
+/// tuple so the frontend can pass it straight to `setPosition` /
+/// `setSize`.
 #[tauri::command]
 pub fn load_panel_state() -> Result<Option<(i32, i32, u32, u32)>, String> {
     Ok(load_panel_state_state())
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Open a writable temp data dir (overrides `db::resolve_data_dir`
+    /// via db's thread-local test override). Returns the tempdir
+    /// (kept alive for the test's duration so the dir isn't cleaned up
+    /// mid-test) + the guard that clears the override on drop.
+    fn fresh_data_dir() -> (tempfile::TempDir, db::TestOverrideGuard) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let g = db::set_test_overrides(Some(tmp.path().to_path_buf()), None, None);
+        (tmp, g)
+    }
+
+    // -- defaults --
+
+    #[test]
+    fn defaults_sensible() {
+        let cfg = Config::default();
+        assert_eq!(cfg.follow_activity_min_secs, 900, "15min default");
+        assert_eq!(cfg.theme, "system");
+        assert!(!cfg.focus.enabled);
+        assert!(cfg.focus.window.is_none());
+        assert!(cfg.pet_pos.is_none());
+        assert!(cfg.panel_rect.is_none());
+    }
+
+    // -- round-trip --
+
+    #[test]
+    fn config_round_trip() {
+        let (_tmp, _g) = fresh_data_dir();
+        let cfg = Config {
+            follow_activity_min_secs: 1800,
+            providers: ProvidersCfg::default(),
+            theme: "dark".into(),
+            focus: FocusCfg {
+                enabled: true,
+                window: Some(("22:00".into(), "07:00".into())),
+            },
+            pet_pos: Some((100, 200)),
+            panel_rect: Some((50, 60, 380, 560)),
+        };
+        save(&cfg).expect("save");
+        let loaded = load();
+        assert_eq!(loaded, cfg, "Config must round-trip through TOML exactly");
+    }
+
+    /// Round-trip with `None` pet_pos / panel_rect (first-run state).
+    #[test]
+    fn config_round_trip_with_none_fields() {
+        let (_tmp, _g) = fresh_data_dir();
+        let cfg = Config {
+            follow_activity_min_secs: 900,
+            providers: ProvidersCfg::default(),
+            theme: "system".into(),
+            focus: FocusCfg::default(),
+            pet_pos: None,
+            panel_rect: None,
+        };
+        save(&cfg).expect("save");
+        assert_eq!(load(), cfg);
+    }
+
+    /// `load()` with no file returns defaults (first run).
+    #[test]
+    fn load_with_no_file_returns_defaults() {
+        let (_tmp, _g) = fresh_data_dir();
+        let cfg = load();
+        assert_eq!(cfg, Config::default());
+    }
+
+    /// A corrupted TOML file is treated like a missing one — defaults.
+    /// (Mirrors Task 4's behavior: never block the app from launching
+    /// over a config parse error.)
+    #[test]
+    fn load_with_malformed_toml_returns_defaults() {
+        let (tmp, _g) = fresh_data_dir();
+        std::fs::write(tmp.path().join("config.toml"), "this is not = valid toml {{{")
+            .expect("write");
+        let cfg = load();
+        assert_eq!(cfg, Config::default());
+    }
+
+    // -- Task 4 command rewiring (TOML-backed now, not in-memory) --
+
+    #[test]
+    fn save_pet_pos_state_then_load_pet_pos_state_round_trips() {
+        let (_tmp, _g) = fresh_data_dir();
+        assert!(load_pet_pos_state().is_none(), "no pos on first run");
+        save_pet_pos_state(123, 456);
+        assert_eq!(load_pet_pos_state(), Some((123, 456)));
+        // Overwrite with a new position.
+        save_pet_pos_state(789, 12);
+        assert_eq!(load_pet_pos_state(), Some((789, 12)));
+    }
+
+    #[test]
+    fn save_panel_state_state_then_load_panel_state_state_round_trips() {
+        let (_tmp, _g) = fresh_data_dir();
+        assert!(load_panel_state_state().is_none());
+        save_panel_state_state(10, 20, 380, 560);
+        assert_eq!(load_panel_state_state(), Some((10, 20, 380, 560)));
+    }
+
+    /// Saving the pet pos must NOT clobber the panel rect (and vice
+    /// versa) — both go through `Config::load` / `save`, so the
+    /// load-modify-save pattern must preserve the other field.
+    #[test]
+    fn save_pet_pos_does_not_clobber_panel_rect() {
+        let (_tmp, _g) = fresh_data_dir();
+        save_panel_state_state(10, 20, 380, 560);
+        save_pet_pos_state(100, 200);
+        // Both should be present.
+        assert_eq!(load_pet_pos_state(), Some((100, 200)));
+        assert_eq!(load_panel_state_state(), Some((10, 20, 380, 560)));
+    }
+
+    /// `load_window_state("pet")` returns a `WindowState` with `None`
+    /// size (the pet's size is fixed by tauri.conf.json, not persisted).
+    #[test]
+    fn load_window_state_pet_returns_none_size() {
+        let (_tmp, _g) = fresh_data_dir();
+        save_pet_pos_state(50, 60);
+        let ws = load_window_state("pet".into()).expect("cmd ok").expect("present");
+        assert_eq!(ws.x, 50);
+        assert_eq!(ws.y, 60);
+        assert!(ws.w.is_none(), "pet size must be None");
+        assert!(ws.h.is_none(), "pet size must be None");
+    }
+
+    /// `load_window_state("panel")` returns a `WindowState` with both
+    /// position + size populated.
+    #[test]
+    fn load_window_state_panel_returns_position_and_size() {
+        let (_tmp, _g) = fresh_data_dir();
+        save_panel_state_state(1, 2, 3, 4);
+        let ws = load_window_state("panel".into()).expect("cmd ok").expect("present");
+        assert_eq!(ws.x, 1);
+        assert_eq!(ws.y, 2);
+        assert_eq!(ws.w, Some(3));
+        assert_eq!(ws.h, Some(4));
+    }
+
+    /// `load_window_state` for an unknown label returns `None` (the
+    /// pet / panel are the only two windows the app persists).
+    #[test]
+    fn load_window_state_unknown_label_returns_none() {
+        let (_tmp, _g) = fresh_data_dir();
+        assert!(load_window_state("unknown".into()).expect("cmd ok").is_none());
+    }
+
+    // -- Review Focus #5: read-only exe dir → %APPDATA% fallback --
+
+    /// `save` targets a READ-ONLY exe dir → must fall back to the
+    /// appdata dir AND the write succeeds there (the file lands at
+    /// the appdata path, not the read-only exe dir).
+    #[test]
+    fn save_falls_back_to_appdata_when_exe_dir_readonly() {
+        let exe_dir = tempfile::tempdir().expect("exe tmp");
+        let appdata_dir = tempfile::tempdir().expect("appdata tmp");
+        let mut perms = std::fs::metadata(exe_dir.path()).expect("meta").permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(exe_dir.path(), perms).expect("set_readonly");
+
+        let _g = db::set_test_overrides(
+            None,
+            Some(exe_dir.path().to_path_buf()),
+            Some(appdata_dir.path().to_path_buf()),
+        );
+
+        // save() must succeed by falling back to appdata.
+        let cfg = Config {
+            follow_activity_min_secs: 600,
+            theme: "dark".into(),
+            ..Config::default()
+        };
+        save(&cfg).expect("save must fall back to appdata, not error");
+
+        // The file is in the appdata fallback, NOT the read-only exe dir.
+        let cfg_in_appdata = appdata_dir.path().join("config.toml");
+        let cfg_in_exe = exe_dir.path().join("config.toml");
+        assert!(
+            cfg_in_appdata.exists(),
+            "config.toml should be at appdata fallback: {}",
+            cfg_in_appdata.display()
+        );
+        assert!(
+            !cfg_in_exe.exists(),
+            "config.toml should NOT be in the read-only exe dir: {}",
+            cfg_in_exe.display()
+        );
+
+        // load() reads the same fallback path → round-trips.
+        let loaded = load();
+        assert_eq!(loaded.follow_activity_min_secs, 600);
+        assert_eq!(loaded.theme, "dark");
+
+        // Restore permissions so tempfile can clean up.
+        let mut perms = std::fs::metadata(exe_dir.path()).expect("meta2").permissions();
+        perms.set_readonly(false);
+        let _ = std::fs::set_permissions(exe_dir.path(), perms);
+    }
+
+    /// When the exe dir IS writable, no fallback — the config.toml
+    /// lands in the exe dir (portable case, the design spec's default).
+    #[test]
+    fn save_uses_exe_dir_when_writable() {
+        let exe_dir = tempfile::tempdir().expect("exe tmp");
+        let _g = db::set_test_overrides(None, Some(exe_dir.path().to_path_buf()), None);
+        save(&Config::default()).expect("save");
+        let cfg_in_exe = exe_dir.path().join("config.toml");
+        assert!(cfg_in_exe.exists(), "config.toml should be in the exe dir (portable)");
+    }
 }

@@ -57,6 +57,17 @@ tokio = { version = "1", features = ["process", "sync", "rt", "macros", "time"] 
 # 0.4.x); promoted to a direct dep with `serde` so `Conversation` derives
 # `Serialize`/`Deserialize` and round-trips through the persistence layer.
 chrono = { version = "0.4", features = ["serde"] }
+# Task 14: portable SQLite store + TOML config. `rusqlite` with the
+# `bundled` feature compiles SQLite from source (libsqlite3-sys), so the
+# app needs no system SQLite install — the single .exe is self-contained.
+# `toml` serializes the user-facing Config (theme / pet_pos / panel_rect
+# / focus window / follow-activity interval) to a file next to the exe.
+# `dirs` resolves the cross-platform %APPDATA% / XDG fallback location
+# for the SQLite db + config when the exe dir is read-only (Program
+# Files on Windows, /usr on Unix).
+rusqlite = { version = "0.32", features = ["bundled"] }
+toml = "0.8"
+dirs = "5"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
@@ -66,3 +77,9 @@ lto = true
 opt-level = 3
 panic = "abort"
 strip = true
+
+[dev-dependencies]
+# Task 14: scratch directories for the db + config round-trip tests and
+# the read-only fallback test (which `set_readonly(true)`s a temp exe_dir
+# and asserts the db / config.toml land in a separate temp appdata dir).
+tempfile = "3"

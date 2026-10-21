@@ -7,6 +7,11 @@ mod window;
 // drive `timers::FollowActivityThrottle` from the activity-poll thread.
 pub mod activity;
 pub mod timers;
+// Task 14: portable SQLite store (conversations / messages / todos /
+// reminders / pet_state_log) + the path-resolution helper the config
+// module shares (exe dir → %APPDATA% fallback). `pub` so config.rs
+// (private mod) can call `db::resolve_data_dir`.
+pub mod db;
 // Task 7: the "pet brain" — a 1Hz tick loop that feeds live idle time
 // into the state machine, runs the HasSomething auto-clear timer, fires
 // the follow-activity nudge via the throttle, and emits `pet_state` /
@@ -118,9 +123,10 @@ pub fn run() {
             set_pet_click_through,
             set_pet_dragging,
             open_panel_above_pet,
-            // config.rs commands (Task 4 in-session window-state persistence).
-            // Task 15 swaps the in-memory HashMap backing store for a TOML file
-            // next to the exe — same signatures, durable across restarts.
+            // config.rs commands (Task 4 in-session window-state
+            // persistence; Task 14 backed them with a real TOML file
+            // next to the exe, %APPDATA% fallback). Same signatures —
+            // Task 4's frontend callers are unchanged.
             config::save_pet_pos,
             config::save_panel_state,
             config::load_window_state,
