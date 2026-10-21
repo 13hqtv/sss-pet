@@ -452,14 +452,16 @@ pub fn show_panel_or_toggle_pet<R: Runtime, M: Manager<R>>(app: &M) -> Result<()
 ///
 /// Default placement is ABOVE the pet (`panel_y = pet_y - panel_h - gap`); if
 /// there isn't room above (the resulting y would be less than the work area's
-/// top), flip BELOW (`pet_y + pet_h + gap`). X aligns with the pet's left
-/// edge (so the panel reads as attached to the robot, sharing its left edge)
-/// and is clamped to the work area so the panel never opens off-screen
-/// horizontally.
+/// top), flip BELOW (`pet_y + pet_h + gap`). If BELOW *also* doesn't fit (the
+/// screen is shorter than `panel_h + pet_h + 2*gap`), clamp to
+/// `max(work_top, work_bottom - panel_h)` — overlapping the pet is better
+/// than going off-screen (the panel stays reachable by drag). X aligns with
+/// the pet's left edge (so the panel reads as attached to the robot, sharing
+/// its left edge) and is clamped to the work area so the panel never opens
+/// off-screen horizontally.
 fn compute_panel_spawn(
     pet_x: i32,
     pet_y: i32,
-    _pet_w: i32,
     pet_h: i32,
     panel_w: i32,
     panel_h: i32,
@@ -471,12 +473,18 @@ fn compute_panel_spawn(
     // --- Y: default ABOVE, flip BELOW if not enough room above ---
     let above_y = pet_y - panel_h - PANEL_GAP_PX;
     let below_y = pet_y + pet_h + PANEL_GAP_PX;
-    // If the above placement would push the panel above the work area's top,
-    // go below instead. `below_y` may still overflow the work area's bottom
-    // (e.g. the screen is shorter than panel_h + pet_h + 2*gap); we don't
-    // clamp that case because the panel would still be reachable via drag and
-    // clamping would overlap the pet, which is worse visually.
-    let panel_y = if above_y >= work_top { above_y } else { below_y };
+    // If the above placement fits (panel's top >= work_top), use it.
+    // Else if below fits (panel's bottom <= work_bottom), use below.
+    // Else neither fits — clamp so the panel stays on the work area:
+    // bottom-anchored (work_bottom - panel_h) but no higher than work_top.
+    // The clamp overlaps the pet but keeps the panel on-screen + reachable.
+    let panel_y = if above_y >= work_top {
+        above_y
+    } else if below_y + panel_h <= work_bottom {
+        below_y
+    } else {
+        std::cmp::max(work_top, work_bottom - panel_h)
+    };
 
     // --- X: align with the pet's left edge, clamp to the work area ---
     let mut panel_x = pet_x;
@@ -487,7 +495,6 @@ fn compute_panel_spawn(
         panel_x = work_left;
     }
 
-    let _ = work_bottom; // used in the doc comment above; not in the math.
     (panel_x, panel_y)
 }
 
@@ -550,7 +557,6 @@ pub fn open_panel_above_pet<R: Runtime, M: Manager<R>>(app: &M) -> Result<(), St
     let (panel_x, panel_y) = compute_panel_spawn(
         pet_pos.x,
         pet_pos.y,
-        pet_size.width as i32,
         pet_size.height as i32,
         panel_size.width as i32,
         panel_size.height as i32,

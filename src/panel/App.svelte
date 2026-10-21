@@ -72,6 +72,13 @@
       // Svelte 5 cleanup: called on component destroy. Best-effort.
       unlistenMoved?.();
       unlistenResized?.();
+      // Clear any pending debounce timer so a destroy-after-move-event
+      // doesn't fire save_panel_state on a torn-down component (avoids
+      // a "state set on unmounted component" warning + a dangling IPC).
+      if (saveTimer) {
+        clearTimeout(saveTimer);
+        saveTimer = null;
+      }
     };
   });
 </script>
