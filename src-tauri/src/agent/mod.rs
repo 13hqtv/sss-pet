@@ -24,6 +24,13 @@ pub mod claude;
 // own json event vocabulary — NOT stream_json, which is claude-specific).
 // Owns its testable `drain_stream` pure-async line-draining helper.
 pub mod opencode;
+// Task 12: codex backend — `Backend` impl for `CodexBackend` (spawns the
+// codex CLI as a long-lived `app-server --listen stdio://` JSON-RPC 2.0
+// server over stdio: `initialize` handshake → `thread/start` (or
+// `thread/resume`) → route unsolicited events → `turn/completed`). The
+// heaviest backend; the testable pure surface is `handle_event` + the
+// request builders + `extract_session_id` (no subprocess).
+pub mod codex;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -228,24 +235,12 @@ pub struct CodexBackend {
     pub cfg: BackendConfig,
 }
 
-// `ClaudeBackend`'s and `OpencodeBackend`'s `Backend` impls live in
-// `claude.rs` (Task 10) and `opencode.rs` (Task 11) respectively, so the
-// stream-json / json-events line-draining + subprocess wiring stays
-// colocated with their tests. The structs themselves remain defined here so
-// the frozen factory (`new`) and the re-exported names stay stable.
-
-#[async_trait]
-impl Backend for CodexBackend {
-    async fn execute(
-        &self,
-        _prompt: &str,
-        _opts: ExecOptions,
-    ) -> Result<Session, BackendError> {
-        Err(BackendError::Exec(
-            "codex execute not yet implemented (Task 12)".into(),
-        ))
-    }
-}
+// `ClaudeBackend`'s, `OpencodeBackend`'s, and `CodexBackend`'s `Backend`
+// impls live in `claude.rs` (Task 10), `opencode.rs` (Task 11), and
+// `codex.rs` (Task 12) respectively, so the stream-json / json-events /
+// app-server JSON-RPC line-handling + subprocess wiring stays colocated
+// with their tests. The structs themselves remain defined here so the
+// frozen factory (`new`) and the re-exported names stay stable.
 
 /// Factory: build a boxed [`Backend`] for an `agent_type` in
 /// [`SUPPORTED`]. Returns [`BackendError::UnknownAgent`] for anything
@@ -338,25 +333,6 @@ mod tests {
             "unknown agent type: foo (not in SUPPORTED)"
         );
         assert!(std::error::Error::source(&BackendError::Exec("x".into())).is_none());
-    }
-
-    /// The last remaining placeholder backend impl (codex — claude landed
-    /// in Task 10, opencode in Task 11) must return `BackendError::Exec` so
-    /// Task 12 can route the error before its impl lands.
-    #[tokio::test]
-    async fn codex_placeholder_returns_exec_err() {
-        let opts = ExecOptions {
-            cwd: std::env::current_dir().unwrap(),
-            model: None,
-            resume_session_id: None,
-            timeout: None,
-        };
-        let backend = new("codex", BackendConfig::default()).expect("supported");
-        let res = backend.execute("hi", opts).await;
-        assert!(
-            matches!(res, Err(BackendError::Exec(_))),
-            "codex placeholder should return Exec, got {res:?}"
-        );
     }
 
     /// `spawn` must succeed for a real command. We spawn `cargo
