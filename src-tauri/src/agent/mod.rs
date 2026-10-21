@@ -15,6 +15,10 @@ pub mod exec;
 // Task 9: shared stream-json line parser → unified `Message` (consumed by
 // Task 10's claude backend). Pure Rust, no I/O.
 pub mod stream_json;
+// Task 10: claude backend — `Backend` impl for `ClaudeBackend` (spawns the
+// Claude Code CLI in stream-json mode, parses stdout via `stream_json`).
+// Owns the testable `drain_stream` pure-async line-draining helper.
+pub mod claude;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -219,18 +223,10 @@ pub struct CodexBackend {
     pub cfg: BackendConfig,
 }
 
-#[async_trait]
-impl Backend for ClaudeBackend {
-    async fn execute(
-        &self,
-        _prompt: &str,
-        _opts: ExecOptions,
-    ) -> Result<Session, BackendError> {
-        Err(BackendError::Exec(
-            "claude execute not yet implemented (Task 10)".into(),
-        ))
-    }
-}
+// `ClaudeBackend`'s `Backend` impl lives in `claude.rs` (Task 10) so the
+// stream-json line-draining + subprocess wiring stays colocated with its
+// tests. The struct itself remains defined here so the frozen factory
+// (`new`) and the re-exported name stay stable.
 
 #[async_trait]
 impl Backend for OpencodeBackend {
@@ -351,34 +347,20 @@ mod tests {
         assert!(std::error::Error::source(&BackendError::Exec("x".into())).is_none());
     }
 
-    /// The placeholder backend impls must return `BackendError::Exec` so
-    /// Tasks 9+ can route the error before Tasks 10–12 land. We don't
-    /// care which backend — claude is enough to assert the placeholder.
+    /// The placeholder backend impls (opencode + codex — claude landed in
+    /// Task 10) must return `BackendError::Exec` so Tasks 11+ can route
+    /// the error before their impls land. We don't test claude here — its
+    /// `execute` is now real (returns `Ok(Session)` or a `BackendError`
+    /// carrying the spawn error, not the placeholder message).
     #[tokio::test]
-    async fn placeholder_execute_returns_not_yet_implemented() {
-        let backend = new("claude", BackendConfig::default()).expect("claude");
+    async fn remaining_placeholders_return_exec_err() {
         let opts = ExecOptions {
             cwd: std::env::current_dir().unwrap(),
             model: None,
             resume_session_id: None,
             timeout: None,
         };
-        let res = backend.execute("hi", opts).await;
-        assert!(matches!(res, Err(BackendError::Exec(_))), "got {res:?}");
-    }
-
-    /// All three placeholder backends return `Exec` (not just claude) —
-    /// guards against a later task landing one impl and forgetting the
-    /// other two.
-    #[tokio::test]
-    async fn all_placeholders_return_exec_err() {
-        let opts = ExecOptions {
-            cwd: std::env::current_dir().unwrap(),
-            model: None,
-            resume_session_id: None,
-            timeout: None,
-        };
-        for name in SUPPORTED {
+        for name in &["opencode", "codex"] {
             let backend = new(name, BackendConfig::default()).expect("supported");
             let res = backend.execute("hi", opts.clone()).await;
             assert!(
