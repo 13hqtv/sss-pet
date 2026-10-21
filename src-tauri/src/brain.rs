@@ -145,11 +145,31 @@ impl PetBrain {
     /// `lib.rs` for manual state triggering (verification of the
     /// `!`/`?`/thinking poses). Returns the new current state.
     ///
-    /// This does NOT run the `HasSomething` auto-clear timer — the tick
-    /// loop handles that on its next tick (if the dev signal entered
-    /// `HasSomething`, the next tick starts the 5s TTL).
+    /// Also keeps the `HasSomething` auto-clear timer (`has_since`) in
+    /// sync with the result (fix round 1): when the machine *enters*
+    /// `HasSomething` here, the TTL clock starts immediately rather than
+    /// on the next 1s tick — otherwise the observed auto-clear window
+    /// was 5–6s (up to 1s lost waiting for the tick to notice the entry).
+    /// When the result leaves `HasSomething`, the timer is cleared so a
+    /// future entry starts the TTL fresh. The tick loop's own `has_since`
+    /// handling is unchanged and remains the steady-state path.
     pub(crate) fn apply_and_stage_emit(&mut self, signal: Signal) -> PetState {
         let new_state = self.machine.apply(signal);
+        if new_state == PetState::HasSomething {
+            // Start the TTL clock immediately on entry so the ~5s
+            // auto-clear is measured from the actual transition, not
+            // from the next tick's `Instant::now()`. Only set when
+            // unset (matches the tick loop's "start if None" rule — a
+            // re-trigger while already in HasSomething does not restart
+            // the clock).
+            if self.has_since.is_none() {
+                self.has_since = Some(Instant::now());
+            }
+        } else {
+            // State left HasSomething (or was never in it) — clear the
+            // timer so the next entry starts the TTL fresh.
+            self.has_since = None;
+        }
         self.last_emitted = new_state;
         new_state
     }
@@ -224,9 +244,12 @@ pub fn tick<R: Runtime>(app: &AppHandle<R>, brain: &BrainState, now: Instant) ->
 
         let current = guard.machine.current();
         let state_changed = current != guard.last_emitted;
-        if state_changed {
-            guard.last_emitted = current;
-        }
+        // NOTE (fix round 1): `last_emitted` is NOT advanced here. It is
+        // only updated after `emit_to` succeeds (below). If we set it
+        // under the lock before emitting, a failed `emit_to` (logged,
+        // swallowed) would leave `last_emitted == current`, so the next
+        // tick would see no diff and never re-attempt — the frontend
+        // would be stuck at the pre-change state with no retry path.
         (current, state_changed, fire_nudge)
     };
 
@@ -237,8 +260,23 @@ pub fn tick<R: Runtime>(app: &AppHandle<R>, brain: &BrainState, now: Instant) ->
         }
     }
     if state_changed {
-        if let Err(e) = app.emit_to("pet", "pet_state", current) {
-            eprintln!("[pet] emit pet_state failed: {e}");
+        match app.emit_to("pet", "pet_state", current) {
+            Ok(_) => {
+                // Only record the emission as complete after success —
+                // a failed emit leaves `last_emitted` at the prior value
+                // so the next tick re-attempts (diff still != 0). On
+                // success we re-lock and advance `last_emitted`. If the
+                // lock is poisoned (e.g. a panic in another thread
+                // mid-tick) we skip the update rather than crashing the
+                // tick loop — the worst case is one redundant re-emit on
+                // the next tick, which is harmless.
+                if let Ok(mut guard) = brain.lock() {
+                    guard.last_emitted = current;
+                }
+            }
+            Err(e) => {
+                eprintln!("[pet] emit pet_state failed: {e}");
+            }
         }
     }
 

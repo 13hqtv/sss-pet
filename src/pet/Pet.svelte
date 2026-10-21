@@ -122,9 +122,26 @@
     NeedsYou: "state-needs-you",
   };
 
+  /// Human-readable Chinese label for each state, used in the SVG
+  /// `aria-label` so screen readers announce the localized state name
+  /// rather than the raw Rust variant string (`"HasSomething"` /
+  /// `"NeedsYou"` are not user-facing). Mirrors `STATE_CLASS`'s shape;
+  /// falls back to `"待命"` for an unknown variant (defensive).
+  const STATE_LABEL: Record<PetStateName, string> = {
+    Sleep: "睡眠",
+    Standby: "待命",
+    Thinking: "思考",
+    HasSomething: "有动静",
+    NeedsYou: "需要你",
+  };
+
   /// The CSS class for the current state. `state-standby` is the default
   /// and also the fallback for any unknown state string.
   let stateClass = $derived(STATE_CLASS[state] ?? "state-standby");
+
+  /// The localized Chinese label for the current state, surfaced in the
+  /// SVG `aria-label`. `待命` is the default / fallback.
+  let stateLabel = $derived(STATE_LABEL[state] ?? "待命");
 
   /// Brief visual nudge when the robot is clicked — proves it received the
   /// click. `nudge` toggles a CSS transform for ~100ms. Kept for the click
@@ -437,7 +454,7 @@
     height="96"
     role="button"
     tabindex="0"
-    aria-label="桌面宠物机器人 · {state}"
+    aria-label="桌面宠物机器人 · {stateLabel}"
     onmousedown={onRobotMouseDown}
     onkeydown={onRobotKeydown}
   >
@@ -497,13 +514,32 @@
       <circle cx="60" cy="43" r="3" fill="#0f172a" />
       <!-- mouth (thinking: small circle, "o") -->
       <circle cx="48" cy="64" r="3" fill="#0f172a" />
-      <!-- spinning cog above head -->
-      <g class="cog" transform="translate(48 14)">
-        <circle cx="0" cy="0" r="5" fill="none" stroke="#64748b" stroke-width="1.5" />
-        <rect x="-1" y="-7" width="2" height="4" fill="#64748b" />
-        <rect x="-1" y="3" width="2" height="4" fill="#64748b" />
-        <rect x="-7" y="-1" width="4" height="2" fill="#64748b" />
-        <rect x="3" y="-1" width="4" height="2" fill="#64748b" />
+      <!-- spinning cog above head.
+
+           STRUCTURAL NOTE (fix round 1): the cog is split into an outer
+           `<g transform="translate(48 14)">` that positions it above the
+           head, and an inner `<g class="cog">` that carries the CSS spin
+           animation. This separation is required because the CSS
+           `@keyframes thinking-cog-spin` sets `transform: rotate(...)`,
+           which (per the CSS spec) entirely overrides an SVG `transform`
+           presentation attribute on the same element — specificity 0
+           loses to any CSS `transform` property. If both lived on the
+           same element (as in the prior implementation's
+           `<g class="cog" transform="translate(48 14)">`), the
+           `translate(48 14)` was dropped during the animation and the cog
+           rendered at (0,0) (top-left corner) instead of above the head.
+           The inner `.cog` keeps `transform-box: fill-box;
+           transform-origin: center` (states.css) so it spins around its
+           own center (0,0 in its local coords = (48,14) once the outer
+           translate is applied). -->
+      <g transform="translate(48 14)">
+        <g class="cog">
+          <circle cx="0" cy="0" r="5" fill="none" stroke="#64748b" stroke-width="1.5" />
+          <rect x="-1" y="-7" width="2" height="4" fill="#64748b" />
+          <rect x="-1" y="3" width="2" height="4" fill="#64748b" />
+          <rect x="-7" y="-1" width="4" height="2" fill="#64748b" />
+          <rect x="3" y="-1" width="4" height="2" fill="#64748b" />
+        </g>
       </g>
 
     {:else if state === "HasSomething"}
