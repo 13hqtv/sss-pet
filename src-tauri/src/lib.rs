@@ -1,3 +1,4 @@
+mod tray;
 mod window;
 
 use tauri::Manager;
@@ -34,7 +35,14 @@ pub fn run() {
             // pass-through when it leaves. Runs in Rust because the frontend
             // gets no pointer events while the window is pass-through
             // (WS_EX_TRANSPARENT on Windows). See task-2-report.md §2.
+            // Task 3 also gates this poll on pet visibility (see
+            // window.rs::PET_VISIBLE) and names the thread
+            // `pet-clickthrough-poll`.
             window::spawn_click_through_poller(app.app_handle().clone());
+            // Build the system tray (icon + 显示/隐藏 / 设置 / 退出 menu +
+            // left-click → show_panel_or_toggle_pet). Errors propagate to
+            // the setup hook and fail the launch if the tray can't be built.
+            tray::build_tray(app.app_handle())?;
             Ok(())
         })
         .run(tauri::generate_context!())
