@@ -21,6 +21,7 @@
     type StoredMessage,
     type Message,
     type MessageKind,
+    type ExecResult,
     type Provider,
   } from "../lib/api";
   import { subscribeChatStream } from "../lib/stream";
@@ -219,14 +220,58 @@
     }
   }
 
-  function handleStreamResult(convId: string, _result: unknown) {
+  function handleStreamResult(convId: string, result: ExecResult) {
     const cleared = new Set(streamingConvIds);
     cleared.delete(convId);
     streamingConvIds = cleared;
-    // The result is persisted by save_turn_record; we don't render the
-    // structured ExecResult as a bubble (its output, if non-empty,
-    // already arrived as a Text chat_message). A future tightening
-    // could surface a "turn done" status chip here.
+    // Surface a failed / non-completed `ExecResult` (CLI not on PATH,
+    // 403 quota, crash, timeout → status "failed"/"timeout"/etc.).
+    // Without this the spinner stops with NO message — an invisible
+    // failure (final-review fix #2). The streamed messages (if any)
+    // already arrived as `chat_message` bubbles; this adds a visible
+    // failure bubble inline + sets the banner. The error bubble is
+    // frontend-only (not persisted) — on reload `load_history` shows
+    // whatever the backend actually saved.
+    if (result.status && result.status !== "completed") {
+      const detail =
+        result.output && result.output.trim().length > 0
+          ? result.output.trim()
+          : "本轮失败";
+      errorMsg = `本轮出错: ${detail}`;
+      const errBubble: DisplayMessage = {
+        role: "assistant",
+        content: `本轮出错: ${detail}`,
+        kind: "Error",
+      };
+      const buf = liveBuffers.get(convId) ?? [];
+      buf.push(errBubble);
+      liveBuffers.set(convId, buf);
+      if (convId === activeConvId) {
+        messages = [...buf];
+      }
+    }
+  }
+
+  // `chat_error` — a `save_turn_record` failure surfaced from the
+  // backend (disk full / FS error / db lock poisoned). The turn DID
+  // complete in-memory (`chat_result` still fires + clears the
+  // spinner), but the history won't survive a restart. Warn the user
+  // via the banner + an inline system bubble. Final-review fix #1:
+  // the frontend learns the save failed instead of the turn silently
+  // vanishing on restart + the next turn replaying instead of resuming.
+  function handleStreamError(convId: string, message: string) {
+    errorMsg = message;
+    const errBubble: DisplayMessage = {
+      role: "system",
+      content: message,
+      kind: "Status",
+    };
+    const buf = liveBuffers.get(convId) ?? [];
+    buf.push(errBubble);
+    liveBuffers.set(convId, buf);
+    if (convId === activeConvId) {
+      messages = [...buf];
+    }
   }
 
   $effect(() => {
@@ -238,6 +283,7 @@
       unlisten = await subscribeChatStream({
         onMessage: handleStreamMessage,
         onResult: handleStreamResult,
+        onError: handleStreamError,
       });
     })();
     return () => {

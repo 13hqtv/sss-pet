@@ -12,6 +12,16 @@
 //! terminal `chat_result` + a `save_turn_record` (persists messages +
 //! the agent-native `session_id` so the NEXT turn resumes).
 //!
+//! **Final-review fix (save-before-emit + `chat_error`):** the drain
+//! task persists via `save_turn_record` BEFORE emitting `chat_result`,
+//! so the emitted result reflects persistence success. On a save
+//! failure (disk full / FS error / poisoned db lock), it logs the
+//! error + emits a dedicated `chat_error` event
+//! `{"conv_id", "message":"保存对话失败: …"}` to the frontend (which
+//! surfaces a warning banner + inline bubble), then STILL emits
+//! `chat_result` (the turn completed in-memory; the streamed messages
+//! were visible live). No failure is swallowed.
+//!
 //! **Review Focus #3 (survives-hide):** [`run_chat_turn`] spawns the
 //! stream-drain task and returns immediately. The task drains the
 //! `Session::messages` channel into `emit("chat_message", …)` calls —
@@ -74,9 +84,12 @@ use crate::db;
 ///    Focus #3).
 /// 3. Spawn a task that drains `session.messages` →
 ///    `emit("chat_message", …)` (best-effort — no listener = no-op,
-///    the message is ALREADY buffered), then awaits `session.result` →
-///    `emit("chat_result", …)` + `save_turn_record(&mut *db.lock(),
-///    conv_id, &turn_record)` (persists messages + session_id).
+///    the message is ALREADY buffered), then awaits `session.result`
+///    → `save_turn_record(&mut *db.lock(), conv_id, &turn_record)`
+///    (persists messages + session_id) BEFORE `emit("chat_result", …)`
+///    so the emitted result reflects persistence success. On save Err:
+///    `eprintln!` + `emit("chat_error", {conv_id, "保存对话失败: …"})`,
+///    then still `emit("chat_result", …)`.
 /// 4. Return `Ok(())` immediately — the spawned task runs the stream.
 ///    The Tauri command's IPC call resolves; the frontend sees
 ///    `chat_message` / `chat_result` events as the turn progresses.
@@ -166,7 +179,10 @@ pub async fn run_chat_turn(
                 // Should never happen (run_turn's forwarder always
                 // sends). If it somehow does, the turn_record buffer
                 // still has whatever the forwarders captured; we
-                // persist that + return without emitting chat_result.
+                // persist that + return WITHOUT emitting `chat_result`
+                // (there's no result to emit). Save errors are still
+                // surfaced via `chat_error` here (the hole the
+                // final-review fix closes — no failure is swallowed).
                 let record = turn_record
                     .lock()
                     .map(|r| r.clone())
@@ -174,29 +190,62 @@ pub async fn run_chat_turn(
                         messages: Vec::new(),
                         result: None,
                     });
-                if let Ok(mut conn) = db_clone.lock() {
-                    let _ = db::save_turn_record(&mut *conn, &conv_id_owned, &record);
+                match db_clone.lock() {
+                    Ok(mut conn) => {
+                        if let Err(e) =
+                            db::save_turn_record(&mut *conn, &conv_id_owned, &record)
+                        {
+                            eprintln!(
+                                "save_turn_record failed (no-result arm, conv={conv_id_owned}): {e}"
+                            );
+                            emit(
+                                "chat_error",
+                                json!({
+                                    "conv_id": conv_id_owned.clone(),
+                                    "message": format!("保存对话失败: {e}"),
+                                }),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "db lock poisoned (no-result arm, conv={conv_id_owned}): {e} — cannot persist"
+                        );
+                        emit(
+                            "chat_error",
+                            json!({
+                                "conv_id": conv_id_owned.clone(),
+                                "message": "保存对话失败: 数据库锁获取失败",
+                            }),
+                        );
+                    }
                 }
                 return;
             }
         };
 
-        // Emit the terminal result (best-effort — same hidden-panel
-        // no-op semantics as chat_message).
-        let payload = json!({
-            "conv_id": conv_id_owned,
-            "result": result,
-        });
-        emit("chat_result", payload);
-
-        // Persist the turn (messages + session_id). The turn_record
-        // Arc was filled by run_turn's forwarders as the backend
-        // streamed; we now clone it out under the lock + save. Cloning
-        // the TurnRecord (Vec<Message> + Option<ExecResult>) is cheap
-        // relative to a db transaction; we don't hold the db lock
-        // across the turn_record lock (avoids any lock-ordering
-        // surprise with a future code path that takes them the other
-        // way around).
+        // Persist the turn (messages + session_id) BEFORE emitting
+        // `chat_result`, so the emitted result reflects persistence
+        // success: if the save fails, a `chat_error` event fires
+        // BEFORE `chat_result` (the frontend learns the history won't
+        // survive a restart by the time the result arrives). We still
+        // emit `chat_result` afterward — the turn DID complete
+        // in-memory + the streamed messages were visible live; the
+        // user just needs to be told the save failed.
+        //
+        // Design choice (final-review fix): surface a save failure via
+        // a dedicated `chat_error` event rather than (a) mutating the
+        // `ExecResult`'s `status` to "completed_unsaved" or (b)
+        // adding a `persisted: false` flag to the `chat_result`
+        // payload. Rationale: the `ExecResult` is the agent layer's
+        // domain type (shared with the backends + serialized via
+        // serde); overloading its `status` with a persistence flag
+        // conflates agent outcome with db outcome. A separate event
+        // keeps the `chat_result` payload shape unchanged (no
+        // `ChatResultEvent` TS change, no test churn) + gives the
+        // frontend a single dedicated warning channel. The frontend's
+        // `ChatView` subscribes `chat_error` + shows a banner + an
+        // inline system bubble (see `stream.ts` / `ChatView.svelte`).
         let record = turn_record
             .lock()
             .map(|r| r.clone())
@@ -204,14 +253,53 @@ pub async fn run_chat_turn(
                 messages: Vec::new(),
                 result: None,
             });
-        if let Ok(mut conn) = db_clone.lock() {
-            // `save_turn_record` takes `&mut Connection` — obtain it
-            // from the MutexGuard via `&mut *guard` (deref-mut through
-            // the guard to the underlying Connection). The brief
-            // calls out this exact pattern for the managed
-            // `Arc<Mutex<Connection>>`.
-            let _ = db::save_turn_record(&mut *conn, &conv_id_owned, &record);
+        match db_clone.lock() {
+            Ok(mut conn) => {
+                // `save_turn_record` takes `&mut Connection` — obtain it
+                // from the MutexGuard via `&mut *guard` (deref-mut
+                // through the guard to the underlying Connection). The
+                // brief calls out this exact pattern for the managed
+                // `Arc<Mutex<Connection>>`.
+                if let Err(e) = db::save_turn_record(&mut *conn, &conv_id_owned, &record) {
+                    eprintln!(
+                        "save_turn_record failed (conv={conv_id_owned}): {e}"
+                    );
+                    emit(
+                        "chat_error",
+                        json!({
+                            "conv_id": conv_id_owned.clone(),
+                            "message": format!("保存对话失败: {e}"),
+                        }),
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "db lock poisoned (conv={conv_id_owned}): {e} — cannot persist"
+                );
+                emit(
+                    "chat_error",
+                    json!({
+                        "conv_id": conv_id_owned.clone(),
+                        "message": "保存对话失败: 数据库锁获取失败",
+                    }),
+                );
+            }
         }
+
+        // Emit the terminal result (best-effort — same hidden-panel
+        // no-op semantics as chat_message). The save above already
+        // fired `chat_error` if it failed, so by the time this fires
+        // the frontend's state is accurate. Cloning the TurnRecord
+        // above (Vec<Message> + Option<ExecResult>) is cheap relative
+        // to a db transaction; we don't hold the db lock across the
+        // turn_record lock (avoids any lock-ordering surprise with a
+        // future code path that takes them the other way around).
+        let payload = json!({
+            "conv_id": conv_id_owned,
+            "result": result,
+        });
+        emit("chat_result", payload);
     });
 
     // 4. Return immediately — the spawned task runs the stream.

@@ -1,13 +1,13 @@
-// Task 15: Tauri event subscription for `chat_message` / `chat_result`,
-// routed to the active conversation by `conv_id`.
+// Task 15: Tauri event subscription for `chat_message` / `chat_result`
+// / `chat_error`, routed to the active conversation by `conv_id`.
 //
 // `chat_send` returns immediately; the spawned drain task in
 // `chat::run_chat_turn` emits these events as the backend streams +
-// when the turn completes. The frontend's `ChatView` mounts this
-// router once + dispatches by `conv_id` to the right conversation's
-// live message buffer (so the user sees the stream even if they
-// switched conversations mid-stream — the messages land in the right
-// conversation).
+// when the turn completes / when a save fails. The frontend's
+// `ChatView` mounts this router once + dispatches by `conv_id` to the
+// right conversation's live message buffer (so the user sees the
+// stream even if they switched conversations mid-stream — the messages
+// land in the right conversation).
 //
 // Review Focus #3 (survives-hide): if the panel is hidden mid-stream
 // (no listener), the emit is a no-op — but the backend keeps running
@@ -36,16 +36,31 @@ export interface ChatResultEvent {
   result: ExecResult;
 }
 
+/** `chat_error` payload — a non-fatal warning surfaced when
+ * `save_turn_record` fails (disk full / FS error / db lock poisoned).
+ * The turn DID complete in-memory (`chat_result` is still emitted
+ * afterward), but the messages + agent-native `session_id` won't
+ * survive a restart. Emitted by `chat::run_chat_turn`'s drain task
+ * BEFORE `chat_result` (save runs before emit). The frontend surfaces
+ * this as a warning banner + an inline system bubble so the user
+ * learns the turn was NOT persisted (final-review fix: no failure is
+ * invisible). */
+export interface ChatErrorEvent {
+  conv_id: string;
+  message: string;
+}
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
 /** Callbacks the `ChatView` registers per-event. The `conv_id` is
  * already extracted by the router so the callback only handles its own
- * conversation's message / result. */
+ * conversation's message / result / error. */
 export interface StreamHandlers {
   onMessage: (convId: string, message: Message) => void;
   onResult: (convId: string, result: ExecResult) => void;
+  onError: (convId: string, message: string) => void;
 }
 
 /**
@@ -83,6 +98,20 @@ export async function subscribeChatStream(
     },
   );
   unsubs.push(unlistenResult);
+
+  // `chat_error` — a `save_turn_record` failure (the turn completed
+  // in-memory but won't be persisted). Surfaced by the drain task
+  // BEFORE `chat_result` (save runs before emit). Final-review fix:
+  // the frontend learns the save failed instead of silently dropping
+  // the turn on restart.
+  const unlistenError = await listen<ChatErrorEvent>(
+    "chat_error",
+    (e) => {
+      const { conv_id, message } = e.payload;
+      handlers.onError(conv_id, message);
+    },
+  );
+  unsubs.push(unlistenError);
 
   // Single cleanup fn — calls both unlistens. Best-effort: an
   // unlisten that throws (e.g. webview already torn down) doesn't
