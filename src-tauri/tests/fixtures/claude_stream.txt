@@ -1,0 +1,11 @@
+{"type":"system","subtype":"init","cwd":"/home/user/proj","session_id":"abc-123","tools":["Bash","Read","Edit"],"model":"claude-opus-4-8","permissionMode":"default","apiKeySource":"none","claude_code_version":"2.1.228"}
+{"type":"system","subtype":"hook_started","hook_id":"h-1","hook_name":"SessionStart:startup","hook_event":"SessionStart","session_id":"abc-123"}
+{"type":"assistant","message":{"id":"msg-1","role":"assistant","model":"claude-opus-4-8","type":"message","content":[{"type":"thinking","thinking":"Let me think about the reply."}]},"session_id":"abc-123","uuid":"u-1"}
+{"type":"assistant","message":{"id":"msg-2","role":"assistant","model":"claude-opus-4-8","type":"message","content":[{"type":"text","text":"hello"}]},"session_id":"abc-123","uuid":"u-2"}
+{"type":"assistant","message":{"id":"msg-3","role":"assistant","model":"claude-opus-4-8","type":"message","content":[{"type":"tool_use","id":"call-1","name":"Read","input":{"file_path":"/tmp/foo.txt"}}]},"session_id":"abc-123","uuid":"u-3"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":"file contents here"}]},"session_id":"abc-123","uuid":"u-4"}
+{"type":"assistant","message":{"id":"msg-4","role":"assistant","model":"claude-opus-4-8","type":"message","content":[{"type":"text","text":"done"}]},"session_id":"abc-123","uuid":"u-5"}
+{"type":"result","subtype":"success","result":"done","session_id":"abc-123","is_error":false,"duration_ms":1234,"num_turns":2,"model":"claude-opus-4-8"}
+this is not json at all
+{"type":"log","log":{"level":"info","message":"stream started"}}
+{"type":"system","subtype":"hook_response","hook_id":"h-1","session_id":"abc-123"}

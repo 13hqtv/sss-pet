@@ -12,6 +12,9 @@
 //! expose. Names are FROZEN — Tasks 9–13/15 consume them.
 
 pub mod exec;
+// Task 9: shared stream-json line parser → unified `Message` (consumed by
+// Task 10's claude backend). Pure Rust, no I/O.
+pub mod stream_json;
 
 use std::collections::HashMap;
 use std::fmt;
