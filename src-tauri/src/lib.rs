@@ -1,4 +1,5 @@
 mod config;
+pub mod state;
 mod tray;
 mod window;
 
