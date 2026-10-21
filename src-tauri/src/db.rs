@@ -104,10 +104,14 @@ fn appdata_dir() -> Option<PathBuf> {
 ///    NOT actually prevent file creation inside — but treating the bit
 ///    as authoritative respects the user's explicit "I marked this
 ///    read-only" intent.
-/// 2. Create + delete a `.swd-pet-probe-<pid>` file — catches the
+/// 2. Create + delete a `.swd-pet-probe-<pid>-<seq>` file — catches the
 ///    ACL-protected-but-not-flagged case (Program Files on Windows: the
 ///    dir isn't `readonly`-flagged, but writes still fail). The probe
-///    filename is PID-scoped so parallel tests don't collide.
+///    filename is PID + a per-process monotonic counter so two threads
+///    in the SAME process probing the SAME dir simultaneously (e.g.
+///    parallel `cargo test` threads, or two callers racing on the same
+///    exe dir) get DISTINCT filenames — previously PID-only, so the
+///    second `File::create` would fail → false negative.
 fn is_writable(dir: &Path) -> bool {
     if !dir.exists() {
         return false;
@@ -118,7 +122,12 @@ fn is_writable(dir: &Path) -> bool {
     {
         return false;
     }
-    let probe = dir.join(format!(".swd-pet-probe-{}", std::process::id()));
+    // PID + per-process counter: concurrent probes never collide on the
+    // probe filename (the collision used to make the second `File::create`
+    // fail spuriously, reporting a writable dir as read-only).
+    static PROBE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = PROBE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let probe = dir.join(format!(".swd-pet-probe-{}-{}", std::process::id(), seq));
     match std::fs::File::create(&probe) {
         Ok(_) => {
             let _ = std::fs::remove_file(&probe);
@@ -383,29 +392,47 @@ pub fn load_messages(conn: &Connection, conv_id: &str) -> rusqlite::Result<Vec<S
 /// `session_id` so the NEXT turn resumes the agent's native session
 /// (mirrors multica's `ResumeSessionID`). Called by Task 15's chat
 /// controller after a turn's stream + result resolve.
+///
+/// **Atomicity (fix-round-1, brief's SQL-hygiene "transactions for
+/// multi-statement"):** this runs N message INSERTs followed by a
+/// conditional `UPDATE conversations SET session_id`. All of it is
+/// wrapped in ONE rusqlite `Transaction` — either every statement
+/// commits together (`tx.commit()`) OR, if any statement after the
+/// first fails, the whole batch rolls back (rusqlite drops the
+/// `Transaction` on the early-return `?` path, which issues
+/// `ROLLBACK`). Without the transaction, an autocommit-mode failure
+/// mid-way would leave earlier message INSERTs committed while the
+/// `session_id` UPDATE was lost — partial messages + a stale/missing
+/// resume key (the bug this fix closes).
 pub fn save_turn_record(
-    conn: &Connection,
+    conn: &mut Connection,
     conv_id: &str,
     record: &TurnRecord,
 ) -> rusqlite::Result<()> {
+    // `Transaction` derefs to `&Connection` so `append_message(&tx, …)`
+    // and `tx.execute(…)` work via deref coercion. The `?` below
+    // propagates any error and, in doing so, DROPS `tx` — rusqlite's
+    // `Drop for Transaction` issues `ROLLBACK`, so no partial commit.
+    let tx = conn.transaction()?;
     // 1. Append all messages as StoredMessages (kind → role string).
     for m in &record.messages {
         let sm = StoredMessage {
             role: message_kind_to_role(m.kind),
             content: m.content.clone(),
         };
-        append_message(conn, conv_id, &sm)?;
+        append_message(&tx, conv_id, &sm)?;
     }
     // 2. If the result surfaced a new agent-native session_id, update
     //    the conversation row so the next turn resumes that session.
     if let Some(result) = &record.result {
         if let Some(sid) = &result.session_id {
-            conn.execute(
+            tx.execute(
                 "UPDATE conversations SET session_id = ?1 WHERE id = ?2",
                 rusqlite::params![sid, conv_id],
             )?;
         }
     }
+    tx.commit()?;
     Ok(())
 }
 
@@ -692,7 +719,7 @@ mod tests {
 
     #[test]
     fn save_turn_record_appends_messages_and_updates_session_id() {
-        let (_tmp, conn) = fresh_db();
+        let (_tmp, mut conn) = fresh_db();
         let conv = Conversation {
             id: unique_id("tr"),
             provider: "claude".into(),
@@ -737,7 +764,7 @@ mod tests {
                 usage: HashMap::new(),
             }),
         };
-        save_turn_record(&conn, &conv.id, &record).expect("save_turn_record");
+        save_turn_record(&mut conn, &conv.id, &record).expect("save_turn_record");
 
         // The conversation's session_id is now the agent-native id →
         // the NEXT turn will resume (Task 13's resume_or_replay sees
@@ -768,7 +795,7 @@ mod tests {
     /// clear an existing session_id.
     #[test]
     fn save_turn_record_with_none_session_id_preserves_existing() {
-        let (_tmp, conn) = fresh_db();
+        let (_tmp, mut conn) = fresh_db();
         let conv = Conversation {
             id: unique_id("preserved"),
             provider: "claude".into(),
@@ -791,12 +818,115 @@ mod tests {
                 usage: HashMap::new(),
             }),
         };
-        save_turn_record(&conn, &conv.id, &record).expect("save");
+        save_turn_record(&mut conn, &conv.id, &record).expect("save");
         let loaded = load_conversation(&conn, &conv.id).expect("load").expect("present");
         assert_eq!(
             loaded.session_id.as_deref(),
             Some("existing-sess"),
             "None session_id must NOT clear the existing one"
+        );
+    }
+
+    /// **Atomicity (fix-round-1)** — `save_turn_record` runs N message
+    /// INSERTs followed by a conditional `UPDATE conversations SET
+    /// session_id`. All of that MUST be one transaction: if the UPDATE
+    /// fails mid-way, the earlier message INSERTs must roll back (no
+    /// partial commit) AND the conversation's `session_id` must stay
+    /// where it was. Without the transaction (autocommit mode), the
+    /// message INSERTs would be committed and the lost UPDATE would
+    /// leave a partial-messages + stale-resume-key state — exactly the
+    /// bug this test pins.
+    ///
+    /// Failure is injected by rebuilding `conversations` with a CHECK
+    /// constraint that rejects a poison `session_id` value. The turn's
+    /// `result.session_id` is set to that poison value: the 2 message
+    /// INSERTs succeed, then the UPDATE violates the CHECK and errors
+    /// out. The transaction rolls back, so `load_messages` returns
+    /// empty AND the conversation's `session_id` is unchanged.
+    #[test]
+    fn save_turn_record_atomicity() {
+        let (_tmp, mut conn) = fresh_db();
+        // Rebuild `conversations` with a CHECK that rejects the poison
+        // session_id. The CHECK turns the UPDATE into the failing
+        // statement that the transaction must roll back from.
+        conn.execute_batch(
+            "DROP TABLE conversations;
+             CREATE TABLE conversations (
+                id TEXT PRIMARY KEY,
+                provider TEXT NOT NULL,
+                session_id TEXT CHECK (session_id IS NULL OR session_id != '__POISON_SESS__'),
+                title TEXT NOT NULL,
+                created_at TEXT NOT NULL
+             );",
+        )
+        .expect("rebuild conversations with CHECK");
+
+        let conv = Conversation {
+            id: unique_id("atom"),
+            provider: "claude".into(),
+            session_id: Some("original-sess".into()), // a valid (non-poison) value
+            title: "Atomicity".into(),
+            created_at: chrono::Utc::now(),
+        };
+        save_conversation(&conn, &conv).expect("save conversation with valid session_id");
+
+        // TurnRecord: 2 messages + a result whose session_id is the
+        // poison value. The loop appends both messages (both INSERTs
+        // succeed), then the `UPDATE conversations SET session_id`
+        // fails the CHECK → `save_turn_record` returns Err.
+        let record = TurnRecord {
+            messages: vec![
+                Message {
+                    kind: MessageKind::Text,
+                    content: "first".into(),
+                    tool: None,
+                    call_id: None,
+                },
+                Message {
+                    kind: MessageKind::Text,
+                    content: "second".into(),
+                    tool: None,
+                    call_id: None,
+                },
+            ],
+            result: Some(ExecResult {
+                status: "completed".into(),
+                output: "done".into(),
+                session_id: Some("__POISON_SESS__".into()),
+                usage: HashMap::new(),
+            }),
+        };
+        let err = save_turn_record(&mut conn, &conv.id, &record).expect_err(
+            "UPDATE must fail the CHECK constraint, surfacing an error from save_turn_record",
+        );
+        // Sanity: the error is indeed a CHECK constraint violation, not
+        // some unrelated failure that would make the test pass for the
+        // wrong reason.
+        let msg = format!("{err}");
+        assert!(
+            msg.to_lowercase().contains("check")
+                || msg.to_lowercase().contains("constraint"),
+            "expected a CHECK-constraint failure, got: {msg}"
+        );
+
+        // (a) The transaction rolled back the 2 message INSERTs —
+        // without the transaction they would have been committed in
+        // autocommit mode.
+        let msgs = load_messages(&conn, &conv.id).expect("load messages");
+        assert!(
+            msgs.is_empty(),
+            "transaction must roll back the message INSERTs on UPDATE failure; got {msgs:?}"
+        );
+
+        // (b) The conversation's session_id is unchanged — the failed
+        // UPDATE was never persisted (rolled back, AND it errored out).
+        let loaded = load_conversation(&conn, &conv.id)
+            .expect("load conversation")
+            .expect("conversation still present");
+        assert_eq!(
+            loaded.session_id.as_deref(),
+            Some("original-sess"),
+            "session_id must be unchanged after the transaction rolled back"
         );
     }
 
