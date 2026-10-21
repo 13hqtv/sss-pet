@@ -18,11 +18,12 @@
 //!
 //! **Review Focus #3 (survives-hide):** [`run_turn`] spawns forwarder
 //! tasks that drain the backend's `messages` / `result` channels into
-//! both a frontend-facing channel pair AND a persistent `Arc<Mutex<Vec<
-//! Message>>>` buffer. If the frontend drops its receivers (panel
-//! hidden mid-stream), the forwarder keeps draining the backend and
-//! buffering — the full message stream + final result are always
-//! captured for history. See `run_turn_survives_hide`.
+//! both a frontend-facing channel pair AND a persistent
+//! `Arc<Mutex<TurnRecord>>` buffer (messages + final `ExecResult`). If
+//! the frontend drops its receivers (panel hidden mid-stream), the
+//! forwarder keeps draining the backend and buffering — the full message
+//! stream + final result are always captured for history. See
+//! `run_turn_survives_hide`.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -65,6 +66,53 @@ pub struct Conversation {
     pub session_id: Option<String>,
     pub title: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// One turn's captured record: the streamed [`Message`]s the backend
+/// emitted, PLUS the final [`ExecResult`] — the structured outcome of
+/// the turn. This is what [`run_turn`] buffers behind the
+/// `Arc<Mutex<TurnRecord>>` it returns, and what Task 14 (db) persists
+/// + Task 15 (chat) replays.
+///
+/// **Why a struct, not a `Vec<Message>`:** the prior shape stuffed the
+/// `ExecResult` into the message buffer as a synthetic
+/// `Message{kind: Status, content: "session=… status=… output=…"}`. That
+/// was ambiguous — (a) it was indistinguishable from a real
+/// backend-emitted `Status` message (same [`crate::agent::MessageKind`]),
+/// and (b) the `format!("session={} status={} output={}")` delimiter
+/// mis-splits if any value contains ` status=` / ` output=`. Downstream
+/// (Task 14 db + Task 15 chat) couldn't tell the result from a real
+/// status line and would mis-parse it. The fix-round-1 controller ruling
+/// is to **separate** the two: messages stay messages, the result lives
+/// in its own `result: Option<ExecResult>` field. The result-forwarder
+/// STILL forwards the `ExecResult` to the frontend's `result` oneshot
+/// (so the live [`Session::result`] resolves) — it just ALSO lands it in
+/// `record.result` instead of fabricating a fake `Status` message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnRecord {
+    /// The streamed messages (text / thinking / tool-use / tool-result /
+    /// status / error / log) the backend emitted during this turn, in
+    /// arrival order. Source of truth for history — Task 14 persists this
+    /// `Vec` as the turn's message stream.
+    pub messages: Vec<Message>,
+    /// The turn's terminal outcome — `None` while the turn is in flight,
+    /// `Some(exec_result)` once the backend's `result` oneshot resolved
+    /// (or the forwarder synthesized a `"failed"` result when the backend
+    /// dropped its sender without sending). Separated from `messages` so
+    /// history consumers can read the structured result without parsing a
+    /// synthetic status string out of the message stream.
+    pub result: Option<ExecResult>,
+}
+
+impl TurnRecord {
+    /// Empty record (no messages, no result yet) — the initial state of
+    /// the buffer [`run_turn`] creates.
+    fn new() -> Self {
+        Self {
+            messages: Vec::new(),
+            result: None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -152,21 +200,28 @@ fn build_replay_prompt(history: &[StoredMessage], new_prompt: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Drive one turn of `conv` through `backend`, returning a frontend-facing
-/// [`Session`] AND a persistent `Arc<Mutex<Vec<Message>>>` buffer.
+/// [`Session`] AND a persistent `Arc<Mutex<TurnRecord>>` buffer.
 ///
 /// 1. `(opts, prompt) = resume_or_replay(conv, history, new_prompt)`; set
 ///    `opts.cwd = cwd`.
 /// 2. `backend.execute(&prompt, opts)` → the backend's live [`Session`].
 /// 3. Create a NEW frontend channel pair (`mpsc` for messages, `oneshot` for
-///    result) + an `Arc<Mutex<Vec<Message>>>` buffer.
+///    result) + an `Arc<Mutex<TurnRecord>>` buffer (messages + result).
 /// 4. Spawn a **message forwarder**: take `backend_session.messages`; for
-///    each msg → push to the buffer AND `frontend_tx.send(msg).await` (send
-///    errors = frontend dropped its receiver — IGNORE, keep buffering +
+///    each msg → push to `record.messages` AND `frontend_tx.send(msg).await`
+///    (send errors = frontend dropped its receiver — IGNORE, keep buffering +
 ///    draining the backend). On the backend messages channel closing → drop
 ///    `frontend_tx` (closes the frontend receiver cleanly).
-/// 5. Spawn a **result forwarder**: `backend_session.result.await` → push
-///    the `ExecResult` (as a synthetic [`Message`] of kind `Status`) to the
-///    buffer; `frontend_result_tx.send(exec_result)` (ignore send error).
+/// 5. Spawn a **result forwarder**: `backend_session.result.await` → set
+///    `record.result = Some(exec_result)` (NOT a synthetic `Status` message
+///    — the result is a structured field, distinguishable from real
+///    backend-emitted status lines) + forward `exec_result` to the
+///    frontend's result oneshot (ignore send error). If the backend
+///    dropped its result sender without sending (e.g. its task panicked),
+///    synthesize an `ExecResult{status:"failed", ..}` so the frontend's
+///    `result` always resolves AND `record.result` is still set — matches
+///    the "caller's result always resolves" contract from the claude
+///    backend's `drain_stream`.
 /// 6. Return `(Session { messages: frontend_rx, result: frontend_result_rx
 ///    }, buffer)`.
 ///
@@ -181,7 +236,7 @@ pub async fn run_turn(
     history: &[StoredMessage],
     new_prompt: &str,
     cwd: &Path,
-) -> Result<(Session, Arc<Mutex<Vec<Message>>>), BackendError> {
+) -> Result<(Session, Arc<Mutex<TurnRecord>>), BackendError> {
     // 1. Decide resume vs replay; set the cwd to the caller's project dir.
     let (mut opts, prompt) = resume_or_replay(conv, history, new_prompt);
     opts.cwd = cwd.to_path_buf();
@@ -192,19 +247,19 @@ pub async fn run_turn(
     // 3. Create the frontend-facing channel pair + the persistent buffer.
     let (frontend_tx, frontend_rx) = mpsc::channel::<Message>(64);
     let (frontend_result_tx, frontend_result_rx) = oneshot::channel::<ExecResult>();
-    let buffer: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
+    let buffer: Arc<Mutex<TurnRecord>> = Arc::new(Mutex::new(TurnRecord::new()));
 
-    // 4. Message forwarder: drain backend messages → buffer + frontend.
-    //    A send error (frontend dropped its receiver) is IGNORED — the
-    //    forwarder keeps draining the backend into the buffer so the full
-    //    message stream is captured for history even if the panel hid
+    // 4. Message forwarder: drain backend messages → buffer.messages +
+    //    frontend. A send error (frontend dropped its receiver) is IGNORED
+    //    — the forwarder keeps draining the backend into the buffer so the
+    //    full message stream is captured for history even if the panel hid
     //    mid-stream (Review Focus #3).
     let buffer_msgs = Arc::clone(&buffer);
     let mut backend_rx = backend_session.messages;
     tokio::spawn(async move {
         while let Some(msg) = backend_rx.recv().await {
-            if let Ok(mut buf) = buffer_msgs.lock() {
-                buf.push(msg.clone());
+            if let Ok(mut rec) = buffer_msgs.lock() {
+                rec.messages.push(msg.clone());
             }
             // Best-effort forward; a dropped receiver does NOT stop the
             // drain (the buffer is the source of truth for history).
@@ -215,10 +270,13 @@ pub async fn run_turn(
         drop(frontend_tx);
     });
 
-    // 5. Result forwarder: await the backend's final ExecResult → push a
-    //    synthetic Status message to the buffer (so the history captures
-    //    the terminal outcome) + forward to the frontend's result
-    //    oneshot. Again, send errors are ignored (frontend may be gone).
+    // 5. Result forwarder: await the backend's final ExecResult → set
+    //    `record.result = Some(exec_result)` (structured — NOT a synthetic
+    //    Status message stuffed into the message buffer, which was
+    //    ambiguous with real backend Status lines + delimiter-fragile) +
+    //    forward to the frontend's result oneshot (so the live
+    //    Session.result resolves). Again, send errors are ignored
+    //    (frontend may be gone) — the buffer still captured the result.
     let buffer_res = Arc::clone(&buffer);
     let backend_result_rx = backend_session.result;
     tokio::spawn(async move {
@@ -226,9 +284,9 @@ pub async fn run_turn(
             Ok(r) => r,
             // The backend dropped its result sender without sending
             // (e.g. its task panicked). Synthesize a "failed" result so
-            // the frontend's `result` always resolves — matches the
-            // "caller's result always resolves" contract from the claude
-            // backend's drain_stream.
+            // the frontend's `result` always resolves AND `record.result`
+            // is set — matches the "caller's result always resolves"
+            // contract from the claude backend's drain_stream.
             Err(_) => ExecResult {
                 status: "failed".into(),
                 output: String::new(),
@@ -236,24 +294,11 @@ pub async fn run_turn(
                 usage: std::collections::HashMap::new(),
             },
         };
-        if let Ok(mut buf) = buffer_res.lock() {
-            buf.push(Message {
-                kind: crate::agent::MessageKind::Status,
-                content: format!(
-                    "session={} status={} output={}",
-                    exec_result
-                        .session_id
-                        .as_deref()
-                        .unwrap_or(""),
-                    exec_result.status,
-                    exec_result.output,
-                ),
-                tool: None,
-                call_id: None,
-            });
+        if let Ok(mut rec) = buffer_res.lock() {
+            rec.result = Some(exec_result.clone());
         }
         // Best-effort forward; a dropped receiver is fine — the buffer
-        // still captured the result.
+        // still captured the result in `record.result`.
         let _ = frontend_result_tx.send(exec_result);
     });
 
@@ -444,7 +489,8 @@ mod tests {
     /// The frontend drops its receivers immediately after `run_turn`
     /// returns (panel hidden). The forwarder must keep draining the
     /// backend and buffering — the buffer ends up with ALL the canned
-    /// messages + the synthetic result message, despite the drop.
+    /// messages in `record.messages` AND the `ExecResult` in
+    /// `record.result`, despite the drop.
     #[tokio::test]
     async fn run_turn_survives_hide() {
         let backend = fake_backend();
@@ -465,34 +511,65 @@ mod tests {
         // Simulate the frontend hiding: drop BOTH receivers.
         drop(session);
 
-        // Give the forwarder tasks time to drain the backend into the
-        // buffer. The backend's canned batch is tiny; a few short yields
-        // suffice. Cap with a timeout so a broken forwarder fails fast
-        // instead of hanging the test.
-        for _ in 0..200 {
-            tokio::task::yield_now().await;
+        // Poll the buffer's `result` field (set by the result-forwarder
+        // once the backend's ExecResult arrives) up to 2s, ~10ms apart.
+        // This is NOT timing-fragile — it waits exactly until the result
+        // lands (or fails fast at the 2s cap). The prior `yield_now×200 +
+        // sleep 50ms` was a fixed delay that could flake under a slow
+        // scheduler; polling the actual completion signal is robust.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            {
+                let rec = buffer.lock().expect("buffer not poisoned");
+                if rec.result.is_some() {
+                    break;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        // Belt-and-braces: also sleep a few ms so spawned tasks get
-        // scheduled even under a cooperative scheduler.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let buf = buffer.lock().expect("buffer not poisoned");
-        let text_count = buf
+        let rec = buffer.lock().expect("buffer not poisoned");
+        // The result was captured despite the hide — the result-forwarder
+        // set `record.result` even though both frontend receivers were
+        // dropped before the result arrived (Review Focus #3).
+        assert!(
+            rec.result.is_some(),
+            "result must land in TurnRecord despite the frontend drop, got: {:?}",
+            rec.result
+        );
+        // The messages were captured despite the hide — exactly the 3
+        // canned messages (2 Text + 1 ToolUse). No synthetic Status
+        // message is pushed anymore (the result lives in `rec.result`),
+        // so the count is exactly the canned batch size.
+        assert_eq!(
+            rec.messages.len(),
+            3,
+            "buffer should contain ALL 3 canned messages despite the frontend drop, got: {:?}",
+            rec.messages
+        );
+        let text_count = rec
+            .messages
             .iter()
             .filter(|m| m.kind == MessageKind::Text)
             .count();
         assert_eq!(
             text_count,
             2,
-            "buffer should contain ALL canned Text messages despite the frontend drop, got: {buf:?}"
+            "buffer should contain ALL canned Text messages despite the frontend drop, got: {:?}",
+            rec.messages
         );
         assert!(
-            buf.iter().any(|m| m.content == "hello"),
-            "buffer missing first canned message, got: {buf:?}"
+            rec.messages.iter().any(|m| m.content == "hello"),
+            "buffer missing first canned message, got: {:?}",
+            rec.messages
         );
         assert!(
-            buf.iter().any(|m| m.content == "world"),
-            "buffer missing second canned message, got: {buf:?}"
+            rec.messages.iter().any(|m| m.content == "world"),
+            "buffer missing second canned message, got: {:?}",
+            rec.messages
         );
     }
 
@@ -555,14 +632,33 @@ mod tests {
         );
 
         // The buffer mirrors the stream.
-        let buf = buffer.lock().expect("buffer not poisoned");
-        assert!(
-            buf.iter().any(|m| m.content == "hello"),
-            "buffer should also capture first canned message, got: {buf:?}"
-        );
-        assert!(
-            buf.iter().any(|m| m.content == "world"),
-            "buffer should also capture second canned message, got: {buf:?}"
-        );
+        {
+            let rec = buffer.lock().expect("buffer not poisoned");
+            assert!(
+                rec.messages.iter().any(|m| m.content == "hello"),
+                "buffer should also capture first canned message, got: {:?}",
+                rec.messages
+            );
+            assert!(
+                rec.messages.iter().any(|m| m.content == "world"),
+                "buffer should also capture second canned message, got: {:?}",
+                rec.messages
+            );
+        }
+
+        // The result landed in the TurnRecord's `result` field (NOT just
+        // the frontend channel) — the result-forwarder set `record.result`
+        // when the backend's ExecResult arrived. This is the fix-round-1
+        // assertion: the structured result is captured separately from the
+        // message stream (no synthetic Status message to mis-parse).
+        {
+            let rec = buffer.lock().expect("buffer not poisoned");
+            assert_eq!(
+                rec.result,
+                Some(result.clone()),
+                "result must land in TurnRecord (not just the frontend channel), got: {:?}",
+                rec.result
+            );
+        }
     }
 }

@@ -48,7 +48,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Whitelist of v1 supported agent types. The factory [`new`] matches
 /// these case-sensitively; anything else returns
@@ -60,7 +60,10 @@ pub const SUPPORTED: &[&str] = &["claude", "opencode", "codex"];
 /// Kind tag for a [`Message`]. Mirrors multica's unified event taxonomy so
 /// the webview can render text / thinking / tool activity uniformly across
 /// claude / opencode / codex despite their different native stream formats.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// `Serialize` + `Deserialize` so that [`Message`] (and Task 13's
+/// [`crate::agent::conversation::TurnRecord`]) can round-trip through the
+/// persistence layer (Task 14 db / Task 15 chat).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageKind {
     /// Plain assistant text (an assistant message / turn output).
     Text,
@@ -82,8 +85,11 @@ pub enum MessageKind {
 /// renders these as they arrive (text / thinking bubbles, tool-use /
 /// tool-result chips). `tool` is set for `ToolUse` / `ToolResult`;
 /// `call_id` pairs a `ToolResult` with its `ToolUse`. Both are `None`
-/// for `Text` / `Thinking` / `Status` / `Error` / `Log`.
-#[derive(Debug, Clone, Serialize)]
+/// for `Text` / `Thinking` / `Status` / `Error` / `Log`. `Serialize` +
+/// `Deserialize` so a turn's buffered `Vec<Message>` can be persisted
+/// (Task 14 db) and replayed (Task 15 chat) — Task 13's `TurnRecord`
+/// holds the buffer + the final `ExecResult` in one serializable record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub kind: MessageKind,
     pub content: String,
@@ -95,8 +101,11 @@ pub struct Message {
 /// may touch multiple models (e.g. main + a small summarizer), hence the
 /// `HashMap<String, TokenUsage>` in [`ExecResult`]. `cost_usd_ticks`
 /// is in fixed-point ticks (1 tick = 1e-6 USD) to keep the struct
-/// integer-only and avoid f64 drift in serialized history.
-#[derive(Debug, Clone)]
+/// integer-only and avoid f64 drift in serialized history. `Serialize` +
+/// `Deserialize` + `PartialEq` so [`ExecResult`] (and Task 13's
+/// `TurnRecord`) can round-trip through persistence AND be compared in
+/// tests (the `run_turn` tests assert `buffer.result == Some(exec_result)`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub input_tokens: i64,
     pub output_tokens: i64,
@@ -124,8 +133,13 @@ pub struct ExecOptions {
 /// concatenated final text (for convenience — the webview usually
 /// renders the streamed `Message`s instead); `session_id` is the
 /// agent-native id to persist for [`ExecOptions::resume_session_id`] on
-/// the next turn; `usage` maps model name → token accounting.
-#[derive(Debug, Clone)]
+/// the next turn; `usage` maps model name → token accounting. `Serialize`
+/// + `Deserialize` + `PartialEq` so Task 13's `TurnRecord` can carry an
+/// `Option<ExecResult>` that round-trips through persistence AND the
+/// `run_turn` tests can assert `buffer.result == Some(exec_result)`
+/// (controller fix-round-1 ruling: the result lands in the `TurnRecord`,
+/// NOT as a synthetic `Status` message stuffed into the message buffer).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExecResult {
     pub status: String,
     pub output: String,
