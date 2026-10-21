@@ -34,6 +34,17 @@
 //! `set_ignore_cursor_events` work and sleeps at a longer cadence). This
 //! closes the Task 2 deferred minor "poll runs unconditionally" and keeps
 //! the CPU/idle constraint satisfied for the hidden case too.
+//!
+//! ## Pet dragging & panel spawn (Task 4)
+//!
+//! Task 4 makes the pet draggable (`data-tauri-drag-region` on the robot SVG
+//! root → `start_dragging`) and adds [`open_panel_above_pet`] which flips the
+//! panel above/below the pet based on which side has room on the pet's
+//! current monitor's work area. A second atomic flag [`DRAGGING`] is set by
+//! the frontend via the `set_pet_dragging` Tauri command for the duration of
+//! a drag: the poller honors it by pinning `ignore=false` so the OS drag is
+//! never interrupted by a click-through flip if the cursor momentarily leaves
+//! the robot rect between OS drag ticks (the window lags the cursor briefly).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -69,19 +80,55 @@ const HYSTERESIS_PX: i32 = 2;
 /// `GetCursorPos` returns physical pixels too, so no DPI conversion is needed).
 const ROBOT_MARGIN_RATIO: i32 = 10; // margin = outer_size / 10 (parts per hundred)
 
+/// Vertical gap between the pet and the panel when the panel opens above or
+/// below it. Matches the brief's "~4px" — small enough that the panel reads
+/// as attached to the robot, large enough that they don't visually merge.
+const PANEL_GAP_PX: i32 = 4;
+
+/// Margin from the work-area edge the pet sits at on startup, when there is
+/// no persisted position to restore. ~8px per the brief. Kept small so the
+/// pet genuinely reads as "bottom-right" rather than "near bottom-right".
+const PET_MARGIN_PX: i32 = 8;
+
 /// Source-of-truth flag for whether the pet overlay window is currently
 /// visible. Read by the click-through poller each tick to decide whether to
 /// do cursor work; written by [`show_pet`]/[`hide_pet`].
 ///
 /// Starts `true` because `tauri.conf.json` declares the pet window
-/// `visible: true`. [`show_pet`]/[`hide_pet`] keep this in sync with the
-/// actual window state by setting the flag *before* calling `show()`/`hide()`
-/// so the poller observes the new state no later than its next tick.
+/// `visible: true`. [`show_pet`]/[`hide_pet`] set this *after* the underlying
+/// `show()`/`hide()` call succeeds so the flag always matches the actual
+/// window state (closes the Task 3 deferred minor "PET_VISIBLE set before
+/// op, self-correcting but improvable"). Resume latency on `show()` is bounded
+/// by [`POLL_INTERVAL`] (~30ms), imperceptible against a user-initiated click.
 static PET_VISIBLE: AtomicBool = AtomicBool::new(true);
 
 /// Whether the pet overlay window is currently visible, per [`PET_VISIBLE`].
 fn pet_is_visible() -> bool {
     PET_VISIBLE.load(Ordering::Acquire)
+}
+
+/// Source-of-truth flag for whether the pet window is currently being dragged
+/// by the user (set by the `set_pet_dragging` Tauri command from
+/// `Pet.svelte`'s `mousedown`/`mouseup` handlers around the
+/// `data-tauri-drag-region` OS drag). The poller honors this by pinning
+/// `ignore=false` while it is `true`: during a drag the cursor stays on the
+/// robot, but the window may lag the cursor between OS drag ticks, so the
+/// cursor could momentarily read outside the (now-stale) robot rect and
+/// trigger a pass-through flip that would break the drag. Pinning sidesteps
+/// that race without needing to track the cursor-vs-window offset.
+static DRAGGING: AtomicBool = AtomicBool::new(false);
+
+/// Whether the pet is currently being dragged. Read by the poller each tick.
+fn pet_is_dragging() -> bool {
+    DRAGGING.load(Ordering::Acquire)
+}
+
+/// Set the [`DRAGGING`] flag. Called by the `set_pet_dragging` Tauri command
+/// (registered in `lib.rs`), which the frontend invokes on `mousedown`
+/// (`true`) and `mouseup` (`false`) around the `data-tauri-drag-region` OS
+/// drag of the pet window.
+pub fn set_pet_dragging_state(dragging: bool) {
+    DRAGGING.store(dragging, Ordering::Release);
 }
 
 /// Set whether the window with `label` ignores (passes through) cursor events.
@@ -196,6 +243,25 @@ fn poll_loop<R: Runtime + 'static>(app: tauri::AppHandle<R>) {
             eprintln!("[pet] click-through poll: pet visible, resuming cursor work");
         }
 
+        // Drag gate (Task 4). While the user is dragging the pet window (the
+        // frontend set DRAGGING=true via `set_pet_dragging` around the
+        // `data-tauri-drag-region` OS drag), pin `ignore=false` so the drag
+        // is never interrupted by a pass-through flip — the cursor stays on
+        // the robot but the window may lag the cursor between OS drag ticks,
+        // so the poller could otherwise read the cursor as momentarily
+        // outside the (stale) robot rect and toggle pass-through on. Pinning
+        // avoids that race without needing to track cursor-vs-window offset.
+        if pet_is_dragging() {
+            if currently_pass_through {
+                // Best-effort: ignore errors so a transient set_ignore_cursor_events
+                // failure doesn't crash the drag. The next tick retries.
+                let _ = pet.set_ignore_cursor_events(false);
+                currently_pass_through = false;
+            }
+            thread::sleep(POLL_INTERVAL);
+            continue;
+        }
+
         // outer_position / outer_size both return physical pixels, matching
         // GetCursorPos's coordinate space — no DPI scaling needed.
         let (Ok(pos), Ok(size)) = (pet.outer_position(), pet.outer_size()) else {
@@ -264,26 +330,30 @@ fn poll_loop<R: Runtime + 'static>(app: tauri::AppHandle<R>) {
 /// Show the pet overlay window and mark it visible so the click-through
 /// poller resumes its cursor work.
 ///
-/// Sets [`PET_VISIBLE`] = `true` *before* calling `show()` so the poller's
-/// next tick observes the new state and switches back to [`POLL_INTERVAL`].
+/// Sets [`PET_VISIBLE`] = `true` *after* `show()` succeeds so the flag always
+/// matches the actual window state (closes the Task 3 deferred minor "flag
+/// set before op"). The poller reads the flag every [`POLL_INTERVAL`] (~30ms),
+/// so the ~30ms resume latency is imperceptible against a user-initiated click.
 pub fn show_pet<R: Runtime, M: Manager<R>>(app: &M) -> Result<(), String> {
-    PET_VISIBLE.store(true, Ordering::Release);
     let pet: Option<WebviewWindow<R>> = app.get_webview_window("pet");
     let pet = pet.ok_or_else(|| "window 'pet' not found".to_string())?;
     pet.show().map_err(|e| format!("pet.show() failed: {e}"))?;
+    PET_VISIBLE.store(true, Ordering::Release);
     Ok(())
 }
 
 /// Hide the pet overlay window and pause the click-through poller.
 ///
-/// Sets [`PET_VISIBLE`] = `false` *before* calling `hide()` so the poller's
-/// next tick observes the new state and stops doing cursor work on a window
-/// the user can no longer see.
+/// Sets [`PET_VISIBLE`] = `false` *after* `hide()` succeeds so the flag always
+/// matches the actual window state. The poller observes the new state within
+/// one [`POLL_INTERVAL`] tick (or immediately if it was already in the
+/// [`PAUSE_INTERVAL`] sleep — the sleep is bounded and bounded by the
+/// visibility-flag check on the next iteration).
 pub fn hide_pet<R: Runtime, M: Manager<R>>(app: &M) -> Result<(), String> {
-    PET_VISIBLE.store(false, Ordering::Release);
     let pet: Option<WebviewWindow<R>> = app.get_webview_window("pet");
     let pet = pet.ok_or_else(|| "window 'pet' not found".to_string())?;
     pet.hide().map_err(|e| format!("pet.hide() failed: {e}"))?;
+    PET_VISIBLE.store(false, Ordering::Release);
     Ok(())
 }
 
@@ -356,4 +426,192 @@ pub fn show_panel_or_toggle_pet<R: Runtime, M: Manager<R>>(app: &M) -> Result<()
         }
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Panel spawn + pet startup position (Task 4).
+//
+// `open_panel_above_pet` is the entry point the frontend `Pet.svelte` click
+// handler invokes (via the `open_panel_above_pet` Tauri command registered
+// in `lib.rs`) to pop the panel next to the pet, choosing flip direction
+// based on which side has room on the pet's current monitor's work area.
+//
+// `pet_startup_position` is called once from `lib.rs::run` setup to move the
+// pet off the placeholder (1400, 760) hard-coded in `tauri.conf.json` to the
+// real bottom-right of the primary monitor's work area, or to a saved spot
+// from earlier in this session if the user dragged the pet and then hid +
+// re-showed it (within-session persistence; Task 15 makes it durable).
+// ---------------------------------------------------------------------------
+
+/// Compute the panel's spawn position relative to the pet, choosing flip
+/// direction based on which side of the pet has room on the pet's current
+/// monitor's work area.
+///
+/// Returns `(panel_x, panel_y)` in physical pixels. Pure of side effects so
+/// it can be unit-tested once the project has a test harness.
+///
+/// Default placement is ABOVE the pet (`panel_y = pet_y - panel_h - gap`); if
+/// there isn't room above (the resulting y would be less than the work area's
+/// top), flip BELOW (`pet_y + pet_h + gap`). X aligns with the pet's left
+/// edge (so the panel reads as attached to the robot, sharing its left edge)
+/// and is clamped to the work area so the panel never opens off-screen
+/// horizontally.
+fn compute_panel_spawn(
+    pet_x: i32,
+    pet_y: i32,
+    _pet_w: i32,
+    pet_h: i32,
+    panel_w: i32,
+    panel_h: i32,
+    work_left: i32,
+    work_top: i32,
+    work_right: i32,
+    work_bottom: i32,
+) -> (i32, i32) {
+    // --- Y: default ABOVE, flip BELOW if not enough room above ---
+    let above_y = pet_y - panel_h - PANEL_GAP_PX;
+    let below_y = pet_y + pet_h + PANEL_GAP_PX;
+    // If the above placement would push the panel above the work area's top,
+    // go below instead. `below_y` may still overflow the work area's bottom
+    // (e.g. the screen is shorter than panel_h + pet_h + 2*gap); we don't
+    // clamp that case because the panel would still be reachable via drag and
+    // clamping would overlap the pet, which is worse visually.
+    let panel_y = if above_y >= work_top { above_y } else { below_y };
+
+    // --- X: align with the pet's left edge, clamp to the work area ---
+    let mut panel_x = pet_x;
+    if panel_x + panel_w > work_right {
+        panel_x = work_right - panel_w;
+    }
+    if panel_x < work_left {
+        panel_x = work_left;
+    }
+
+    let _ = work_bottom; // used in the doc comment above; not in the math.
+    (panel_x, panel_y)
+}
+
+/// Open the `"panel"` window next to the `"pet"` window, choosing flip
+/// direction based on which side of the pet has room on the pet's current
+/// monitor's work area, then `set_position` + `show` + `set_focus` the panel.
+///
+/// This is the entry point the frontend `Pet.svelte` click handler invokes
+/// (via the `open_panel_above_pet` Tauri command registered in `lib.rs`).
+/// It deliberately *always opens* the panel (no toggle) — the toggle-on-click
+/// behavior is reserved for the tray icon's left-click via
+/// [`show_panel_or_toggle_pet`]. Re-clicking the robot while the panel is
+/// already open re-positions the panel to the current pet location (so if the
+/// user dragged the pet, the panel follows).
+///
+/// Panel size: prefers the persisted rect (if the user resized it earlier
+/// this session) so re-opening honors that; falls back to the panel's current
+/// outer size, which on first open reflects the 380×560 default from
+/// `tauri.conf.json`.
+pub fn open_panel_above_pet<R: Runtime, M: Manager<R>>(app: &M) -> Result<(), String> {
+    let pet: WebviewWindow<R> = app
+        .get_webview_window("pet")
+        .ok_or_else(|| "window 'pet' not found".to_string())?;
+    let panel: WebviewWindow<R> = app
+        .get_webview_window("panel")
+        .ok_or_else(|| "window 'panel' not found".to_string())?;
+
+    let pet_pos = pet
+        .outer_position()
+        .map_err(|e| format!("pet.outer_position() failed: {e}"))?;
+    let pet_size = pet
+        .outer_size()
+        .map_err(|e| format!("pet.outer_size() failed: {e}"))?;
+
+    // Prefer the panel's persisted rect from earlier in the session so
+    // re-opening honors a user resize; fall back to the panel's current
+    // outer size (the 380×560 default on first open).
+    let panel_size = crate::config::load_panel_state_state()
+        .map(|(_, _, w, h)| tauri::PhysicalSize::new(w, h))
+        .or_else(|| panel.outer_size().ok())
+        .ok_or_else(|| "panel.outer_size() failed and no persisted size".to_string())?;
+
+    // Prefer the pet's current monitor (correct on multi-monitor setups
+    // where the user dragged the pet onto a secondary display); fall back to
+    // the primary monitor if that query fails (rare — only when the OS
+    // reports no current monitor, e.g. during a display reconfiguration).
+    let monitor = pet
+        .current_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| pet.primary_monitor().ok().flatten())
+        .ok_or_else(|| "no monitor available for panel placement".to_string())?;
+    let work_area = monitor.work_area();
+
+    let work_left = work_area.position.x;
+    let work_top = work_area.position.y;
+    let work_right = work_area.position.x + work_area.size.width as i32;
+    let work_bottom = work_area.position.y + work_area.size.height as i32;
+
+    let (panel_x, panel_y) = compute_panel_spawn(
+        pet_pos.x,
+        pet_pos.y,
+        pet_size.width as i32,
+        pet_size.height as i32,
+        panel_size.width as i32,
+        panel_size.height as i32,
+        work_left,
+        work_top,
+        work_right,
+        work_bottom,
+    );
+
+    panel
+        .set_position(tauri::PhysicalPosition::new(panel_x, panel_y))
+        .map_err(|e| format!("panel.set_position() failed: {e}"))?;
+    panel
+        .show()
+        .map_err(|e| format!("panel.show() failed: {e}"))?;
+    panel
+        .set_focus()
+        .map_err(|e| format!("panel.set_focus() failed: {e}"))?;
+    Ok(())
+}
+
+/// Compute the pet window's startup position in physical pixels, used by
+/// `lib.rs::run` setup to move the pet off the placeholder (1400, 760) baked
+/// into `tauri.conf.json` to the real bottom-right of the primary monitor's
+/// work area — or to a saved spot from earlier in the session if the user
+/// dragged the pet and then hid + re-showed it (within-session persistence).
+///
+/// Returns `Some((x, y))` if a usable monitor was found; `None` if no monitor
+/// was available (in which case the caller leaves the placeholder alone rather
+/// than panicking — the pet would still appear, just at the wrong spot).
+pub fn pet_startup_position<R: Runtime, M: Manager<R>>(app: &M) -> Option<(i32, i32)> {
+    // Restore a within-session dragged position if one exists (Task 15 will
+    // make this durable across restarts via a TOML file).
+    if let Some((x, y)) = crate::config::load_pet_pos_state() {
+        return Some((x, y));
+    }
+
+    let pet: WebviewWindow<R> = app.get_webview_window("pet")?;
+    let pet_size = pet.outer_size().ok()?;
+    // Prefer the primary monitor for the startup position because the pet
+    // window's `current_monitor()` may not yet report the right value during
+    // `setup` (Tauri is still wiring the window). The user can drag the pet
+    // to another monitor afterward; that drag is what current_monitor() in
+    // [`open_panel_above_pet`] is for. `Manager` itself doesn't expose
+    // `primary_monitor`, but `AppHandle` (via `shared_app_impl!`) does, and
+    // `Manager::app_handle` returns a usable `&AppHandle<R>`.
+    let app_handle = app.app_handle();
+    let monitor = app_handle
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| pet.current_monitor().ok().flatten())?;
+    let work_area = monitor.work_area();
+
+    let work_right = work_area.position.x + work_area.size.width as i32;
+    let work_bottom = work_area.position.y + work_area.size.height as i32;
+    let pet_w = pet_size.width as i32;
+    let pet_h = pet_size.height as i32;
+
+    Some((
+        work_right - pet_w - PET_MARGIN_PX,
+        work_bottom - pet_h - PET_MARGIN_PX,
+    ))
 }
