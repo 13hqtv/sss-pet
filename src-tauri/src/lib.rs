@@ -106,6 +106,13 @@ fn open_panel_above_pet(app: tauri::AppHandle) -> Result<(), String> {
 /// **NOT for production** — this is a verification affordance for Task 7.
 /// Later tasks that wire the real signals will naturally make this
 /// obsolete (and it can be feature-gated or removed then).
+///
+/// Task 17: gated with `#[cfg(debug_assertions)]` so the command is NOT
+/// compiled into release builds. The frontend's `invoke("dev_trigger_state")`
+/// would fail in release — that's expected (dev-only). The registration
+/// in `invoke_handler` below is also gated, so the handler list in
+/// release builds simply omits this entry.
+#[cfg(debug_assertions)]
 #[tauri::command]
 fn dev_trigger_state(app: tauri::AppHandle, target: String) -> Result<(), String> {
     // `app.state::<BrainState>()` returns `State<'_, Mutex<PetBrain>>`
@@ -289,6 +296,11 @@ pub fn run() {
             // (has-something / needs-you / thinking / dismissed / panel)
             // to verify the SVG/CSS poses without the real agent/reminder
             // wiring (Tasks 9+/16). Obsolete once those land; remove then.
+            //
+            // Task 17: gated `#[cfg(debug_assertions)]` — NOT registered in
+            // release builds. The frontend `invoke("dev_trigger_state")`
+            // would fail in release; that's expected (dev-only).
+            #[cfg(debug_assertions)]
             dev_trigger_state,
             // Task 15: chat commands — `list_conversations` (sidebar),
             // `new_conversation` (新建 button), `load_history` (select

@@ -144,7 +144,14 @@ pub fn spawn_reminder_scheduler<R: Runtime + 'static>(
     db_state: Arc<Mutex<Connection>>,
     brain_state: BrainState,
 ) {
-    tokio::spawn(async move {
+    // Task 17: use `tauri::async_runtime::spawn` (NOT `tokio::spawn`)
+    // because `setup` is synchronous — `tokio::spawn` panics with
+    // "there is no reactor running" when called outside a Tokio
+    // runtime context. `tauri::async_runtime::spawn` delegates to the
+    // Tauri-managed Tokio runtime, which is initialized before `setup`
+    // runs. The spawned task still has access to `tokio::time::sleep`
+    // (Tauri's runtime is a full Tokio runtime with the `time` feature).
+    tauri::async_runtime::spawn(async move {
         loop {
             tokio::time::sleep(TICK_INTERVAL).await;
             // Take the db lock + run a tick. The brain lock is taken

@@ -92,15 +92,14 @@
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { listen } from "@tauri-apps/api/event";
   import { dismissPetAlert } from "../panel/lib/settings";
-  import { onMount } from "svelte";
   import "./states.css";
 
   // ---------------------------------------------------------------------------
   // Task 7: pet state + activity nudge.
   // ---------------------------------------------------------------------------
 
-  /// The 5 pet states, as serialized by Rust's `PetState` (serde → variant
-  /// name string). Default "Standby" until the first `pet_state` event.
+  // The 5 pet states, as serialized by Rust's `PetState` (serde → variant
+  // name string). Default "Standby" until the first `pet_state` event.
   type PetStateName =
     | "Sleep"
     | "Standby"
@@ -108,21 +107,28 @@
     | "HasSomething"
     | "NeedsYou";
 
-  // Svelte 5 runes — typed via the variable annotation
-  // (NOT `$state<T>(...)`, which svelte-check mis-parses as a generic
-  // call on a global `$state`). This is the canonical Svelte 5 form
-  // anyway; see task-15-report.md "Svelte 5 runes + svelte-check" for
-  // the same concern in ChatView. The 5 pre-existing svelte-check
-  // errors on this line are that mis-parse, NOT a real type bug —
-  // `pnpm build` (which uses svelte's compiler, not the type checker)
-  // is clean.
-  let state = $state<PetStateName>("Standby");
+  // Svelte 5 runes: typed via the variable annotation (NOT the call,
+  // which svelte-check mis-parses — see task-15-report.md "Svelte 5
+  // runes + svelte-check" concern in ChatView).
+  //
+  // Task 17: variable named `petState` (NOT `state`) to avoid a
+  // svelte-check runes-detection quirk — having a variable named
+  // `state` causes `$state(...)` to be resolved as a store
+  // auto-subscription to the `state` variable (not a rune), which
+  // prevents svelte-check from entering runes mode (see
+  // checkGlobalsForRunes in svelte-check's dist: `$state` is removed
+  // from globals when a `state` variable exists). The Svelte compiler
+  // (pnpm build) was always clean; this is a svelte-check-specific
+  // issue. All other .svelte files in the project (App.svelte,
+  // ChatView.svelte, etc.) don't have a variable named `state`, so
+  // their `$state(...)` is correctly detected as a rune global.
+  let petState: PetStateName = $state("Standby");
 
-  /// Map a serialized `PetState` string to the CSS class that drives the
-  /// per-state styling + animation (or lack thereof) in `states.css`.
-  /// Falls back to `state-standby` if an unknown string arrives (defensive
-  /// — shouldn't happen, but a future Rust variant added without updating
-  /// this map should not break the pet).
+  // Map a serialized `PetState` string to the CSS class that drives the
+  // per-state styling + animation (or lack thereof) in `states.css`.
+  // Falls back to `state-standby` if an unknown string arrives (defensive
+  // — shouldn't happen, but a future Rust variant added without updating
+  // this map should not break the pet).
   const STATE_CLASS: Record<PetStateName, string> = {
     Sleep: "state-sleep",
     Standby: "state-standby",
@@ -131,11 +137,11 @@
     NeedsYou: "state-needs-you",
   };
 
-  /// Human-readable Chinese label for each state, used in the SVG
-  /// `aria-label` so screen readers announce the localized state name
-  /// rather than the raw Rust variant string (`"HasSomething"` /
-  /// `"NeedsYou"` are not user-facing). Mirrors `STATE_CLASS`'s shape;
-  /// falls back to `"待命"` for an unknown variant (defensive).
+  // Human-readable Chinese label for each state, used in the SVG
+  // `aria-label` so screen readers announce the localized state name
+  // rather than the raw Rust variant string (`"HasSomething"` /
+  // `"NeedsYou"` are not user-facing). Mirrors `STATE_CLASS`'s shape;
+  // falls back to `"待命"` for an unknown variant (defensive).
   const STATE_LABEL: Record<PetStateName, string> = {
     Sleep: "睡眠",
     Standby: "待命",
@@ -144,26 +150,26 @@
     NeedsYou: "需要你",
   };
 
-  /// The CSS class for the current state. `state-standby` is the default
-  /// and also the fallback for any unknown state string.
-  let stateClass = $derived(STATE_CLASS[state] ?? "state-standby");
+  // The CSS class for the current state. `state-standby` is the default
+  // and also the fallback for any unknown state string.
+  let stateClass = $derived(STATE_CLASS[petState] ?? "state-standby");
 
-  /// The localized Chinese label for the current state, surfaced in the
-  /// SVG `aria-label`. `待命` is the default / fallback.
-  let stateLabel = $derived(STATE_LABEL[state] ?? "待命");
+  // The localized Chinese label for the current state, surfaced in the
+  // SVG `aria-label`. `待命` is the default / fallback.
+  let stateLabel = $derived(STATE_LABEL[petState] ?? "待命");
 
-  /// Brief visual nudge when the robot is clicked — proves it received the
-  /// click. `nudge` toggles a CSS transform for ~100ms. Kept for the click
-  /// (non-drag) path; a drag does not nudge.
-  /// Task 2 carry: `nudgeTimer` is now cleared on component destroy (see
-  /// `onMount` cleanup below) — previously it leaked on unmount.
+  // Brief visual nudge when the robot is clicked — proves it received the
+  // click. `nudge` toggles a CSS transform for ~100ms. Kept for the click
+  // (non-drag) path; a drag does not nudge.
+  // Task 2 carry: `nudgeTimer` is now cleared on component destroy (see
+  // `onMount` cleanup below) — previously it leaked on unmount.
   let nudge = $state(false);
   let nudgeTimer: ReturnType<typeof setTimeout> | null = null;
 
-  /// Activity-nudge flag from the follow-activity throttle (Rust
-  /// `pet_activity_nudge` event). Plays a ~1s wiggle WITHOUT changing the
-  /// state class. Only set when the pet is awake (asleep pet ignores
-  /// nudges — respect quiet, Review Focus #1).
+  // Activity-nudge flag from the follow-activity throttle (Rust
+  // `pet_activity_nudge` event). Plays a ~1s wiggle WITHOUT changing the
+  // state class. Only set when the pet is awake (asleep pet ignores
+  // nudges — respect quiet, Review Focus #1).
   let nudgeActivity = $state(false);
   let nudgeActivityTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -183,25 +189,36 @@
   // ---------------------------------------------------------------------------
   // Tauri event listeners + cleanup (Task 7).
   //
-  // `onMount` subscribes to `pet_state` and `pet_activity_nudge`. Returns a
+  // `$effect` subscribes to `pet_state` and `pet_activity_nudge`. Returns a
   // cleanup function that unlistens + clears all pending timers (nudge,
   // nudgeActivity, dragSafety). This closes the Task 2 carry "nudgeTimer
   // leaks on unmount" and ensures no dangling setTimeout fires after the
   // component tears down.
+  //
+  // Task 17: converted from `onMount` to `$effect` to fix svelte-check
+  // runes-mode detection (the presence of the legacy `onMount` import
+  // caused svelte-check to treat the whole file as legacy Svelte 4 mode,
+  // mis-parsing every `$state(...)` call as a store auto-subscription —
+  // see the 4 Task-16-carry errors. The Svelte compiler (pnpm build) was
+  // always clean; this is a svelte-check / language-tools quirk. The
+  // effect body reads no reactive state synchronously (all `state` reads
+  // are inside event-listener callbacks, which $effect does not track),
+  // so it runs exactly once on mount and returns the cleanup — the same
+  // semantics as the prior `onMount`.
   //
   // `listen` is async (returns a Promise<UnlistenFn>); we guard against the
   // race where the component unmounts before the promises resolve by
   // tracking a `cancelled` flag — if unmounted, we immediately unlisten
   // the just-resolved handle.
   // ---------------------------------------------------------------------------
-  onMount(() => {
+  $effect(() => {
     let cancelled = false;
     // Stash the unlisten handles; null until the promises resolve.
     let unlistenState: (() => void) | null = null;
     let unlistenNudge: (() => void) | null = null;
 
     listen<PetStateName>("pet_state", (e) => {
-      state = e.payload;
+      petState = e.payload;
     }).then((u) => {
       if (cancelled) {
         u();
@@ -217,7 +234,7 @@
       // at 5min, and 3 < 5, so by the time we're asleep the throttle
       // already stopped firing — but the frontend doesn't trust the
       // backend's timing).
-      if (state === "Sleep") return;
+      if (petState === "Sleep") return;
       if (nudgeActivityTimer) clearTimeout(nudgeActivityTimer);
       nudgeActivity = true;
       nudgeActivityTimer = setTimeout(() => {
@@ -366,12 +383,12 @@
     // panel — so the `?` clears on the same click. Any other state:
     // open the panel above/below the pet (Task 2/4 behavior).
     //
-    // Reading `state` here is safe: it's the subscribed `pet_state`
+    // Reading `petState` here is safe: it's the subscribed `pet_state`
     // event's latest payload (kept up to date by the listen handler
     // in onMount). The dismiss command applies `Signal::Dismissed` +
     // emits the resulting state immediately, so the frontend's `?`
     // clears without waiting for the next 1s brain tick.
-    if (state === "NeedsYou") {
+    if (petState === "NeedsYou") {
       console.log("[pet] robot clicked — 需要你 → dismiss");
       if (nudgeTimer) clearTimeout(nudgeTimer);
       nudge = true;
@@ -516,7 +533,7 @@
 
     <!-- ============ per-state face + decoration ============ -->
 
-    {#if state === "Sleep"}
+    {#if petState === "Sleep"}
       <!--
         Sleep: dimmed (CSS opacity), eyes closed (short lines), slight
         frown mouth, Zzz floating above. NO animation (states.css has no
@@ -534,7 +551,7 @@
       <text x="68" y="14" font-size="10" fill="#64748b" font-family="system-ui"
         font-weight="600">Zzz</text>
 
-    {:else if state === "Thinking"}
+    {:else if petState === "Thinking"}
       <!--
         Thinking: eyes looking up (pupils shifted), spinning cog above head
         (class="cog" — animated by states.css @keyframes thinking-cog-spin).
@@ -575,7 +592,7 @@
         </g>
       </g>
 
-    {:else if state === "HasSomething"}
+    {:else if petState === "HasSomething"}
       <!--
         HasSomething: perked up, wide eyes, open mouth (O), `!` above head
         (amber). Static — no animation (states.css has no keyframe).
@@ -591,7 +608,7 @@
       <text x="44" y="14" font-size="14" fill="#f59e0b" font-family="system-ui"
         font-weight="700">!</text>
 
-    {:else if state === "NeedsYou"}
+    {:else if petState === "NeedsYou"}
       <!--
         NeedsYou: forward-looking eyes (pupils centered, "looking at
         you"), `?` above head (red). Static — no animation.
