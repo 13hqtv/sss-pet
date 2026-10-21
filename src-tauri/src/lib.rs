@@ -12,6 +12,13 @@ pub mod timers;
 // the follow-activity nudge via the throttle, and emits `pet_state` /
 // `pet_activity_nudge` to the pet webview. Spawned from `setup` below.
 mod brain;
+// Task 8: agent backend skeleton — `Backend` trait, `Session`/`Message`/
+// `ExecResult`/`TokenUsage` types, factory `agent::new`, and
+// `agent::exec::{resolve, spawn}`. The three backend impls (claude /
+// opencode / codex) are PLACEHOLDERS here — Tasks 10/11/12 replace their
+// `execute` bodies with real subprocess wiring. Pure Rust, no GUI, no
+// real agent calls yet.
+pub mod agent;
 
 use std::sync::Mutex;
 use std::time::Instant;

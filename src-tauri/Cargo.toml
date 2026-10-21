@@ -38,6 +38,18 @@ device_query = "1"
 # (one-line `extern "system"`) to avoid pulling in
 # `Win32_System_SystemInformation` for a single call.
 windows-sys = { version = "0.61", features = ["Win32_UI_Input_KeyboardAndMouse"] }
+# Task 8: agent backend skeleton (Backend trait / Session / types / factory).
+# `async-trait` makes `Backend::execute` (an `async fn`) object-safe so the
+# factory can return `Box<dyn Backend>` — Rust 1.97's native async-fn-in-trait
+# is still not object-safe (`Box<dyn Backend>` won't compile). `async-trait`
+# desugars `execute` to `Pin<Box<dyn Future + Send>>`, restoring object safety.
+# `which` does cross-platform PATH lookup for `agent::exec::resolve`.
+# `tokio` is already a transitive dep via Tauri but without the `process` /
+# `macros` features we need here (subprocess spawn + `#[tokio::test]`); adding
+# it as a direct dep with exactly those features unifies cleanly with Tauri's.
+async-trait = "0.1"
+which = "7"
+tokio = { version = "1", features = ["process", "sync", "rt", "macros", "time"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
