@@ -112,10 +112,27 @@ async fn probe_opencode_models(cfg: &BackendConfig) -> Vec<String> {
     };
     let mut buf = String::new();
     let read_result = timeout(OPENCODE_PROBE_TIMEOUT, stdout.read_to_string(&mut buf)).await;
-    let _ = child.wait().await; // reap so we don't leak a zombie
+    // Reap the child so we don't leak a zombie — but ONLY after deciding
+    // whether the read succeeded. On a FAILED read (timeout / read error)
+    // the child is almost certainly still alive (a wedged CLI never
+    // exits), so `wait().await` would block forever — `kill_on_drop`
+    // only fires when the `Child` is DROPPED, and we're stuck inside
+    // `wait()` before that drop. Kill FIRST (`start_kill` sends the
+    // signal immediately, non-async) then reap the now-dying child fast,
+    // so the probe timeout the UI's model picker relies on actually
+    // fires instead of stretching to infinity.
     match read_result {
-        Ok(Ok(_)) => parse_opencode_models(&buf),
-        _ => vec![],
+        Ok(Ok(_)) => {
+            // Clean exit — the child has already gone (or is going); reap.
+            let _ = child.wait().await;
+            parse_opencode_models(&buf)
+        }
+        _ => {
+            // Timeout / read error — kill the wedged child BEFORE waiting.
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            vec![]
+        }
     }
 }
 
@@ -150,17 +167,29 @@ async fn probe_claude_models(cfg: &BackendConfig) -> Vec<String> {
     // end-of-session, answers the request, and exits 0.
     let req = claude_list_models_request();
     if stdin.write_all(req.as_bytes()).await.is_err() {
+        // stdin write failed — the child is very likely still alive (and
+        // may be wedged). Kill BEFORE waiting so `wait()` reaps a dying
+        // child, not a live one forever (see the read-failure note in
+        // [`probe_opencode_models`]).
         drop(stdin);
+        let _ = child.start_kill();
         let _ = child.wait().await;
         return vec![];
     }
     drop(stdin);
     let mut buf = String::new();
     let read_result = timeout(CLAUDE_PROBE_TIMEOUT, stdout.read_to_string(&mut buf)).await;
-    let _ = child.wait().await;
     match read_result {
-        Ok(Ok(_)) => parse_claude_control_response(&buf),
-        _ => vec![],
+        Ok(Ok(_)) => {
+            let _ = child.wait().await;
+            parse_claude_control_response(&buf)
+        }
+        _ => {
+            // Timeout / read error — kill the wedged child BEFORE waiting.
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            vec![]
+        }
     }
 }
 
@@ -193,9 +222,9 @@ async fn probe_codex_models(cfg: &BackendConfig) -> Vec<String> {
     };
     let mut buf = String::new();
     let read_result = timeout(CODEX_PROBE_TIMEOUT, stdout.read_to_string(&mut buf)).await;
-    let _ = child.wait().await;
     match read_result {
         Ok(Ok(_)) => {
+            let _ = child.wait().await;
             let parsed = parse_codex_debug_models(&buf);
             if parsed.is_empty() {
                 codex_static_models()
@@ -203,7 +232,14 @@ async fn probe_codex_models(cfg: &BackendConfig) -> Vec<String> {
                 parsed
             }
         }
-        _ => codex_static_models(),
+        _ => {
+            // Timeout / read error — kill the wedged child BEFORE waiting
+            // (see [`probe_opencode_models`]), then fall back to the
+            // static catalog.
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            codex_static_models()
+        }
     }
 }
 
@@ -774,6 +810,64 @@ mod tests {
         let result = list_models("some-unknown-agent", &cfg).await;
         assert!(result.is_ok(), "expected Ok, got {result:?}");
         assert!(result.unwrap().is_empty());
+    }
+
+    // ── wedged-process timeout (pins the start_kill fix) ──
+
+    /// PIN: a WEDGED probe (spawns but never closes stdout within the probe
+    /// timeout) must return `Ok(vec![])` WITHIN ~2× the probe timeout, not
+    /// hang forever. Before the `start_kill` fix, the probes called
+    /// `child.wait().await` AFTER the timed-out read — but a wedged CLI never
+    /// exits, so `wait()` blocked indefinitely and the probe timeout stretched
+    /// to infinity, defeating the `Ok(vec![])` fallback the UI's model picker
+    /// relies on.
+    ///
+    /// Wedged stub: point the opencode probe at `cmd.exe`. The probe passes
+    /// argv `["models"]`; cmd.exe ignores the non-switch arg, starts an
+    /// interactive shell, writes its banner to stdout, then BLOCKS reading
+    /// stdin. The opencode probe never writes or closes the child's stdin
+    /// (`child.stdin` is not taken), so cmd never exits and stdout never
+    /// EOFs → `read_to_string` times out after `OPENCODE_PROBE_TIMEOUT` →
+    /// the fix's `start_kill` + `wait()` reap it fast → `vec![]`. Verified
+    /// empirically that `cmd.exe models` with a held-open stdin hangs.
+    ///
+    /// Windows-only — the wedged stub is `cmd.exe`. The fix is platform-
+    /// agnostic (`start_kill`/`wait` on `tokio::process::Child`), so a Unix
+    /// variant (e.g. a `sh`/`cat` that blocks on stdin) would exercise the
+    /// same path; the contract this test pins is the bounded-return one,
+    /// which is platform-independent, and Windows is the shipping target.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn list_models_opencode_wedged_process_returns_empty_within_timeout() {
+        let system_root = std::env::var("SystemRoot")
+            .expect("SystemRoot must be set on Windows");
+        let cmd_path = PathBuf::from(system_root)
+            .join("System32")
+            .join("cmd.exe");
+        assert!(cmd_path.exists(), "cmd.exe not found at {cmd_path:?}");
+        let cfg = BackendConfig {
+            executable_path: Some(cmd_path),
+            env: HashMap::new(),
+        };
+        // Wrap in a 2× probe timeout to PROVE the call doesn't hang — it
+        // must return (empty) at ~1× the probe timeout, well inside 2×.
+        // Before the fix this `timeout` would ELAPSE (return Err) because
+        // `list_models` blocked on the live child's `wait().await`.
+        let outer = tokio::time::timeout(
+            OPENCODE_PROBE_TIMEOUT + OPENCODE_PROBE_TIMEOUT,
+            list_models("opencode", &cfg),
+        )
+        .await;
+        assert!(
+            outer.is_ok(),
+            "list_models(opencode, cmd.exe) hung past 2× PROBE_TIMEOUT — the \
+             start_kill-before-wait fix is not firing"
+        );
+        let models = outer.unwrap().expect("list_models never errors");
+        assert!(
+            models.is_empty(),
+            "wedged cmd.exe probe should yield empty (fallback), got {models:?}"
+        );
     }
 
     // ── real-CLI validation (#[ignore]) ──
