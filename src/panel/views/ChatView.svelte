@@ -85,6 +85,22 @@
   let manualModel: boolean = $state(false);
   let creating: boolean = $state(false);
 
+  // Generation counter guarding the provider-switch probe race
+  // (Fix round 1 #2). `openDialog()` fires `void probeModels(...)`
+  // (fire-and-forget); if the user changes provider before that
+  // first probe's `await listModels(...)` resolves, a second probe
+  // starts + both overlap. Without a guard, the first probe's
+  // `finally { probing = false }` runs AFTER the second set
+  // `probing = true` (leaving probing falsely false), and its
+  // `modelList = list` can overwrite the second's list with the
+  // WRONG provider's models if it completes last. Each probe
+  // captures `my = ++probeGen` and bails early if a newer probe
+  // started (`my !== probeGen`); only the latest probe owns the
+  // `probing` flag + `modelList`. Plain `let` (not `$state`) — the
+  // UI never renders `probeGen` directly, so reactivity isn't
+  // needed; the closure captures the live binding.
+  let probeGen = 0;
+
   // Map a streamed MessageKind to a StoredMessage role — mirrors
   // db.rs::message_kind_to_role so the live buffer + the persisted
   // history agree on role assignment (the persisted shape drops the
@@ -199,14 +215,24 @@
    * result → switch to manual text entry (the design's 兜底). On non-
    * empty → populate the dropdown; if the per-agent default isn't in
    * the list, keep the pre-filled model but it won't be selectable
-   * from the dropdown (the user can switch to manual entry). */
+   * from the dropdown (the user can switch to manual entry).
+   *
+   * Generation-counter guard (Fix round 1 #2): if a newer probe has
+   * started while we were awaiting, bail without touching
+   * `modelList` / `manualModel` / `probeError` / `probing` — the
+   * newer probe owns those. Its `finally` will clear `probing`. */
   async function probeModels(provider: Provider) {
+    probeGen++;
+    const my = probeGen;
     probing = true;
     probeError = null;
     manualModel = false;
     modelList = [];
     try {
       const list = await listModels(provider);
+      // Stale: a newer probe started while we were awaiting. Bail
+      // without touching shared state — the newer probe owns it.
+      if (my !== probeGen) return;
       modelList = list;
       if (list.length === 0) {
         // Probe failed / empty → manual text entry. Keep dialogModel
@@ -224,10 +250,16 @@
         dialogModel = list[0];
       }
     } catch (e) {
+      // Stale probe's error must not overwrite the newer probe's
+      // state — bail the same way.
+      if (my !== probeGen) return;
       probeError = `探测模型失败: ${e}`;
       manualModel = true;
     } finally {
-      probing = false;
+      // Only the latest probe owns the `probing` flag. A stale probe
+      // clearing `probing` would leave it falsely false while the
+      // newer probe is still in flight.
+      if (my === probeGen) probing = false;
     }
   }
 
@@ -524,8 +556,24 @@
       </div>
       <div class="dialog-field">
         <label for="dlg-model">模型</label>
-        {#if probing}
+        {#if probing && !manualModel}
+          <!-- Probing + the user hasn't toggled manual: show the
+               "探测中…" hint AND the `手动输入` escape hatch (Fix
+               round 1 #1). For codex (probe up to ~15s) the user was
+               previously FORCED to wait with no way to confirm or
+               switch to manual entry — the toggle was in the
+               `{:else}` (dropdown) branch, unreachable during
+               probing, and confirm was `disabled={probing || ...}`.
+               Now the user can click `手动输入` mid-probe to switch
+               to a text input + type a model (or keep a pre-filled
+               default) while the probe runs. `manualModel` survives
+               the probe's completion (probeModels only ever SETS it
+               to true, never back to false after the await), so the
+               user's toggle is respected. -->
           <div class="model-probing">探测中…</div>
+          <button class="link-btn" onclick={toggleManual} disabled={creating}>
+            手动输入
+          </button>
         {:else if manualModel || modelList.length === 0}
           <input
             id="dlg-model"
@@ -572,7 +620,19 @@
       </div>
       {#if probeError}<div class="dialog-error">{probeError}</div>{/if}
       <div class="dialog-actions">
-        <button onclick={confirmDialog} disabled={probing || creating}>
+        <!-- Fix round 1 #1: allow confirm while `probing` IF the user
+             has a model (typed or pre-filled) — the probe only
+             populates the dropdown, it doesn't validate the model, so
+             a user with a pre-filled per-agent default (or who typed
+             a name via the now-visible `手动输入` escape hatch) can
+             confirm without waiting out the codex ~15s probe. Still
+             disabled when `creating` (the actual newConversation
+             call). `probing && !dialogModel` keeps it disabled when
+             probing + no model yet (the probe might auto-pick one). -->
+        <button
+          onclick={confirmDialog}
+          disabled={creating || (probing && !dialogModel)}
+        >
           {creating ? "创建中…" : "确定"}
         </button>
         <button class="secondary" onclick={cancelDialog} disabled={creating}>
