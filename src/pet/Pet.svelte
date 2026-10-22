@@ -508,140 +508,172 @@
     onmousedown={onRobotMouseDown}
     onkeydown={onRobotKeydown}
   >
-    <!-- ============ shared body (all states) ============ -->
+    <!-- ============ shared body (all states) ============
+         Refined geometric monoline bot (2026-10-22 redesign). 2px strokes,
+         round caps/joins. FIXED palette — no theme tokens, no data-theme:
+           ink     #1C1C1E  (stroke — reads on light; halo + warm-white
+                            fill carry it on dark backdrops)
+           surface #FAFAF7  (warm-white fill — reads on dark; outline +
+                            halo carry it on light)
+           accent  #4F46E5  (indigo — antenna tip, chest dot, thinking cog)
+           orange  #EA580C  (HasSomething "!")
+           red     #DC2626  (NeedsYou "?")
+           muted   #6B6B70  (Sleep "zzz")
+         The base filter (Pet.svelte <style>) layers a dark drop-shadow
+         (reads on light wallpaper) + a soft light glow (reads on dark
+         wallpaper) so the bot is visible on ANY desktop backdrop without
+         theme switching. State-specific halos override in states.css.
+         Geometry fits inside ~76×80 (well within the 96×96 central 80%
+         click/drag rect window.rs computes for the 120×120 window). -->
 
-    <!-- antenna -->
-    <line x1="48" y1="10" x2="48" y2="22" stroke="#334155" stroke-width="2.5"
+    <!-- antenna: line + indigo tip dot -->
+    <line x1="48" y1="10" x2="48" y2="22" stroke="#1C1C1E" stroke-width="2"
       stroke-linecap="round" />
-    <circle cx="48" cy="7" r="4" fill="#22d3ee" />
+    <circle cx="48" cy="7" r="2.5" fill="#4F46E5" />
 
-    <!-- ears -->
-    <rect x="9" y="36" width="7" height="18" rx="3.5" fill="#94a3b8" />
-    <rect x="80" y="36" width="7" height="18" rx="3.5" fill="#94a3b8" />
+    <!-- head: rounded rect, warm-white fill, ink 2px stroke -->
+    <rect x="20" y="22" width="56" height="40" rx="13"
+      fill="#FAFAF7" stroke="#1C1C1E" stroke-width="2" />
 
-    <!-- head -->
-    <rect
-      x="15"
-      y="22"
-      width="66"
-      height="54"
-      rx="16"
-      fill="#e2e8f0"
-      stroke="#334155"
-      stroke-width="2.5"
-    />
+    <!-- neck: short connector head → body -->
+    <line x1="48" y1="62" x2="48" y2="64" stroke="#1C1C1E" stroke-width="2"
+      stroke-linecap="round" />
+
+    <!-- body: small rounded rect below the head -->
+    <rect x="32" y="64" width="32" height="16" rx="6"
+      fill="#FAFAF7" stroke="#1C1C1E" stroke-width="2" />
+
+    <!-- arms: two short outward-leaning lines flanking the body -->
+    <line x1="32" y1="70" x2="27" y2="74" stroke="#1C1C1E" stroke-width="2"
+      stroke-linecap="round" />
+    <line x1="64" y1="70" x2="69" y2="74" stroke="#1C1C1E" stroke-width="2"
+      stroke-linecap="round" />
+
+    <!-- chest indicator: small indigo status dot on the body -->
+    <circle cx="48" cy="72" r="1.5" fill="#4F46E5" />
 
     <!-- ============ per-state face + decoration ============ -->
 
     {#if petState === "Sleep"}
       <!--
-        Sleep: dimmed (CSS opacity), eyes closed (short lines), slight
-        frown mouth, Zzz floating above. NO animation (states.css has no
-        keyframe for .state-sleep — Review Focus #1: idle CPU ≈ 0).
+        Sleep: dimmed (CSS opacity .5), eyes closed (short lines), slight
+        frown, "zzz" floating upper-right. NO keyframe animation at all
+        (states.css has no `animation` on .state-sleep — Review Focus #1:
+        idle CPU ≈ 0 when asleep). Static — the v0.1.0 constraint.
       -->
       <!-- closed eyes (horizontal lines) -->
-      <line x1="29" y1="46" x2="43" y2="46" stroke="#0f172a" stroke-width="2.5"
+      <line x1="32" y1="40" x2="42" y2="40" stroke="#1C1C1E" stroke-width="2"
         stroke-linecap="round" />
-      <line x1="53" y1="46" x2="67" y2="46" stroke="#0f172a" stroke-width="2.5"
+      <line x1="54" y1="40" x2="64" y2="40" stroke="#1C1C1E" stroke-width="2"
         stroke-linecap="round" />
       <!-- slight frown mouth -->
-      <path d="M 36 64 Q 48 60 60 64" stroke="#0f172a" stroke-width="2.5"
-        fill="none" stroke-linecap="round" />
-      <!-- Zzz text (floating, no animation) -->
-      <text x="68" y="14" font-size="10" fill="#64748b" font-family="system-ui"
-        font-weight="600">Zzz</text>
+      <path d="M40 52 Q48 48 56 52" stroke="#1C1C1E" stroke-width="2"
+        fill="none" stroke-linecap="round" stroke-linejoin="round" />
+      <!-- "zzz" text (static, muted ink, no animation) -->
+      <text x="68" y="13" font-size="9" fill="#6B6B70" font-family="system-ui"
+        font-weight="600">zzz</text>
 
     {:else if petState === "Thinking"}
       <!--
-        Thinking: eyes looking up (pupils shifted), spinning cog above head
-        (class="cog" — animated by states.css @keyframes thinking-cog-spin).
-        The cog is the ONLY animated element in this state.
+        Thinking: eyes looking up (dots shifted up), small "o" mouth,
+        spinning indigo cog above the head (class="cog" — animated by
+        states.css @keyframes thinking-cog-spin). The cog is the ONLY
+        animated element in this state.
       -->
-      <!-- eyes with pupils looking up -->
-      <circle cx="36" cy="46" r="6.5" fill="#f8fafc" stroke="#0f172a" stroke-width="1.5" />
-      <circle cx="60" cy="46" r="6.5" fill="#f8fafc" stroke="#0f172a" stroke-width="1.5" />
-      <circle cx="36" cy="43" r="3" fill="#0f172a" />
-      <circle cx="60" cy="43" r="3" fill="#0f172a" />
-      <!-- mouth (thinking: small circle, "o") -->
-      <circle cx="48" cy="64" r="3" fill="#0f172a" />
-      <!-- spinning cog above head.
+      <!-- eyes (dots, shifted up — "looking up") -->
+      <circle cx="37" cy="38" r="2.5" fill="#1C1C1E" />
+      <circle cx="59" cy="38" r="2.5" fill="#1C1C1E" />
+      <!-- mouth (small "o" circle) -->
+      <circle cx="48" cy="51" r="2" fill="none" stroke="#1C1C1E"
+        stroke-width="1.5" />
+      <!-- spinning indigo cog above the head.
 
-           STRUCTURAL NOTE (fix round 1): the cog is split into an outer
-           `<g transform="translate(48 14)">` that positions it above the
-           head, and an inner `<g class="cog">` that carries the CSS spin
-           animation. This separation is required because the CSS
-           `@keyframes thinking-cog-spin` sets `transform: rotate(...)`,
-           which (per the CSS spec) entirely overrides an SVG `transform`
-           presentation attribute on the same element — specificity 0
-           loses to any CSS `transform` property. If both lived on the
-           same element (as in the prior implementation's
-           `<g class="cog" transform="translate(48 14)">`), the
-           `translate(48 14)` was dropped during the animation and the cog
-           rendered at (0,0) (top-left corner) instead of above the head.
-           The inner `.cog` keeps `transform-box: fill-box;
-           transform-origin: center` (states.css) so it spins around its
-           own center (0,0 in its local coords = (48,14) once the outer
-           translate is applied). -->
-      <g transform="translate(48 14)">
+           STRUCTURAL NOTE (carried from v0.1.0 fix round 1): the cog is
+           split into an outer `<g transform="translate(72 12)">` that
+           positions it above the head's upper-right (clear of the
+           antenna at x=48), and an inner `<g class="cog">` that carries
+           the CSS spin. This separation is REQUIRED: the CSS
+           @keyframes thinking-cog-spin sets `transform: rotate(...)`,
+           which (per the CSS spec) entirely overrides any SVG `transform`
+           presentation attribute on the same element. If both lived on
+           the same element (`<g class="cog" transform="...">`), the
+           translate would be dropped during the animation and the cog
+           would render at (0,0) (top-left corner). The inner `.cog`
+           keeps `transform-box: fill-box; transform-origin: center`
+           (states.css) so it spins around its own center (0,0 in its
+           local coords = (72,12) once the outer translate is applied). -->
+      <g transform="translate(72 12)">
         <g class="cog">
-          <circle cx="0" cy="0" r="5" fill="none" stroke="#64748b" stroke-width="1.5" />
-          <rect x="-1" y="-7" width="2" height="4" fill="#64748b" />
-          <rect x="-1" y="3" width="2" height="4" fill="#64748b" />
-          <rect x="-7" y="-1" width="4" height="2" fill="#64748b" />
-          <rect x="3" y="-1" width="4" height="2" fill="#64748b" />
+          <!-- gear body ring -->
+          <circle cx="0" cy="0" r="4" fill="none" stroke="#4F46E5"
+            stroke-width="1.5" />
+          <!-- 8 gear teeth (short radial lines) -->
+          <line x1="0" y1="-6" x2="0" y2="-4" stroke="#4F46E5"
+            stroke-width="1.5" stroke-linecap="round" />
+          <line x1="0" y1="4" x2="0" y2="6" stroke="#4F46E5"
+            stroke-width="1.5" stroke-linecap="round" />
+          <line x1="-6" y1="0" x2="-4" y2="0" stroke="#4F46E5"
+            stroke-width="1.5" stroke-linecap="round" />
+          <line x1="4" y1="0" x2="6" y2="0" stroke="#4F46E5"
+            stroke-width="1.5" stroke-linecap="round" />
+          <line x1="-4.2" y1="-4.2" x2="-2.8" y2="-2.8" stroke="#4F46E5"
+            stroke-width="1.5" stroke-linecap="round" />
+          <line x1="2.8" y1="2.8" x2="4.2" y2="4.2" stroke="#4F46E5"
+            stroke-width="1.5" stroke-linecap="round" />
+          <line x1="-4.2" y1="4.2" x2="-2.8" y2="2.8" stroke="#4F46E5"
+            stroke-width="1.5" stroke-linecap="round" />
+          <line x1="2.8" y1="-2.8" x2="4.2" y2="-4.2" stroke="#4F46E5"
+            stroke-width="1.5" stroke-linecap="round" />
         </g>
       </g>
 
     {:else if petState === "HasSomething"}
       <!--
-        HasSomething: perked up, wide eyes, open mouth (O), `!` above head
-        (amber). Static — no animation (states.css has no keyframe).
+        HasSomething: wide eyes (larger dots), open "O" mouth, orange "!"
+        above the head. Static — no keyframe (states.css has none for
+        .state-has-something; a warm-orange halo tint replaces the base
+        filter).
       -->
       <!-- wide eyes -->
-      <circle cx="36" cy="46" r="7" fill="#0f172a" />
-      <circle cx="60" cy="46" r="7" fill="#0f172a" />
-      <circle cx="38" cy="44" r="2.2" fill="#f8fafc" />
-      <circle cx="62" cy="44" r="2.2" fill="#f8fafc" />
-      <!-- open mouth (surprise circle) -->
-      <circle cx="48" cy="64" r="4" fill="#0f172a" />
-      <!-- `!` above head (amber) -->
-      <text x="44" y="14" font-size="14" fill="#f59e0b" font-family="system-ui"
-        font-weight="700">!</text>
+      <circle cx="37" cy="40" r="3.5" fill="#1C1C1E" />
+      <circle cx="59" cy="40" r="3.5" fill="#1C1C1E" />
+      <!-- open mouth (surprise "O") -->
+      <circle cx="48" cy="52" r="2.5" fill="none" stroke="#1C1C1E"
+        stroke-width="2" />
+      <!-- "!" above head (orange #EA580C) -->
+      <text x="70" y="14" text-anchor="middle" font-size="13" fill="#EA580C"
+        font-family="system-ui" font-weight="700">!</text>
 
     {:else if petState === "NeedsYou"}
       <!--
-        NeedsYou: forward-looking eyes (pupils centered, "looking at
-        you"), `?` above head (red). Static — no animation.
+        NeedsYou: forward-looking eyes (centered dots, "looking at you"),
+        uncertain slight frown, red "?" above the head. Static — no
+        keyframe (a red halo tint replaces the base filter).
       -->
       <!-- eyes looking forward (centered pupils) -->
-      <circle cx="36" cy="46" r="6.5" fill="#f8fafc" stroke="#0f172a" stroke-width="1.5" />
-      <circle cx="60" cy="46" r="6.5" fill="#f8fafc" stroke="#0f172a" stroke-width="1.5" />
-      <circle cx="36" cy="46" r="3" fill="#0f172a" />
-      <circle cx="60" cy="46" r="3" fill="#0f172a" />
-      <!-- mouth (slight frown, uncertain) -->
-      <path d="M 38 64 Q 48 62 58 64" stroke="#0f172a" stroke-width="2.5"
-        fill="none" stroke-linecap="round" />
-      <!-- `?` above head (red) -->
-      <text x="43" y="15" font-size="14" fill="#ef4444" font-family="system-ui"
-        font-weight="700">?</text>
+      <circle cx="37" cy="40" r="2.5" fill="#1C1C1E" />
+      <circle cx="59" cy="40" r="2.5" fill="#1C1C1E" />
+      <!-- uncertain slight frown -->
+      <path d="M40 52 Q48 49 56 52" stroke="#1C1C1E" stroke-width="2"
+        fill="none" stroke-linecap="round" stroke-linejoin="round" />
+      <!-- "?" above head (red #DC2626) -->
+      <text x="70" y="14" text-anchor="middle" font-size="13" fill="#DC2626"
+        font-family="system-ui" font-weight="700">?</text>
 
     {:else}
       <!--
-        Standby (default): alert, eyes open with highlights, neutral
-        mouth bar. Slow blink animated by states.css
-        (@keyframes standby-blink on .eye elements).
+        Standby (default): alert, dot eyes open, slight smile, body
+        steady. Slow blink animated by states.css (@keyframes
+        standby-blink on .eye elements) — the ONLY idle animation on
+        the awake pet, very light.
       -->
       <!-- eyes (open / alert) — class="eye" for the blink animation -->
-      <circle class="eye" cx="36" cy="46" r="6.5" fill="#0f172a" />
-      <circle class="eye" cx="60" cy="46" r="6.5" fill="#0f172a" />
-      <circle cx="38" cy="44" r="2" fill="#f8fafc" />
-      <circle cx="62" cy="44" r="2" fill="#f8fafc" />
-      <!-- mouth (neutral alert bar) -->
-      <rect x="34" y="62" width="28" height="4.5" rx="2.25" fill="#0f172a" />
+      <circle class="eye" cx="37" cy="40" r="2.5" fill="#1C1C1E" />
+      <circle class="eye" cx="59" cy="40" r="2.5" fill="#1C1C1E" />
+      <!-- slight smile mouth -->
+      <path d="M40 50 Q48 54 56 50" stroke="#1C1C1E" stroke-width="2"
+        fill="none" stroke-linecap="round" stroke-linejoin="round" />
     {/if}
-
-    <!-- status LED (shared, always rendered; green for OK states) -->
-    <circle cx="72" cy="32" r="3" fill="#34d399" />
   </svg>
 </main>
 
@@ -667,10 +699,21 @@
     /* Only the robot itself is a DOM click/drag target. */
     pointer-events: auto;
     cursor: pointer;
-    /* Subtle drop shadow so the bot reads against any backdrop.
-       Per-state tints (sleep dim, has-something amber, needs-you red) are
-       applied in states.css, overriding this base. */
-    filter: drop-shadow(0 2px 3px rgba(15, 23, 42, 0.35));
+    /* FIXED palette — no theme tokens, no data-theme. The robot must read
+       on ANY desktop backdrop (light or dark wallpaper). A dual halo
+       achieves this without theme switching:
+         - dark drop-shadow (rgba(0,0,0,.35)): gives contrast on LIGHT
+           wallpapers (the bot casts a soft shadow).
+         - soft light glow (rgba(255,255,255,.4)): gives contrast on DARK
+           wallpapers (a faint light halo outlines the ink strokes + the
+           warm-white fill, which would otherwise blend into black).
+       Both layers are cheap (filter, not animation) and don't tick rAF.
+       Per-state halos (sleep dim, has-something orange, needs-you red)
+       override this base in states.css, keeping the dark shadow so the
+       bot still reads on light backdrops in those states. */
+    filter:
+      drop-shadow(0 2px 3px rgba(0, 0, 0, 0.35))
+      drop-shadow(0 0 2px rgba(255, 255, 255, 0.4));
     transition: transform 90ms ease-out;
     will-change: transform;
   }

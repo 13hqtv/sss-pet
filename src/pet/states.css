@@ -1,5 +1,13 @@
 /* Task 7 — per-state styling + animations for the desktop pet.
  *
+ * FIXED palette (2026-10-22 redesign): the robot does NOT follow the
+ * panel theme — no `var(--…)` tokens, no `data-theme`. State halos use
+ * fixed colors so the bot reads on any desktop backdrop (light or dark
+ * wallpaper). The base dual-halo filter (dark drop-shadow + soft light
+ * glow) lives in Pet.svelte's <style> `.robot`; each state that needs a
+ * tint REPLACES that filter, keeping the dark drop-shadow so the bot
+ * still reads on light wallpapers in those states.
+ *
  * ONLY state-standby and state-thinking animate (light keyframes).
  * state-sleep, state-has-something, state-needs-you are NEAR-STATIC:
  *
@@ -11,7 +19,7 @@
  *   (no CSS `animation` property on `.state-sleep`) is the other half.
  *
  *   state-has-something and state-needs-you are also static (a colored
- *   filter tint signals the state; no motion). The `!`/`?` glyphs are
+ *   halo tint signals the state; no motion). The `!`/`?` glyphs are
  *   fixed `<text>` elements, not animated.
  *
  * The activity-nudge is a one-shot 1s wiggle (not a loop) layered on
@@ -22,24 +30,29 @@
  */
 
 /* ---------------------------------------------------------------------------
- * Sleep — dimmed, NO animation (no @keyframes, no `animation` property).
- * --------------------------------------------------------------------------- */
+ * Sleep — dimmed (opacity .5), NO animation (no @keyframes, no `animation`
+ * property). The halo dims too. Static — the v0.1.0 idle-CPU≈0 constraint.
+ * ------------------------------------------------------------------------- */
 .robot.state-sleep {
   opacity: 0.5;
-  filter: drop-shadow(0 2px 3px rgba(15, 23, 42, 0.2));
+  filter:
+    drop-shadow(0 2px 3px rgba(0, 0, 0, 0.2))
+    drop-shadow(0 0 2px rgba(255, 255, 255, 0.25));
 }
 
 /* ---------------------------------------------------------------------------
  * Standby — slow blink (~4s cycle). Eyes scale Y to ~0.1 briefly.
  * This is the ONLY idle animation on the awake pet; very light.
- * --------------------------------------------------------------------------- */
+ * The .eye elements are the ink dot circles in Pet.svelte (fixed ink
+ * #1C1C1E — no theme token).
+ * ------------------------------------------------------------------------- */
 @keyframes standby-blink {
   0%,
-  90%,
+  92%,
   100% {
     transform: scaleY(1);
   }
-  94% {
+  96% {
     transform: scaleY(0.1);
   }
 }
@@ -51,8 +64,10 @@
 }
 
 /* ---------------------------------------------------------------------------
- * Thinking — cog spins (2s linear loop). The gear above the head rotates.
- * --------------------------------------------------------------------------- */
+ * Thinking — indigo cog spins (2s linear loop). The gear above the head
+ * rotates. The cog is the ONLY animated element in this state. The cog
+ * strokes are fixed indigo #4F46E5 (no theme token).
+ * ------------------------------------------------------------------------- */
 @keyframes thinking-cog-spin {
   from {
     transform: rotate(0deg);
@@ -69,19 +84,25 @@
 }
 
 /* ---------------------------------------------------------------------------
- * HasSomething — static. A warm tint signals "perked up"; the `!` glyph
- * is a fixed `<text>`. No @keyframes.
- * --------------------------------------------------------------------------- */
+ * HasSomething — static. A warm-orange halo tint signals "perked up"; the
+ * `!` glyph is a fixed `<text>` (fill #EA580C). No @keyframes. The dark
+ * drop-shadow is kept so the bot still reads on light wallpapers.
+ * ------------------------------------------------------------------------- */
 .robot.state-has-something {
-  filter: drop-shadow(0 2px 4px rgba(250, 204, 21, 0.5));
+  filter:
+    drop-shadow(0 2px 3px rgba(0, 0, 0, 0.35))
+    drop-shadow(0 0 3px rgba(234, 88, 12, 0.45));
 }
 
 /* ---------------------------------------------------------------------------
- * NeedsYou — static. A red tint signals "needs attention"; the `?` glyph
- * is a fixed `<text>`. No @keyframes.
- * --------------------------------------------------------------------------- */
+ * NeedsYou — static. A red halo tint signals "needs attention"; the `?`
+ * glyph is a fixed `<text>` (fill #DC2626). No @keyframes. The dark
+ * drop-shadow is kept so the bot still reads on light wallpapers.
+ * ------------------------------------------------------------------------- */
 .robot.state-needs-you {
-  filter: drop-shadow(0 2px 4px rgba(239, 68, 68, 0.5));
+  filter:
+    drop-shadow(0 2px 3px rgba(0, 0, 0, 0.35))
+    drop-shadow(0 0 3px rgba(220, 38, 38, 0.45));
 }
 
 /* ---------------------------------------------------------------------------
