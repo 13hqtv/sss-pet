@@ -268,6 +268,22 @@ fn settings_set_with_focus(
     Ok(())
 }
 
+/// Task 3: per-agent model discovery Tauri command. Wraps
+/// [`agent::models::list_models`] with a default [`agent::BackendConfig`]
+/// (the frontend does not pass per-agent config — discovery uses the
+/// user's already-installed CLI on PATH, the same model `chat_send`
+/// uses). Returns `Vec<String>` (empty on any failure — the frontend
+/// offers manual text entry when the list is empty; design: 兜底).
+/// `provider` is one of `claude` / `opencode` / `codex` (the
+/// [`agent::SUPPORTED`] whitelist); unknown providers return `vec![]`.
+#[tauri::command]
+async fn list_models(provider: String) -> Vec<String> {
+    let cfg = agent::BackendConfig::default();
+    agent::models::list_models(&provider, &cfg)
+        .await
+        .unwrap_or_default()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -312,6 +328,11 @@ pub fn run() {
             chat::new_conversation,
             chat::load_history,
             chat::chat_send,
+            // Task 3: per-agent model discovery (opencode / claude / codex)
+            // for the new-conversation model picker. Returns Vec<String>
+            // (empty on any failure — the frontend offers manual text entry
+            // when the list is empty; design: 兜底).
+            list_models,
             // Task 16: todos / reminders / settings / dismiss commands.
             // `todo_*` + `reminder_*` are thin wrappers around
             // `db::todo_*` / `db::reminder_*`. `settings_get` /

@@ -31,6 +31,14 @@ pub mod opencode;
 // heaviest backend; the testable pure surface is `handle_event` + the
 // request builders + `extract_session_id` (no subprocess).
 pub mod codex;
+// Task 3: per-agent model discovery — `list_models(provider, cfg)` +
+// `pub(crate)` per-agent parsers (`parse_opencode_models` /
+// `parse_claude_control_response` / `parse_codex_debug_models`) +
+// `codex_static_models()` fallback. All probe spawns route through
+// `exec::spawn` (Task 2's `CREATE_NO_WINDOW`). Sourced from multica's
+// `claude_models.go` / `thinking.go` / `models.go`. Task 5 (conversation-
+// level model picker) consumes the Tauri command.
+pub mod models;
 // Task 13: conversation model + session resume / history replay. Owns
 // the persisted types (`StoredMessage`, `Conversation`), the
 // `resume_or_replay` decision (resume via the agent-native
