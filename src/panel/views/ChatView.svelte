@@ -50,14 +50,15 @@
   // stream by one save_turn_record call).
   const liveBuffers: Map<string, DisplayMessage[]> = new Map();
 
-  // Display shape: StoredMessage (role + content + persisted kind) PLUS
-  // the live MessageKind + the streamed `tool` metadata (for the
-  // ToolUse "使用工具 X" label). `kind` is undefined for messages
-  // loaded from pre-Task-1 history without a persisted kind (the
-  // history-load path falls back to roleToKind); live messages always
-  // carry the backend's MessageKind. `tool` is only set on live
-  // ToolUse messages (the persisted StoredMessage shape drops it —
-  // history ToolUse blocks render with the "工具" fallback label).
+  // Display shape: StoredMessage (role + content + persisted kind +
+  // persisted tool) PLUS the live MessageKind + the streamed `tool`
+  // metadata (for the ToolUse "使用工具 X" label). `kind` is undefined
+  // for messages loaded from pre-Task-1 history without a persisted
+  // kind (the history-load path falls back to roleToKind); live
+  // messages always carry the backend's MessageKind. `tool` is set on
+  // live ToolUse messages AND on history ToolUse rows (Task 6
+  // fix-round-1 persisted it); null for pre-fix rows + non-tool kinds
+  // → the chip shows "（未知）".
   interface DisplayMessage {
     role: StoredMessage["role"];
     content: string;
@@ -185,6 +186,12 @@
           role: m.role,
           content: m.content,
           kind: (m.kind as MessageKind | null | undefined) ?? roleToKind(m.role),
+          // Task 6 fix-round-1: carry the persisted `tool` name so the
+          // reload path shows "使用工具 Bash" like the live path (was
+          // dropped → "使用工具 工具" doubled fallback). `m.tool` is
+          // null/undefined for pre-fix rows + non-tool kinds; the chip
+          // fallback handles those.
+          tool: m.tool ?? null,
         }));
         liveBuffers.set(convId, [...messages]);
       }
@@ -364,9 +371,9 @@
       content: message.content,
       kind: message.kind,
       // Carry the tool name so the ToolUse block's "使用工具 X"
-      // label shows the actual tool (e.g. "Bash") rather than the
-      // "工具" fallback. History ToolUse rows have no `tool` (the
-      // persisted shape drops it) — they fall back to "工具".
+      // label shows the actual tool (e.g. "Bash"). History ToolUse
+      // rows ALSO carry `tool` now (Task 6 fix-round-1 persisted it
+      // — the history-load map passes `m.tool`); null → "（未知）".
       tool: message.tool,
     };
     // Append to the conv's live buffer.
@@ -543,13 +550,16 @@
             </details>
           {:else if m.kind === "ToolUse"}
             <!-- 🔧 使用工具 X: X = m.tool (the streamed Message.tool
-                 field) if present, else "工具" (the brief). The tool
-                 INPUT is m.content (the backends parse the tool-call
-                 input into the ToolUse message's content). History
-                 ToolUse rows have no `tool` (persisted shape drops
-                 it) → "工具" fallback. -->
+                 field OR the persisted StoredMessage.tool — Task 6
+                 fix-round-1 added the latter so history reload shows
+                 the tool name). Falls back to "（未知）" when tool is
+                 null/empty (pre-fix rows / non-tool kinds) so the chip
+                 reads "使用工具（未知）" rather than the doubled
+                 "使用工具 工具". The tool INPUT is m.content (the
+                 backends parse the tool-call input into the ToolUse
+                 message's content). -->
             <details class="block tool-use">
-              <summary>🔧 使用工具 {m.tool ?? "工具"}</summary>
+              <summary>🔧 使用工具{m.tool ? ` ${m.tool}` : "（未知）"}</summary>
               <pre class="block-content">{m.content}</pre>
             </details>
           {:else if m.kind === "ToolResult"}

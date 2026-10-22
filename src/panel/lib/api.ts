@@ -54,12 +54,15 @@ export interface Conversation {
  * "改动 3"). `kind` is `null` for rows written before Task 1's
  * migration whose role didn't match the db's backfill heuristic
  * (`infer_kind_from_role`); the frontend treats `null` as `Text`.
- * The `tool` metadata is NOT persisted (only the kind name + content
- * are) — ToolUse blocks from history fall back to the "工具" label. */
+ * Task 6 fix-round-1: added the `tool` field (the tool NAME, e.g.
+ * "Bash") so history ToolUse chips show the tool identity on reload
+ * (was dropped → "使用工具 工具" doubled fallback). `null` for pre-fix
+ * rows + non-tool kinds; the frontend falls back to "（未知）". */
 export interface StoredMessage {
   role: "user" | "assistant" | "system" | "tool";
   content: string;
   kind?: string | null;
+  tool?: string | null;
 }
 
 /** Mirrors `agent::MessageKind`. The streamed Message carries this tag

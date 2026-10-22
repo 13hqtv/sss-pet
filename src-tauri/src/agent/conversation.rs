@@ -55,11 +55,21 @@ use super::{Backend, BackendError, ExecOptions, ExecResult, Message, Session};
 /// persisted shape lets history replay render thinking / tool blocks the
 /// same way the live stream did (design "改动 3": reopen a chat and see
 /// the processing, not just plain text).
+///
+/// **Task 6 fix-round-1: `tool` field.** The tool NAME (e.g. `"Bash"`)
+/// carried on a streamed [`Message::tool`] — set by
+/// [`db::save_turn_record`] when persisting a `ToolUse` / `ToolResult`
+/// message. `None` for rows written before this fix (and for non-tool
+/// kinds). Without it, history ToolUse chips read "使用工具 工具" (the
+/// fallback doubled the label — self-referential + no tool identity); now
+/// the reload path carries `tool` the same way the live path does, so a
+/// history ToolUse chip reads "使用工具 Bash".
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredMessage {
     pub role: String,
     pub content: String,
     pub kind: Option<String>,
+    pub tool: Option<String>,
 }
 
 /// One persisted conversation thread. `id` is the desktop-pet's own
@@ -474,11 +484,13 @@ mod tests {
                 role: "user".into(),
                 content: "what is 2+2".into(),
                 kind: None,
+                tool: None,
             },
             StoredMessage {
                 role: "assistant".into(),
                 content: "4".into(),
                 kind: None,
+                tool: None,
             },
         ]
     }

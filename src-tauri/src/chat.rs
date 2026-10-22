@@ -130,6 +130,8 @@ pub async fn run_chat_turn(
             // role). New rows set `kind` explicitly to avoid the
             // heuristic; only pre-Task-1 NULL rows rely on it.
             kind: Some("Text".into()),
+            // The user's prompt carries no tool — `None` (non-tool kind).
+            tool: None,
         };
         db::append_message(&conn, conv_id, &user_msg)
             .map_err(|e| format!("append user msg: {e}"))?;

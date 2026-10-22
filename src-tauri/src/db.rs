@@ -279,6 +279,11 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "conversations", "model", "TEXT")?;
     add_column_if_missing(conn, "conversations", "cwd", "TEXT NOT NULL DEFAULT '.'")?;
     add_column_if_missing(conn, "messages", "kind", "TEXT")?;
+    // Task 6 fix-round-1: persist the tool name on ToolUse/ToolResult
+    // rows so history reload shows "使用工具 Bash" instead of the
+    // doubled "使用工具 工具" fallback. Idempotent like the others
+    // (PRAGMA table_info guard → ADD COLUMN skipped if already present).
+    add_column_if_missing(conn, "messages", "tool", "TEXT")?;
     Ok(())
 }
 
@@ -476,17 +481,21 @@ pub fn list_conversations(conn: &Connection) -> rusqlite::Result<Vec<Conversatio
 /// `load_messages` orders by id). Task 1: also stores the message's
 /// `kind` (the [`MessageKind`](crate::agent::MessageKind) variant name,
 /// or `None` for rows written without one — e.g. the user-prompt append
-/// in `chat::run_chat_turn` which has no `MessageKind` tag).
+/// in `chat::run_chat_turn` which has no `MessageKind` tag). Task 6
+/// fix-round-1: also stores the `tool` name (the streamed
+/// [`Message::tool`], `None` for non-tool kinds + pre-fix rows) so
+/// history ToolUse chips show the tool identity on reload.
 pub fn append_message(conn: &Connection, conv_id: &str, msg: &StoredMessage) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO messages (conv_id, role, content, created_at, kind) \
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO messages (conv_id, role, content, created_at, kind, tool) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         rusqlite::params![
             conv_id,
             msg.role,
             msg.content,
             chrono::Utc::now().to_rfc3339(),
             msg.kind,
+            msg.tool,
         ],
     )?;
     Ok(())
@@ -499,22 +508,26 @@ pub fn append_message(conn: &Connection, conv_id: &str, msg: &StoredMessage) -> 
 /// `Some("ToolResult")`, else `None`. The backfill is a heuristic so
 /// reopening a pre-Task-1 history still renders sensible kinds (text
 /// bubbles for assistant turns, tool-result chips for the user/tool
-/// side) instead of all-`None`.
+/// side) instead of all-`None`. Task 6 fix-round-1: also reads the
+/// `tool` column (`None` for pre-fix rows + non-tool kinds); `tool` is
+/// NOT inferred from role (only `kind` is) — old ToolUse rows keep
+/// `tool: None` and the frontend's fallback wording handles that.
 pub fn load_messages(conn: &Connection, conv_id: &str) -> rusqlite::Result<Vec<StoredMessage>> {
     let mut stmt = conn.prepare(
-        "SELECT role, content, kind FROM messages WHERE conv_id = ?1 ORDER BY id",
+        "SELECT role, content, kind, tool FROM messages WHERE conv_id = ?1 ORDER BY id",
     )?;
     let rows = stmt.query_map([conv_id], |row| {
         let role: String = row.get(0)?;
         let content: String = row.get(1)?;
         let kind: Option<String> = row.get(2)?;
-        Ok((role, content, kind))
+        let tool: Option<String> = row.get(3)?;
+        Ok((role, content, kind, tool))
     })?;
     let mut out = Vec::new();
     for r in rows {
-        let (role, content, kind) = r?;
+        let (role, content, kind, tool) = r?;
         let kind = kind.or_else(|| infer_kind_from_role(&role));
-        out.push(StoredMessage { role, content, kind });
+        out.push(StoredMessage { role, content, kind, tool });
     }
     Ok(out)
 }
@@ -573,12 +586,16 @@ pub fn save_turn_record(
     // `Drop for Transaction` issues `ROLLBACK`, so no partial commit.
     let tx = conn.transaction()?;
     // 1. Append all messages as StoredMessages (kind → role string AND
-    //    kind → kind-name string, content verbatim).
+    //    kind → kind-name string, content verbatim). Task 6 fix-round-1:
+    //    also carry `m.tool` so the tool name persists + history reload
+    //    shows it (was dropped → history ToolUse chips read "工具"
+    //    fallback with no identity).
     for m in &record.messages {
         let sm = StoredMessage {
             role: message_kind_to_role(m.kind),
             content: m.content.clone(),
             kind: Some(message_kind_to_name(m.kind)),
+            tool: m.tool.clone(),
         };
         append_message(&tx, conv_id, &sm)?;
     }
@@ -898,9 +915,9 @@ mod tests {
         };
         save_conversation(&conn, &conv).expect("save");
         let msgs = vec![
-            StoredMessage { role: "user".into(), content: "hello".into(), kind: None },
-            StoredMessage { role: "assistant".into(), content: "hi".into(), kind: None },
-            StoredMessage { role: "tool".into(), content: "{\"result\":42}".into(), kind: None },
+            StoredMessage { role: "user".into(), content: "hello".into(), kind: None, tool: None },
+            StoredMessage { role: "assistant".into(), content: "hi".into(), kind: None, tool: None },
+            StoredMessage { role: "tool".into(), content: "{\"result\":42}".into(), kind: None, tool: None },
         ];
         for m in &msgs {
             append_message(&conn, &conv.id, m).expect("append");
@@ -1477,6 +1494,25 @@ mod tests {
         assert_eq!(msgs[1].role, "assistant");
         assert_eq!(msgs[2].role, "assistant");
         assert_eq!(msgs[3].role, "tool");
+        // Task 6 fix-round-1: the tool NAME round-trips too — a ToolUse
+        // Message with tool: Some("Bash") persists it, + load_messages
+        // returns StoredMessage.tool == Some("Bash"). Without this, history
+        // ToolUse chips read "使用工具 工具" (the doubled fallback). Also
+        // pins that non-tool kinds carry tool: None through the round-trip.
+        assert_eq!(msgs[0].tool, None, "Text msg tool must be None");
+        assert_eq!(msgs[1].tool, None, "Thinking msg tool must be None");
+        assert_eq!(
+            msgs[2].tool.as_deref(),
+            Some("Bash"),
+            "ToolUse msg tool must round-trip as Some(\"Bash\") — the core fix, got: {:?}",
+            msgs[2].tool,
+        );
+        assert_eq!(
+            msgs[3].tool.as_deref(),
+            Some("Bash"),
+            "ToolResult msg tool must round-trip as Some(\"Bash\"), got: {:?}",
+            msgs[3].tool,
+        );
     }
 
     /// Old rows (pre-Task-1 migration, `kind IS NULL`) get a `kind`
