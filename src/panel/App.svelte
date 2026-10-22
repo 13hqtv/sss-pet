@@ -116,8 +116,20 @@
     start_dragging on mousedown anywhere in this bar, so the user can
     move the panel by grabbing the bar. The bar stays at the very top
     (Task 4); the Task 15 tab strip lives below it.
+
+    Mac-style window dots (red/yellow/green) are decorative product
+    chrome — they don't close/min/max (the OS / tray owns that). Their
+    colors are intentionally NOT themed: they're fixed r/y/g in both
+    light + dark (same exception as the `#fff` accent-foreground text
+    in ChatView — product chrome, not theme-dependent). `aria-hidden`
+    keeps screen readers off the purely-decorative dots.
   -->
   <header class="dragbar" data-tauri-drag-region>
+    <div class="dots" aria-hidden="true">
+      <span class="dot red"></span>
+      <span class="dot yellow"></span>
+      <span class="dot green"></span>
+    </div>
     <span class="title">桌面宠物</span>
   </header>
 
@@ -152,77 +164,121 @@
 </main>
 
 <style>
+  /* Task 4: refined restyle. Every color is a theme.css token so the
+   * shell flips with data-theme; no hardcoded hex anywhere (the only
+   * fixed-color exceptions are the mac-style window dots, which are
+   * product chrome — same exclusion as ChatView's `#fff`
+   * accent-foreground). Radius ladder: tabs → --r-chip (full pill).
+   * Spacing follows the 8px rhythm (--space-1..5). The dragbar keeps
+   * its `data-tauri-drag-region` attribute (Tauri's start_dragging). */
+
   .panel {
     margin: 0;
     height: 100vh;
     display: flex;
     flex-direction: column;
-    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-    color: #1f2937;
-    background: #f8fafc;
+    font-family: var(--font);
+    color: var(--ink);
+    background: var(--bg);
     /* OS provides the window chrome (resizable border, etc.) — this just
        fills the client area. */
   }
 
   .dragbar {
     /* A fixed-height bar that reads as a title strip. Tall enough to grab
-       easily (~28px); short enough not to eat the body. */
+       easily (~28px); short enough not to eat the body. Surface fill +
+       bd bottom border = a clean raised strip over --bg. */
     height: 28px;
     flex: 0 0 28px;
     display: flex;
     align-items: center;
-    padding: 0 12px;
-    background: linear-gradient(180deg, #e2e8f0 0%, #cbd5e1 100%);
-    border-bottom: 1px solid #94a3b8;
+    gap: var(--space-2);
+    padding: 0 var(--space-3);
+    background: var(--surface);
+    border-bottom: 1px solid var(--bd);
     /* Grab cursor hints the bar is draggable. Tauri's start_dragging is
        triggered by `data-tauri-drag-region`, not by this cursor, but the
        visual affordance matters. */
     cursor: grab;
     user-select: none;
     /* Drag-region must not have descendant pointer-events intercepting the
-       mousedown — the bar itself is the only child here. */
+       mousedown — dots + title both set `pointer-events: none` so the
+       mousedown lands on the bar (the drag-region). */
   }
 
   .dragbar:active {
     cursor: grabbing;
   }
 
+  /* Mac-style window dots — decorative product chrome. Fixed r/y/g
+   * in both themes (NOT themed — they're chrome, like the `#fff`
+   * accent-foreground text in ChatView). `pointer-events: none` so
+   * the mousedown goes through to the drag-region. */
+  .dots {
+    display: flex;
+    gap: 6px;
+    pointer-events: none;
+  }
+
+  .dot {
+    width: 11px;
+    height: 11px;
+    border-radius: 50%;
+    pointer-events: none;
+  }
+
+  .dot.red {
+    background: #ff5f57;
+  }
+
+  .dot.yellow {
+    background: #febc2e;
+  }
+
+  .dot.green {
+    background: #28c840;
+  }
+
   .title {
-    font-size: 0.8rem;
-    font-weight: 600;
-    color: #334155;
+    font-size: 0.78rem;
+    font-weight: 500;
+    color: var(--mut);
     /* `pointer-events: none` so the mousedown lands on the bar (the
        drag-region) and not on the text label. */
     pointer-events: none;
   }
 
+  /* Pill-style tab strip. Active pill = acc-soft fill + acc text;
+   * inactive = mut text; hover = acc-soft fill (subtle). Full pill
+   * radius (--r-chip = 999px) — "药丸 tab" per the brief. The strip
+   * is NOT a drag-region so the pills are clickable. */
   .tabs {
     flex: 0 0 auto;
     display: flex;
-    gap: 2px;
-    padding: 6px 8px;
-    background: #e2e8f0;
-    border-bottom: 1px solid #94a3b8;
+    gap: var(--space-1);
+    padding: var(--space-2) var(--space-3);
+    background: var(--surface);
+    border-bottom: 1px solid var(--bd);
   }
 
   .tab {
-    padding: 4px 12px;
+    padding: var(--space-1) var(--space-3);
     font-size: 0.8rem;
     border: none;
-    border-radius: 12px;
+    border-radius: var(--r-chip);
     background: transparent;
-    color: #475569;
+    color: var(--mut);
     cursor: pointer;
-    transition: background 0.1s, color 0.1s;
+    transition: background var(--t-fast), color var(--t-fast);
   }
 
   .tab:hover {
-    background: #cbd5e1;
+    background: var(--acc-soft);
   }
 
   .tab.active {
-    background: #2563eb;
-    color: white;
+    background: var(--acc-soft);
+    color: var(--acc);
   }
 
   .body {

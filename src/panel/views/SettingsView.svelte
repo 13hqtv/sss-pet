@@ -354,39 +354,51 @@
 </section>
 
 <style>
+  /* Task 4: refined restyle — hex → theme.css tokens. Matches the
+   * ChatView look. Per the brief: section headings (legend) → ink 500;
+   * labels → mut; inputs → bd border + ink text + acc focus; checkboxes
+   * → acc when on (via accent-color, the modern native-control theming);
+   * buttons → acc + #fff + pill. The "已保存" indicator drops green
+   * (Task 3's克制 approach — no green token exists) → acc instead. The
+   * per-agent probe blocks share the same input/button treatment. Radius:
+   * inputs → --r-code, buttons → --r-chip, fieldset → --r-code. Spacing:
+   * 8px rhythm. No soft shadow (flat tab content, scrollable form). */
+
   .settings {
     flex: 1;
     overflow-y: auto;
-    background: #f8fafc;
-    padding: 10px;
+    background: var(--bg);
+    padding: var(--space-3);
   }
 
   .loading {
-    padding: 1.5rem;
+    padding: var(--space-5);
     text-align: center;
-    color: #64748b;
+    color: var(--mut);
     font-size: 0.88rem;
   }
 
   .form {
     display: flex;
     flex-direction: column;
-    gap: 12px;
+    gap: var(--space-3);
   }
 
   .field {
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    gap: var(--space-1);
   }
 
+  /* Labels are mut (per brief); the fieldset legend is the section
+   * heading → ink 500 (see .agent-models legend below). */
   .field label {
     font-size: 0.82rem;
-    color: #334155;
+    color: var(--mut);
     font-weight: 500;
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: var(--space-1);
   }
 
   .field input[type="text"],
@@ -394,29 +406,42 @@
   .field input[type="time"],
   .field select {
     font-size: 0.85rem;
-    padding: 4px 8px;
-    border: 1px solid #cbd5e1;
-    border-radius: 4px;
+    padding: var(--space-1) var(--space-2);
+    border: 1px solid var(--bd);
+    border-radius: var(--r-code);
     font-family: inherit;
-    background: white;
-    color: #1f2937;
+    background: var(--surface);
+    color: var(--ink);
+    transition: border-color var(--t-fast);
   }
 
+  .field input[type="text"]:focus,
+  .field input[type="number"]:focus,
+  .field input[type="time"]:focus,
+  .field select:focus {
+    border-color: var(--acc);
+    outline: none;
+  }
+
+  /* Checkboxes: accent-color themes the native checked state to the
+   * accent indigo — "switch var(--acc) when on" per the brief, no
+   * custom switch markup needed. Works in both light + dark. */
   .field input[type="checkbox"] {
     width: 16px;
     height: 16px;
     cursor: pointer;
+    accent-color: var(--acc);
   }
 
   .field small {
     font-size: 0.7rem;
-    color: #94a3b8;
+    color: var(--mut);
   }
 
   .field .row {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: var(--space-1);
   }
 
   .field .row.disabled {
@@ -425,30 +450,32 @@
 
   .field .row span {
     font-size: 0.8rem;
-    color: #64748b;
+    color: var(--mut);
   }
 
-  /* -- per-agent default model section (Task 5) -- */
+  /* -- per-agent default model section (Task 5) --
+   * The fieldset is a section card: surface fill + bd border + code
+   * radius. The legend is the section heading → ink 500. */
   .agent-models {
-    border: 1px solid #cbd5e1;
-    border-radius: 6px;
-    padding: 10px;
+    border: 1px solid var(--bd);
+    border-radius: var(--r-code);
+    padding: var(--space-3);
     display: flex;
     flex-direction: column;
-    gap: 8px;
-    background: #f1f5f9;
+    gap: var(--space-2);
+    background: var(--surface);
   }
 
   .agent-models legend {
     font-size: 0.82rem;
-    color: #334155;
+    color: var(--ink);
     font-weight: 500;
-    padding: 0 4px;
+    padding: 0 var(--space-1);
   }
 
   .agent-models .hint {
     font-size: 0.7rem;
-    color: #94a3b8;
+    color: var(--mut);
   }
 
   .agent-row {
@@ -456,9 +483,9 @@
     grid-template-columns: 80px auto 1fr;
     grid-template-rows: auto auto;
     align-items: center;
-    gap: 4px 8px;
-    padding: 6px 4px;
-    border-bottom: 1px solid #e2e8f0;
+    gap: var(--space-1) var(--space-2);
+    padding: var(--space-1) var(--space-1);
+    border-bottom: 1px solid var(--bd);
   }
 
   .agent-row:last-child {
@@ -467,7 +494,7 @@
 
   .agent-name {
     font-size: 0.82rem;
-    color: #1f2937;
+    color: var(--ink);
     font-weight: 500;
     grid-row: 1;
     grid-column: 1;
@@ -477,17 +504,23 @@
     grid-row: 1;
     grid-column: 2;
     font-size: 0.78rem;
-    padding: 3px 8px;
+    padding: 3px var(--space-2);
     cursor: pointer;
-    background: #2563eb;
-    color: white;
+    background: var(--acc);
+    color: #fff;
     border: none;
-    border-radius: 4px;
+    border-radius: var(--r-chip);
+    transition: opacity var(--t-fast);
+  }
+
+  .probe-btn:hover {
+    opacity: 0.9;
   }
 
   .probe-btn:disabled {
-    background: #94a3b8;
+    background: var(--mut);
     cursor: not-allowed;
+    opacity: 1;
   }
 
   .model-pick {
@@ -495,79 +528,99 @@
     grid-column: 3;
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: var(--space-1);
     flex-wrap: wrap;
   }
 
   .model-pick select,
   .model-pick input[type="text"] {
     font-size: 0.82rem;
-    padding: 3px 6px;
-    border: 1px solid #cbd5e1;
-    border-radius: 4px;
+    padding: 3px var(--space-2);
+    border: 1px solid var(--bd);
+    border-radius: var(--r-code);
     font-family: inherit;
-    background: white;
-    color: #1f2937;
+    background: var(--surface);
+    color: var(--ink);
     min-width: 180px;
     flex: 1;
+    transition: border-color var(--t-fast);
+  }
+
+  .model-pick select:focus,
+  .model-pick input[type="text"]:focus {
+    border-color: var(--acc);
+    outline: none;
   }
 
   .probing-label {
     font-size: 0.78rem;
-    color: #2563eb;
+    color: var(--acc);
     font-style: italic;
   }
 
   .model-pick small.muted {
     font-size: 0.68rem;
-    color: #94a3b8;
+    color: var(--mut);
   }
 
   .link-btn {
     background: transparent;
     border: none;
-    color: #2563eb;
+    color: var(--acc);
     font-size: 0.72rem;
     cursor: pointer;
     padding: 0;
     text-decoration: underline;
   }
 
+  .link-btn:disabled {
+    color: var(--mut);
+    cursor: not-allowed;
+  }
+
   .error-msg {
     grid-row: 2;
     grid-column: 2 / span 2;
     font-size: 0.72rem;
-    color: #991b1b;
+    color: var(--err);
   }
 
   .actions {
     display: flex;
     align-items: center;
-    gap: 10px;
-    margin-top: 4px;
+    gap: var(--space-2);
+    margin-top: var(--space-1);
   }
 
   .actions button {
-    padding: 6px 16px;
+    padding: var(--space-1) var(--space-4);
     font-size: 0.88rem;
     cursor: pointer;
-    background: #2563eb;
-    color: white;
+    background: var(--acc);
+    color: #fff;
     border: none;
-    border-radius: 4px;
+    border-radius: var(--r-chip);
+    transition: opacity var(--t-fast);
   }
 
+  .actions button:hover {
+    opacity: 0.9;
+  }
+
+  /* "已保存" indicator: was green (#16a34a). No green token exists in
+   * the design system; Task 3's克制 approach removes green. Use acc
+   * (accent indigo) — a positive confirmation within the accent palette. */
   .actions .saved {
     font-size: 0.8rem;
-    color: #16a34a;
+    color: var(--acc);
   }
 
   .error {
-    padding: 6px 10px;
-    background: #fee2e2;
-    color: #991b1b;
+    padding: var(--space-1) var(--space-3);
+    background: var(--err-soft);
+    color: var(--err);
     font-size: 0.8rem;
-    border-top: 1px solid #fecaca;
-    margin-top: 8px;
+    border-top: 1px solid var(--err);
+    margin-top: var(--space-2);
   }
 </style>

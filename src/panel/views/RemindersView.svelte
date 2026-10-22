@@ -137,6 +137,14 @@
 </section>
 
 <style>
+  /* Task 4: refined restyle — hex → theme.css tokens. Same treatment
+   * as TodosView + ChatView: surface fill + bd dividers + acc-soft
+   * hover, mut → err delete hover, acc buttons. The "已触发" badge is
+   * a muted chip (mut text on bg fill + bd border) — fired = past /
+   * dimmed, not an accent state. Due-time display is mut per the
+   * brief. Radius: inputs → --r-code, button → --r-chip, badge →
+   * --r-chip. Spacing: 8px rhythm. No soft shadow (flat tab content). */
+
   .reminders {
     display: flex;
     flex-direction: column;
@@ -146,10 +154,10 @@
 
   .add-row {
     display: flex;
-    gap: 6px;
-    padding: 8px;
-    border-bottom: 1px solid #cbd5e1;
-    background: #f1f5f9;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    border-bottom: 1px solid var(--bd);
+    background: var(--surface);
     flex-wrap: wrap;
   }
 
@@ -157,33 +165,59 @@
     flex: 1;
     min-width: 120px;
     font-size: 0.85rem;
-    padding: 4px 8px;
-    border: 1px solid #cbd5e1;
-    border-radius: 4px;
+    padding: var(--space-1) var(--space-2);
+    border: 1px solid var(--bd);
+    border-radius: var(--r-code);
     font-family: inherit;
+    background: var(--bg);
+    color: var(--ink);
+    transition: border-color var(--t-fast);
+  }
+
+  .add-row input[type="text"]:focus {
+    border-color: var(--acc);
+    outline: none;
+  }
+
+  .add-row input[type="text"]::placeholder {
+    color: var(--mut);
   }
 
   .add-row input[type="datetime-local"] {
     font-size: 0.8rem;
-    padding: 4px;
-    border: 1px solid #cbd5e1;
-    border-radius: 4px;
+    padding: var(--space-1);
+    border: 1px solid var(--bd);
+    border-radius: var(--r-code);
     font-family: inherit;
+    background: var(--bg);
+    color: var(--ink);
+    transition: border-color var(--t-fast);
+  }
+
+  .add-row input[type="datetime-local"]:focus {
+    border-color: var(--acc);
+    outline: none;
   }
 
   .add-row button {
-    padding: 4px 12px;
+    padding: var(--space-1) var(--space-3);
     font-size: 0.85rem;
     cursor: pointer;
-    background: #2563eb;
-    color: white;
+    background: var(--acc);
+    color: #fff;
     border: none;
-    border-radius: 4px;
+    border-radius: var(--r-chip);
+    transition: opacity var(--t-fast);
+  }
+
+  .add-row button:hover {
+    opacity: 0.9;
   }
 
   .add-row button:disabled {
-    background: #94a3b8;
+    background: var(--mut);
     cursor: not-allowed;
+    opacity: 1;
   }
 
   .list {
@@ -192,15 +226,21 @@
     padding: 0;
     overflow-y: auto;
     flex: 1;
-    background: #f8fafc;
+    background: var(--bg);
   }
 
   .reminder {
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 8px 10px;
-    border-bottom: 1px solid #e2e8f0;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    border-bottom: 1px solid var(--bd);
+    background: var(--surface);
+    transition: background var(--t-fast);
+  }
+
+  .reminder:hover {
+    background: var(--acc-soft);
   }
 
   .reminder .content {
@@ -212,66 +252,71 @@
 
   .reminder .text {
     font-size: 0.88rem;
-    color: #1f2937;
+    color: var(--ink);
     word-break: break-word;
   }
 
   .reminder .due {
     font-size: 0.75rem;
-    color: #64748b;
+    color: var(--mut);
     display: flex;
-    gap: 4px;
+    gap: var(--space-1);
     align-items: center;
   }
 
   .reminder .due .label {
-    color: #94a3b8;
+    color: var(--mut);
   }
 
   .reminder .due .time {
-    font-family: ui-monospace, "Cascadia Code", monospace;
+    font-family: var(--mono);
   }
 
   .reminder.fired .text {
-    color: #94a3b8;
+    color: var(--mut);
   }
 
+  /* "已触发" badge — muted neutral chip (fired = past state, not an
+   * accent or error state). mut text on bg fill + bd border, full
+   * pill radius. */
   .reminder .badge {
-    background: #fef3c7;
-    color: #92400e;
-    padding: 1px 5px;
-    border-radius: 8px;
+    background: var(--bg);
+    color: var(--mut);
+    border: 1px solid var(--bd);
+    padding: 1px var(--space-2);
+    border-radius: var(--r-chip);
     font-size: 0.65rem;
-    margin-left: 4px;
+    margin-left: var(--space-1);
   }
 
   .reminder .del {
     background: transparent;
     border: none;
-    color: #94a3b8;
+    color: var(--mut);
     font-size: 1rem;
     cursor: pointer;
-    padding: 2px 6px;
-    border-radius: 4px;
+    padding: 2px var(--space-1);
+    border-radius: var(--r-code);
+    transition: background var(--t-fast), color var(--t-fast);
   }
 
   .reminder .del:hover {
-    background: #fee2e2;
-    color: #dc2626;
+    background: var(--err-soft);
+    color: var(--err);
   }
 
   .empty {
-    padding: 1.5rem;
+    padding: var(--space-5);
     text-align: center;
-    color: #64748b;
+    color: var(--mut);
     font-size: 0.88rem;
   }
 
   .error {
-    padding: 6px 10px;
-    background: #fee2e2;
-    color: #991b1b;
+    padding: var(--space-1) var(--space-3);
+    background: var(--err-soft);
+    color: var(--err);
     font-size: 0.8rem;
-    border-top: 1px solid #fecaca;
+    border-top: 1px solid var(--err);
   }
 </style>

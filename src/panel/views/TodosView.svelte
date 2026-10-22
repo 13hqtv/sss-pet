@@ -106,6 +106,12 @@
 </section>
 
 <style>
+  /* Task 4: refined restyle — hex → theme.css tokens. Matches the
+   * ChatView look: surface fill + bd dividers + acc-soft hover, acc
+   * checkboxes (via accent-color), mut → err delete button hover.
+   * Radius: inputs → --r-code, button → --r-chip. Spacing: 8px rhythm.
+   * No soft shadow (flat tab content, not elevated). */
+
   .todos {
     display: flex;
     flex-direction: column;
@@ -115,34 +121,52 @@
 
   .add-row {
     display: flex;
-    gap: 6px;
-    padding: 8px;
-    border-bottom: 1px solid #cbd5e1;
-    background: #f1f5f9;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    border-bottom: 1px solid var(--bd);
+    background: var(--surface);
   }
 
   .add-row input {
     flex: 1;
     font-size: 0.85rem;
-    padding: 4px 8px;
-    border: 1px solid #cbd5e1;
-    border-radius: 4px;
+    padding: var(--space-1) var(--space-2);
+    border: 1px solid var(--bd);
+    border-radius: var(--r-code);
     font-family: inherit;
+    background: var(--bg);
+    color: var(--ink);
+    transition: border-color var(--t-fast);
+  }
+
+  .add-row input:focus {
+    border-color: var(--acc);
+    outline: none;
+  }
+
+  .add-row input::placeholder {
+    color: var(--mut);
   }
 
   .add-row button {
-    padding: 4px 12px;
+    padding: var(--space-1) var(--space-3);
     font-size: 0.85rem;
     cursor: pointer;
-    background: #2563eb;
-    color: white;
+    background: var(--acc);
+    color: #fff;
     border: none;
-    border-radius: 4px;
+    border-radius: var(--r-chip);
+    transition: opacity var(--t-fast);
+  }
+
+  .add-row button:hover {
+    opacity: 0.9;
   }
 
   .add-row button:disabled {
-    background: #94a3b8;
+    background: var(--mut);
     cursor: not-allowed;
+    opacity: 1;
   }
 
   .list {
@@ -151,25 +175,31 @@
     padding: 0;
     overflow-y: auto;
     flex: 1;
-    background: #f8fafc;
+    background: var(--bg);
   }
 
   .todo {
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 8px 10px;
-    border-bottom: 1px solid #e2e8f0;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    border-bottom: 1px solid var(--bd);
+    background: var(--surface);
+    transition: background var(--t-fast);
+  }
+
+  .todo:hover {
+    background: var(--acc-soft);
   }
 
   .todo label {
     flex: 1;
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: var(--space-2);
     cursor: pointer;
     font-size: 0.88rem;
-    color: #1f2937;
+    color: var(--ink);
   }
 
   .todo input[type="checkbox"] {
@@ -177,6 +207,10 @@
     width: 16px;
     height: 16px;
     cursor: pointer;
+    /* accent-color themes the native checkbox's checked state to the
+       accent indigo — "checked = var(--acc)" per the brief, no custom
+       switch markup needed. Works in both light + dark. */
+    accent-color: var(--acc);
   }
 
   .todo .text {
@@ -185,37 +219,38 @@
   }
 
   .todo.done .text {
-    color: #94a3b8;
+    color: var(--mut);
     text-decoration: line-through;
   }
 
   .todo .del {
     background: transparent;
     border: none;
-    color: #94a3b8;
+    color: var(--mut);
     font-size: 1rem;
     cursor: pointer;
-    padding: 2px 6px;
-    border-radius: 4px;
+    padding: 2px var(--space-1);
+    border-radius: var(--r-code);
+    transition: background var(--t-fast), color var(--t-fast);
   }
 
   .todo .del:hover {
-    background: #fee2e2;
-    color: #dc2626;
+    background: var(--err-soft);
+    color: var(--err);
   }
 
   .empty {
-    padding: 1.5rem;
+    padding: var(--space-5);
     text-align: center;
-    color: #64748b;
+    color: var(--mut);
     font-size: 0.88rem;
   }
 
   .error {
-    padding: 6px 10px;
-    background: #fee2e2;
-    color: #991b1b;
+    padding: var(--space-1) var(--space-3);
+    background: var(--err-soft);
+    color: var(--err);
     font-size: 0.8rem;
-    border-top: 1px solid #fecaca;
+    border-top: 1px solid var(--err);
   }
 </style>
