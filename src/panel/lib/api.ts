@@ -48,11 +48,18 @@ export interface Conversation {
 }
 
 /** Mirrors `agent::conversation::StoredMessage` (the persisted shape —
- * role + content only; the kind tag / tool metadata are dropped at
- * persist time per the design spec). */
+ * role + content + the `MessageKind` variant NAME). Task 1 added the
+ * `kind` field so reopening a history conversation still renders
+ * thinking / tool blocks the same way the live stream did (design
+ * "改动 3"). `kind` is `null` for rows written before Task 1's
+ * migration whose role didn't match the db's backfill heuristic
+ * (`infer_kind_from_role`); the frontend treats `null` as `Text`.
+ * The `tool` metadata is NOT persisted (only the kind name + content
+ * are) — ToolUse blocks from history fall back to the "工具" label. */
 export interface StoredMessage {
   role: "user" | "assistant" | "system" | "tool";
   content: string;
+  kind?: string | null;
 }
 
 /** Mirrors `agent::MessageKind`. The streamed Message carries this tag

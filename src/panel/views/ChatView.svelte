@@ -50,16 +50,19 @@
   // stream by one save_turn_record call).
   const liveBuffers: Map<string, DisplayMessage[]> = new Map();
 
-  // Display shape: StoredMessage (role + content) PLUS the live
-  // MessageKind (for visual distinction — thinking / tool-use / error
-  // all render differently even though they all persist as role
-  // "assistant"). `kind` is undefined for messages loaded from
-  // history (we didn't persist it); we infer a kind from the role for
-  // rendering (assistant → Text, tool → ToolResult, system → Status).
+  // Display shape: StoredMessage (role + content + persisted kind) PLUS
+  // the live MessageKind + the streamed `tool` metadata (for the
+  // ToolUse "使用工具 X" label). `kind` is undefined for messages
+  // loaded from pre-Task-1 history without a persisted kind (the
+  // history-load path falls back to roleToKind); live messages always
+  // carry the backend's MessageKind. `tool` is only set on live
+  // ToolUse messages (the persisted StoredMessage shape drops it —
+  // history ToolUse blocks render with the "工具" fallback label).
   interface DisplayMessage {
     role: StoredMessage["role"];
     content: string;
     kind?: MessageKind;
+    tool?: string | null;
   }
 
   const PROVIDERS: Provider[] = ["claude", "codex", "opencode"];
@@ -168,12 +171,20 @@
         messages = [...live];
       } else {
         // History is longer (the conversation was re-selected after a
-        // save_turn_record) — render history, mapping roles→kinds for
-        // display. The live buffer is stale; reset it.
+        // save_turn_record) — render history. Task 1 / design "改动 3":
+        // the persisted `kind` lets the SAME per-kind render branches
+        // the live stream uses fire for history too (thinking blocks
+        // stay collapsed + pretty after a reload — Review Focus #3).
+        // `load_messages` backfills `kind` from `role` for pre-Task-1
+        // rows, so `kind` is rarely null at the IPC boundary; when it
+        // IS null (unknown role), fall back to `roleToKind` so the
+        // render branch is still sensible (Text for assistant/user,
+        // ToolResult for tool, Status for system). The brief's "kind
+        // null → Text" rule is honored for truly-unknown roles.
         messages = history.map((m) => ({
           role: m.role,
           content: m.content,
-          kind: roleToKind(m.role),
+          kind: (m.kind as MessageKind | null | undefined) ?? roleToKind(m.role),
         }));
         liveBuffers.set(convId, [...messages]);
       }
@@ -352,6 +363,11 @@
       role: kindToRole(message.kind),
       content: message.content,
       kind: message.kind,
+      // Carry the tool name so the ToolUse block's "使用工具 X"
+      // label shows the actual tool (e.g. "Bash") rather than the
+      // "工具" fallback. History ToolUse rows have no `tool` (the
+      // persisted shape drops it) — they fall back to "工具".
+      tool: message.tool,
     };
     // Append to the conv's live buffer.
     const buf = liveBuffers.get(convId) ?? [];
@@ -512,10 +528,67 @@
       </div>
       <div class="messages" bind:this={scrollEl}>
         {#each messages as m (m)}
-          <div class="bubble" data-role={m.role} data-kind={m.kind}>
-            <span class="role">{m.role}</span>
-            <span class="content">{m.content}</span>
-          </div>
+          <!-- Per-kind render branches (design "改动 3"). The SAME
+               branches fire for live-streamed messages (m.kind from
+               the backend's MessageKind) AND for history messages
+               (m.kind from StoredMessage.kind, persisted by Task 1 /
+               db::save_turn_record + backfilled by load_messages).
+               kind null/unknown → Text (the brief's rule). -->
+          {#if m.kind === "Thinking"}
+            <!-- 🤔 思考: dimmed, default-collapsed (native <details>
+                 is collapsed until the user clicks the summary). -->
+            <details class="block thinking">
+              <summary>🤔 思考</summary>
+              <div class="block-content">{m.content}</div>
+            </details>
+          {:else if m.kind === "ToolUse"}
+            <!-- 🔧 使用工具 X: X = m.tool (the streamed Message.tool
+                 field) if present, else "工具" (the brief). The tool
+                 INPUT is m.content (the backends parse the tool-call
+                 input into the ToolUse message's content). History
+                 ToolUse rows have no `tool` (persisted shape drops
+                 it) → "工具" fallback. -->
+            <details class="block tool-use">
+              <summary>🔧 使用工具 {m.tool ?? "工具"}</summary>
+              <pre class="block-content">{m.content}</pre>
+            </details>
+          {:else if m.kind === "ToolResult"}
+            <!-- ✅ 工具结果: default-collapsed; m.content is the
+                 tool's output (parsed by the backends). -->
+            <details class="block tool-result">
+              <summary>✅ 工具结果</summary>
+              <pre class="block-content">{m.content}</pre>
+            </details>
+          {:else if m.kind === "Status"}
+            <!-- Status: a small dimmed inline line (not a full bubble
+                 — design "改动 3": "小状态行"). -->
+            <div class="status-line">{m.content}</div>
+          {:else if m.kind === "Error"}
+            <!-- Error: red error bubble (the content is the error
+                 message). Keep the .bubble base + data-role so the
+                 align/color base still applies, layered with the
+                 red error override. -->
+            <div class="bubble error" data-role={m.role} data-kind="Error">
+              <span class="role">error</span>
+              <span class="content">{m.content}</span>
+            </div>
+          {:else if m.kind === "Log"}
+            <!-- Log: best-effort debug line — very dimmed, small.
+                 Usually not surfaced to the user but render it if
+                 it arrives (don't silently drop streamed data). -->
+            <div class="log-line">{m.content}</div>
+          {:else}
+            <!-- Text (or kind null/unknown → treat as Text per the
+                 brief). Normal user/assistant bubble; the role-based
+                 align + color is driven by data-role. Hide the role
+                 label on user messages (the right-aligned blue bubble
+                 is self-evidently the user — multica style); show it
+                 for assistant so the source is clear. -->
+            <div class="bubble" data-role={m.role} data-kind="Text">
+              {#if m.role !== "user"}<span class="role">{m.role}</span>{/if}
+              <span class="content">{m.content}</span>
+            </div>
+          {/if}
         {/each}
       </div>
       <div class="composer">
@@ -878,10 +951,137 @@
     color: #991b1b;
   }
 
-  .bubble[data-kind="Thinking"] {
+  /* -- collapsible blocks (thinking / tool-use / tool-result) --
+     Native <details>/<summary>: collapsed by default, expands on
+     click. No JS toggle needed. Used for the non-text MessageKinds
+     so the processing stream is scannable (multica-style) — the user
+     sees "🤔 思考" / "🔧 使用工具 X" / "✅ 工具结果" chips roll out
+     live + can expand any of them for the full content. */
+  .block {
+    align-self: flex-start;
+    width: 100%;
+    max-width: 96%;
+    border: 1px solid #cbd5e1;
+    border-radius: 6px;
+    background: #f8fafc;
+    font-size: 0.8rem;
+    overflow: hidden;
+  }
+
+  .block > summary {
+    cursor: pointer;
+    padding: 4px 10px;
+    font-size: 0.78rem;
+    font-weight: 500;
+    user-select: none;
+    list-style: none;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  /* Drop the default disclosure triangle — the emoji is the marker + a
+     custom ▸ that rotates when open. */
+  .block > summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .block > summary::before {
+    content: "▸";
+    font-size: 0.65rem;
+    color: #94a3b8;
+    transition: transform 0.1s ease;
+  }
+
+  .block[open] > summary::before {
+    transform: rotate(90deg);
+  }
+
+  .block-content {
+    padding: 6px 10px;
+    border-top: 1px solid #e2e8f0;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: ui-monospace, "Cascadia Code", monospace;
+    font-size: 0.75rem;
+    line-height: 1.4;
+    color: #334155;
+    /* Cap the height so a huge tool output doesn't swallow the whole
+       panel — scroll inside the block instead. */
+    max-height: 320px;
+    overflow-y: auto;
+  }
+
+  /* Thinking: dimmed purple (chain-of-thought). */
+  .block.thinking {
     background: #f5f3ff;
+    border-color: #ddd6fe;
+  }
+
+  .block.thinking > summary {
     color: #5b21b6;
+    background: rgba(221, 214, 254, 0.45);
+  }
+
+  .block.thinking .block-content {
+    color: #6d28d9;
     font-style: italic;
+    background: #faf5ff;
+  }
+
+  /* ToolUse: indigo (the agent is calling a tool). */
+  .block.tool-use {
+    background: #eef2ff;
+    border-color: #c7d2fe;
+  }
+
+  .block.tool-use > summary {
+    color: #3730a3;
+    background: rgba(199, 210, 254, 0.45);
+  }
+
+  .block.tool-use .block-content {
+    color: #1e3a8a;
+    background: #f0f4ff;
+  }
+
+  /* ToolResult: green (the tool returned). */
+  .block.tool-result {
+    background: #f0fdf4;
+    border-color: #bbf7d0;
+  }
+
+  .block.tool-result > summary {
+    color: #166534;
+    background: rgba(187, 247, 208, 0.45);
+  }
+
+  .block.tool-result .block-content {
+    color: #14532d;
+    background: #f7fff9;
+  }
+
+  /* Status: a small dimmed inline line (not a full bubble). */
+  .status-line {
+    align-self: center;
+    font-size: 0.72rem;
+    color: #64748b;
+    font-style: italic;
+    padding: 2px 8px;
+    text-align: center;
+  }
+
+  /* Log: very dimmed small line (debug — usually not surfaced). */
+  .log-line {
+    align-self: flex-start;
+    font-size: 0.68rem;
+    color: #94a3b8;
+    font-family: ui-monospace, "Cascadia Code", monospace;
+    padding: 1px 8px;
+    max-width: 96%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .composer {
