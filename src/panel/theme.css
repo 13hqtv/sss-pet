@@ -1,0 +1,177 @@
+/* Task 1: design-system tokens + base elements.
+ *
+ * Two themes via :root[data-theme="light"|"dark"]; the "system" default
+ * (no data-theme set, or data-theme="system") resolves via the
+ * prefers-color-scheme media query below — so the first paint is
+ * correct even before main.ts runs the JS resolution. main.ts also
+ * sets data-theme to the resolved value ("light"|"dark") so explicit
+ * light/dark choices are sticky regardless of OS theme.
+ *
+ * Token values are verbatim from
+ * docs/superpowers/specs/2026-10-22-refined-ui-design.md.
+ *
+ * Markdown element styles (p/ul/li/code/pre) live in Task 2; this file
+ * is tokens + base (body / scrollbars / focus / reduced-motion) only.
+ */
+
+/* ---------------------------------------------------------------------------
+ * Shared tokens (theme-independent)
+ * ------------------------------------------------------------------------- */
+:root {
+  --font: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+  --mono: ui-monospace, "SF Mono", monospace;
+
+  /* radius ladder: panel → bubble → chip → code */
+  --r-panel: 14px;
+  --r-bubble: 12px;
+  --r-chip: 999px;
+  --r-code: 8px;
+
+  /* spacing rhythm (8px base, 4/8/12/16/24) */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+
+  /* transition baseline; quieted by prefers-reduced-motion below */
+  --t-fast: 120ms ease;
+  --t-base: 180ms ease;
+}
+
+/* ---------------------------------------------------------------------------
+ * Light theme (the default on :root)
+ * ------------------------------------------------------------------------- */
+:root {
+  --bg: #fafaf7;
+  --surface: #ffffff;
+  --ink: #1c1c1e;
+  --mut: #6b6b70;
+  --bd: #ecece8;
+  --acc: #4f46e5;
+  --acc-soft: #eef2ff;
+  --code-bg: #1e1e2e;
+  --code-ink: #e4e4e7;
+  --shadow: 0 6px 24px rgba(20, 20, 30, 0.07),
+    0 1px 3px rgba(20, 20, 30, 0.04);
+}
+
+/* ---------------------------------------------------------------------------
+ * Dark theme — explicit (data-theme="dark") OR system fallback.
+ * The :root[data-theme="dark"] block is the explicit choice; the
+ * prefers-color-scheme media query below is the system fallback, which
+ * applies dark tokens whenever the OS prefers dark AND the user has not
+ * explicitly forced light (data-theme="light"). When JS has resolved
+ * "system" → "light"|"dark" and set data-theme, the explicit block wins.
+ * ------------------------------------------------------------------------- */
+:root[data-theme="dark"] {
+  --bg: #0f0f11;
+  --surface: #1a1a1d;
+  --ink: #e8e8ea;
+  --mut: #8a8a90;
+  --bd: #2a2a2e;
+  --acc: #818cf8;
+  --acc-soft: #1e1b3a;
+  --code-bg: #0b0b0d;
+  --code-ink: #d4d4d8;
+  --shadow: 0 6px 24px rgba(0, 0, 0, 0.45),
+    0 1px 3px rgba(0, 0, 0, 0.3);
+}
+
+/* System default: when OS prefers dark and the user hasn't forced light
+ * (data-theme absent, "system", or already "dark") → dark tokens. This
+ * covers the no-JS / pre-mount first paint. :root[data-theme="light"]
+ * is intentionally excluded so an explicit light choice holds even when
+ * the OS is dark. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f0f11;
+    --surface: #1a1a1d;
+    --ink: #e8e8ea;
+    --mut: #8a8a90;
+    --bd: #2a2a2e;
+    --acc: #818cf8;
+    --acc-soft: #1e1b3a;
+    --code-bg: #0b0b0d;
+    --code-ink: #d4d4d8;
+    --shadow: 0 6px 24px rgba(0, 0, 0, 0.45),
+      0 1px 3px rgba(0, 0, 0, 0.3);
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * Base elements
+ * ------------------------------------------------------------------------- */
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font: 14px/1.6 var(--font);
+  color: var(--ink);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+/* Themed scrollbars — thin, unobtrusive, track matches bg, thumb is
+ * muted with a softer hover. WebKit + Firefox both covered. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--bd) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--bd);
+  border-radius: var(--r-chip);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--mut);
+  background-clip: padding-box;
+  border: 2px solid transparent;
+}
+
+/* Visible focus for keyboard navigation — accent outline, offset so it
+ * doesn't eat into the focused element. Mouse clicks won't trigger
+ * :focus-visible so this stays unobtrusive for pointer users. */
+:focus-visible {
+  outline: 2px solid var(--acc);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+/* Selection tinted with the accent soft so highlighted text reads as
+ * on-brand in both themes. */
+::selection {
+  background: var(--acc-soft);
+  color: var(--ink);
+}
+
+/* Respect reduced-motion: collapse transitions/animations to instant.
+ * Components opt into transitions via var(--t-fast)/var(--t-base); this
+ * blanket rule also neutralizes any stray animation property. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+  }
+}

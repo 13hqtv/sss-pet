@@ -20,6 +20,9 @@
     type ProviderCfg,
   } from "../lib/settings";
   import { listModels } from "../lib/api";
+  // Task 1: apply the theme to <html data-theme> on save so the panel
+  // flips immediately (same webview, no cross-window event needed).
+  import { applyTheme } from "../lib/theme";
 
   const PROVIDERS: Provider[] = ["claude", "codex", "opencode"];
   const PROVIDER_LABEL: Record<Provider, string> = {
@@ -173,6 +176,11 @@
     try {
       await saveSettings(newSettings);
       settings = newSettings;
+      // Task 1: apply the theme to <html data-theme> now so the panel
+      // flips immediately (no panel reload). "system" re-resolves via
+      // prefers-color-scheme and re-registers the OS-change listener;
+      // explicit light/dark are sticky. The pet window does NOT theme.
+      applyTheme(theme);
       errorMsg = null;
       savedMsg = "已保存";
       if (savedTimer) clearTimeout(savedTimer);

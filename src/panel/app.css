@@ -1,5 +1,5 @@
-html,
-body {
-  margin: 0;
-  padding: 0;
-}
+@import "./theme.css";
+
+/* The base reset (html/body margin/padding) now lives in theme.css
+ * alongside the themed body styling; keep this file as the entry
+ * shim so existing `import "./app.css"` calls keep working. */
