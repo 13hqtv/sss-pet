@@ -172,6 +172,15 @@ impl TurnRecord {
 /// in `ExecOptions`) keeps `ExecOptions` free of "is this prompt the raw turn
 /// or a replayed context?" ambiguity — the prompt is always exactly what the
 /// backend should send.
+///
+/// **Task 4: `opts.model = conv.model.clone()`.** The conversation's chosen
+/// model (set at creation, immutable — design "改动 1") reaches the backend
+/// here: both branches set `opts.model` from `conv.model` (was hardcoded
+/// `None`). The three backends already thread `opts.model` (claude
+/// `--model`, opencode `--model`, codex thread/start `model` — Tasks
+/// 10/11/12), so once this sets it the model the user picked at creation
+/// actually reaches the agent CLI. `None` (the default) means "use the
+/// agent's own default model".
 pub fn resume_or_replay(
     conv: &Conversation,
     history: &[StoredMessage],
@@ -187,7 +196,7 @@ pub fn resume_or_replay(
         Some(id) => {
             let opts = ExecOptions {
                 cwd,
-                model: None,
+                model: conv.model.clone(),
                 resume_session_id: Some(id.clone()),
                 timeout: None,
             };
@@ -200,7 +209,7 @@ pub fn resume_or_replay(
             let prompt = build_replay_prompt(history, new_prompt);
             let opts = ExecOptions {
                 cwd,
-                model: None,
+                model: conv.model.clone(),
                 resume_session_id: None,
                 timeout: None,
             };
@@ -607,6 +616,168 @@ mod tests {
             rec.messages.iter().any(|m| m.content == "world"),
             "buffer missing second canned message, got: {:?}",
             rec.messages
+        );
+    }
+
+    // -- Review Focus #4: conv.model reaches ExecOptions.model --
+
+    /// `resume_or_replay` must set `opts.model = conv.model.clone()` so the
+    /// conversation's chosen model reaches the backend via
+    /// `ExecOptions.model` (the three backends already thread `opts.model`
+    /// — claude `--model`, opencode `--model`, codex thread/start `model`).
+    /// With `conv.model == Some("sonnet")` the returned
+    /// `ExecOptions.model == Some("sonnet")`; with `conv.model == None`
+    /// it's `None` (agent's own default). Pinned on BOTH the resume path
+    /// (session_id Some) AND the replay path (session_id None), since both
+    /// build an `ExecOptions`.
+    #[test]
+    fn resume_or_replay_threads_conv_model_into_opts() {
+        // Resume path — conv.model == Some("sonnet") → opts.model == Some("sonnet")
+        let mut conv = conv_with_session();
+        conv.model = Some("sonnet".into());
+        let (opts, _prompt) = resume_or_replay(&conv, &history(), "go");
+        assert_eq!(
+            opts.model.as_deref(),
+            Some("sonnet"),
+            "resume path: conv.model must reach ExecOptions.model, got: {:?}",
+            opts.model,
+        );
+
+        // Resume path — conv.model == None → opts.model == None
+        let conv = conv_with_session(); // already model: None
+        let (opts, _prompt) = resume_or_replay(&conv, &history(), "go");
+        assert!(
+            opts.model.is_none(),
+            "resume path: conv.model == None must yield opts.model == None, got: {:?}",
+            opts.model,
+        );
+
+        // Replay path — conv.model == Some("sonnet") → opts.model == Some("sonnet")
+        let mut conv = conv_no_session();
+        conv.model = Some("sonnet".into());
+        let (opts, _prompt) = resume_or_replay(&conv, &history(), "go");
+        assert_eq!(
+            opts.model.as_deref(),
+            Some("sonnet"),
+            "replay path: conv.model must reach ExecOptions.model, got: {:?}",
+            opts.model,
+        );
+
+        // Replay path — conv.model == None → opts.model == None
+        let conv = conv_no_session(); // already model: None
+        let (opts, _prompt) = resume_or_replay(&conv, &history(), "go");
+        assert!(
+            opts.model.is_none(),
+            "replay path: conv.model == None must yield opts.model == None, got: {:?}",
+            opts.model,
+        );
+    }
+
+    // -- Review Focus #5: run_turn threads cwd into backend's opts.cwd --
+
+    /// A `Backend` impl that captures the `ExecOptions` it received on
+    /// `execute` (so the #5 test can assert the cwd `run_turn` was called
+    /// with reached the backend's `opts.cwd`). Mirrors the canned-message
+    /// `FakeBackend` above but stores the opts in an
+    /// `Arc<Mutex<Option<ExecOptions>>>` instead of ignoring them. The
+    /// capture is `std::sync::Mutex` (not tokio) — held only briefly inside
+    /// `execute`, never across an `.await`.
+    struct CapturingBackend {
+        canned: Vec<Message>,
+        result: ExecResult,
+        seen_opts: Arc<Mutex<Option<ExecOptions>>>,
+    }
+
+    #[async_trait]
+    impl Backend for CapturingBackend {
+        async fn execute(
+            &self,
+            _prompt: &str,
+            opts: ExecOptions,
+        ) -> Result<Session, BackendError> {
+            *self.seen_opts.lock().unwrap() = Some(opts);
+            let (messages_tx, messages_rx) = mpsc::channel::<Message>(64);
+            let (result_tx, result_rx) = oneshot::channel::<ExecResult>();
+            let canned = self.canned.clone();
+            let result = self.result.clone();
+            tokio::spawn(async move {
+                for msg in canned {
+                    if messages_tx.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+                drop(messages_tx);
+                let _ = result_tx.send(result);
+            });
+            Ok(Session {
+                messages: messages_rx,
+                result: result_rx,
+            })
+        }
+    }
+
+    /// `run_turn` must pass its `cwd` param through to the backend's
+    /// `opts.cwd` (the conversation's cwd is the source of truth — set at
+    /// creation, immutable — and Task 4's `chat_send` passes `conv.cwd` as
+    /// this param, removing the `config::resolve_agent_cwd()` call). The
+    /// backend spawns the agent CLI in `opts.cwd`, so file tools resolve
+    /// relative to the project the user picked. With a conv whose
+    /// `cwd == "/tmp/proj"` + `run_turn` called with `cwd == "/tmp/proj"`,
+    /// the `CapturingBackend`'s `execute` receives `opts.cwd == "/tmp/proj"`.
+    #[tokio::test]
+    async fn run_turn_threads_cwd_into_backend_opts() {
+        let seen_opts: Arc<Mutex<Option<ExecOptions>>> = Arc::new(Mutex::new(None));
+        let backend = CapturingBackend {
+            canned: canned_messages(),
+            result: canned_result(),
+            seen_opts: Arc::clone(&seen_opts),
+        };
+        // The conv's cwd is the source of truth; chat_send (Task 4) passes
+        // conv.cwd as run_turn's cwd param. Mirror that here.
+        let mut conv = conv_no_session();
+        conv.cwd = "/tmp/proj".into();
+        let cwd = std::path::PathBuf::from("/tmp/proj");
+
+        let (session, _buffer) = run_turn(
+            &backend as &dyn Backend,
+            &conv,
+            &history(),
+            "go",
+            &cwd,
+        )
+        .await
+        .expect("run_turn ok");
+
+        // Drop the frontend session so the forwarders can finish + the
+        // runtime doesn't leak. The CapturingBackend already recorded opts
+        // synchronously inside execute (before the spawn), so the capture
+        // is populated by this point regardless.
+        drop(session);
+
+        // Poll until the CapturingBackend's execute recorded the opts (or
+        // 2s — not timing-fragile; execute runs before run_turn returns,
+        // so this is effectively immediate, the poll is just defensive).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if seen_opts.lock().unwrap().is_some() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("CapturingBackend never received opts within 2s");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let opts = seen_opts
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("opts captured by CapturingBackend.execute");
+        assert_eq!(
+            opts.cwd,
+            std::path::PathBuf::from("/tmp/proj"),
+            "run_turn must pass its cwd param through to opts.cwd, got: {:?}",
+            opts.cwd,
         );
     }
 
