@@ -30,6 +30,8 @@
   } from "../lib/api";
   import { getSettings, defaultModelFor } from "../lib/settings";
   import { subscribeChatStream } from "../lib/stream";
+  import { marked } from "marked";
+  import DOMPurify from "dompurify";
 
   // Reactive state. Svelte 5 runes — typed via the variable annotation
   // (NOT `$state<T>(...)`, which svelte-check mis-parses as a generic
@@ -135,6 +137,21 @@
       case "user":
         return "Text";
     }
+  }
+
+  // Render assistant Text content as markdown (Task 2). marked parses
+  // to HTML (breaks:true → single newlines render as <br>); DOMPurify
+  // strips <script>/event handlers/other XSS vectors before {@html}
+  // injection (agent output is半可信 but still defense-in-depth).
+  // marked.parse is sync by default (async:false) → returns string;
+  // the cast guards against the string|Promise<string> union type from
+  // marked's overload signatures (the sync overload returns string).
+  // User bubbles + non-Text kinds keep their existing plain-text render
+  // (Task 3 restyles the Thinking/ToolUse/ToolResult/Status/Error blocks).
+  function renderMarkdown(content: string): string {
+    return DOMPurify.sanitize(
+      marked.parse(content ?? "", { breaks: true }) as string,
+    );
   }
 
   // -- load + select --
@@ -593,10 +610,26 @@
                  align + color is driven by data-role. Hide the role
                  label on user messages (the right-aligned blue bubble
                  is self-evidently the user — multica style); show it
-                 for assistant so the source is clear. -->
-            <div class="bubble" data-role={m.role} data-kind="Text">
+                 for assistant so the source is clear.
+                 Task 2: assistant Text renders as markdown via
+                 renderMarkdown → {@html} (marked + DOMPurify). User
+                 Text stays plain text. The .md class scopes the
+                 GLOBAL markdown element styles in theme.css to the
+                 assistant bubble only — Svelte scoped <style> does NOT
+                 reach {@html}-injected content, so those styles must
+                 live in theme.css (not this component's <style>). The
+                 content wrapper is a <div> (not <span>) so block
+                 elements (<p>/<pre>/<ul>) render validly inside it. -->
+            <div
+              class="bubble"
+              class:md={m.role !== "user"}
+              data-role={m.role}
+              data-kind="Text"
+            >
               {#if m.role !== "user"}<span class="role">{m.role}</span>{/if}
-              <span class="content">{m.content}</span>
+              <div class="content">
+                {#if m.role === "user"}{m.content}{:else}{@html renderMarkdown(m.content)}{/if}
+              </div>
             </div>
           {/if}
         {/each}
