@@ -185,9 +185,11 @@
   }
 
   .dragbar {
-    /* A fixed-height bar that reads as a title strip. Tall enough to grab
-       easily (~28px); short enough not to eat the body. Surface fill +
-       bd bottom border = a clean raised strip over --bg. */
+    /* A fixed-height bar that reads as a raised title strip. Tall enough
+       to grab easily (~28px); short enough not to eat the body. Surface
+       fill + bd bottom border + soft shadow = a raised strip over --bg
+       (shadow points down into the tab strip, matching ChatView's
+       elevated-surface convention). */
     height: 28px;
     flex: 0 0 28px;
     display: flex;
@@ -196,6 +198,7 @@
     padding: 0 var(--space-3);
     background: var(--surface);
     border-bottom: 1px solid var(--bd);
+    box-shadow: var(--shadow);
     /* Grab cursor hints the bar is draggable. Tauri's start_dragging is
        triggered by `data-tauri-drag-region`, not by this cursor, but the
        visual affordance matters. */
@@ -251,14 +254,17 @@
   /* Pill-style tab strip. Active pill = acc-soft fill + acc text;
    * inactive = mut text; hover = acc-soft fill (subtle). Full pill
    * radius (--r-chip = 999px) — "药丸 tab" per the brief. The strip
-   * is NOT a drag-region so the pills are clickable. */
+   * is NOT a drag-region so the pills are clickable. No border-bottom:
+   * the strip shares --surface fill with the dragbar above, and the
+   * dragbar's border + shadow already separate the two; a second rule
+   * here would read as a double divider (the pill row separates itself
+   * from the body by its own surface + gap). */
   .tabs {
     flex: 0 0 auto;
     display: flex;
     gap: var(--space-1);
     padding: var(--space-2) var(--space-3);
     background: var(--surface);
-    border-bottom: 1px solid var(--bd);
   }
 
   .tab {
