@@ -78,6 +78,39 @@ export interface Settings {
   focus: FocusCfg;
   default_provider: string;
   working_dir: string | null;
+  /** Per-agent config (Task 5: each agent's `default_model`, probed
+   * + picked in SettingsView, pre-filled in the new-conv dialog).
+   * Mirrors `config::ProvidersCfg`. `default_model: null` = "use the
+   * agent's own default model". */
+  providers: ProvidersCfg;
+}
+
+/** Mirrors `config::ProviderCfg` — the per-agent config (Task 5:
+ * `default_model` only for now; future fields extend this without a
+ * breaking IPC shape change). */
+export interface ProviderCfg {
+  default_model: string | null;
+}
+
+/** Mirrors `config::ProvidersCfg` — one section per whitelisted agent
+ * (claude / codex / opencode). `serde(default)` on the Rust side keeps
+ * old `config.toml` files (no `[providers.<agent>]` section) loading
+ * as `ProviderCfg::default()` (`default_model: null`). */
+export interface ProvidersCfg {
+  claude: ProviderCfg;
+  codex: ProviderCfg;
+  opencode: ProviderCfg;
+}
+
+/** Read the default model for `provider` from the loaded settings
+ * (one of `claude` / `codex` / `opencode`). Returns `null` for
+ * unknown providers or unset defaults. Used by the new-conv dialog
+ * to pre-fill the model field from the per-agent default. */
+export function defaultModelFor(
+  settings: Settings,
+  provider: Provider,
+): string | null {
+  return settings.providers[provider]?.default_model ?? null;
 }
 
 export async function getSettings(): Promise<Settings> {

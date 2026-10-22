@@ -330,24 +330,33 @@ pub fn list_conversations(
 /// caller, `session_id=None`, `title="新对话"`, `created_at=now`),
 /// persist it via `save_conversation`, return the new `Conversation`.
 /// The frontend's "新建" button calls this after the user picks a
-/// provider (claude / codex / opencode).
+/// provider + model + cwd in the new-conversation dialog (Task 5).
 ///
 /// Task 1: delegates to `db::new_conversation` so the uuid +
 /// default-title + persist logic lives in one place (the db layer).
-/// `model` is `None` here (Task 4 will wire the model picker through
-/// this command's signature); `cwd` is the user-pinned working
-/// directory from `config::resolve_agent_cwd()` (the same value
-/// `chat_send` uses — so a fresh conversation's cwd matches the dir
-/// the agent CLI will spawn in on the first turn).
+/// Task 5: the frontend now passes `model` (Option<String>, None =
+/// "use the agent's own default model") + `cwd` (the working directory
+/// the agent CLI runs in, pinned at creation — immutable). If `cwd` is
+/// empty/whitespace, fall back to `config::resolve_agent_cwd()` (the
+/// global config's `working_dir`, else the process's cwd) — the
+/// new-conv dialog pre-fills cwd from `working_dir` so this fallback
+/// only fires if the user blanked the field.
 #[tauri::command]
 pub fn new_conversation(
     db: State<'_, Arc<Mutex<Connection>>>,
     provider: String,
+    model: Option<String>,
+    cwd: String,
 ) -> Result<Conversation, String> {
-    let cwd = crate::config::resolve_agent_cwd();
-    let cwd_str = cwd.to_string_lossy().to_string();
+    let cwd_str = if cwd.trim().is_empty() {
+        crate::config::resolve_agent_cwd()
+            .to_string_lossy()
+            .to_string()
+    } else {
+        cwd
+    };
     let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
-    db::new_conversation(&conn, &provider, None, &cwd_str)
+    db::new_conversation(&conn, &provider, model, &cwd_str)
         .map_err(|e| format!("new_conversation: {e}"))
 }
 
@@ -379,30 +388,38 @@ pub fn load_history(
 /// creation); once the conversation exists, its own `cwd` is the source of
 /// truth. This closes the v0.1.0 hazard of the global working_dir changing
 /// under a running conversation's feet.
+///
+/// **Task 5 carry: `provider` comes from `conv.provider`, NOT the
+/// frontend.** The frontend's `chat_send` invoke no longer passes a
+/// `provider` arg — the conversation's agent is fixed at creation (the
+/// design's "定了不改" ruling). Loading the conversation row yields both
+/// `cwd` AND `provider` here; we use `conv.provider` for `agent::new`.
+/// This closes the v0.1.0 hazard of swapping provider mid-conversation
+/// (which mismatched the agent-native `session_id`).
 #[tauri::command]
 pub async fn chat_send(
     app: tauri::AppHandle,
     db: State<'_, Arc<Mutex<Connection>>>,
     conv_id: String,
     prompt: String,
-    provider: String,
 ) -> Result<(), String> {
-    // Load the conversation; use conv.cwd (source of truth — set at
-    // creation, immutable) as the cwd for run_turn. NO more
-    // config::resolve_agent_cwd() here — the conversation's own cwd is
-    // authoritative. (new_conversation still reads config::resolve_agent_cwd()
-    // as the default cwd when CREATING a conversation; this is fine — that's
-    // exactly the "new-conversation default" role the global config plays
-    // after Task 4.)
-    let cwd = {
+    // Load the conversation; use conv.cwd + conv.provider (source of
+    // truth — set at creation, immutable) for run_turn + agent::new. NO
+    // more config::resolve_agent_cwd() here — the conversation's own
+    // cwd + provider are authoritative. (new_conversation still reads
+    // config::resolve_agent_cwd() as the default cwd when CREATING a
+    // conversation; this is fine — that's exactly the "new-conversation
+    // default" role the global config plays after Task 4.)
+    let (cwd, provider) = {
         let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
         let conv = db::load_conversation(&conn, &conv_id)
             .map_err(|e| format!("load_conversation: {e}"))?
             .ok_or_else(|| format!("conversation {conv_id} not found"))?;
-        std::path::PathBuf::from(conv.cwd)
+        (std::path::PathBuf::from(conv.cwd), conv.provider)
     };
     let cfg = BackendConfig::default();
-    let backend = agent::new(&provider, cfg).map_err(|e| format!("agent::new({provider}): {e}"))?;
+    let backend =
+        agent::new(&provider, cfg).map_err(|e| format!("agent::new({provider}): {e}"))?;
     // The emit closure: wraps `app.emit(event, payload)`. Captures the
     // AppHandle by value (it's Clone + Send + Sync + 'static); the
     // closure is `Fn` (AppHandle::emit takes &self). Best-effort —

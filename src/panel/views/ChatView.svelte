@@ -1,10 +1,13 @@
-<!-- Task 15: the 对话 (chat) tab — the main panel view. Left sidebar =
-     conversation list (list_conversations + 新建 button with a provider
-     picker); right pane = message bubbles (load_history on select +
-     live-streamed chat_message events) + provider picker + composer.
-     On send → chat_send(conv_id, prompt, provider) → backend spawns
-     the stream-drain task + returns; chat_message / chat_result
-     events arrive via stream.ts (dispatched by conv_id).
+<!-- Task 5: the 对话 (chat) tab — the main panel view. Left sidebar =
+     conversation list + a "新建对话" button that opens a modal dialog
+     (provider select → model probe → cwd input → confirm →
+     new_conversation(provider, model, cwd)); right pane = message
+     bubbles (load_history on select + live-streamed chat_message
+     events) + composer. On send → chat_send(conv_id, prompt) → backend
+     spawns the stream-drain task + returns (Task 5 carry: NO `provider`
+     arg — the conversation's agent is fixed at creation; the backend
+     uses `conv.provider`); chat_message / chat_result events arrive via
+     stream.ts (dispatched by conv_id).
 
      Review Focus #3 (survives-hide): if the panel is hidden
      mid-stream, the emit closures are no-ops — but the backend keeps
@@ -17,6 +20,7 @@
     newConversation,
     loadHistory,
     chatSend,
+    listModels,
     type Conversation,
     type StoredMessage,
     type Message,
@@ -24,6 +28,7 @@
     type ExecResult,
     type Provider,
   } from "../lib/api";
+  import { getSettings, defaultModelFor } from "../lib/settings";
   import { subscribeChatStream } from "../lib/stream";
 
   // Reactive state. Svelte 5 runes — typed via the variable annotation
@@ -36,12 +41,6 @@
   let draft: string = $state("");
   let streamingConvIds: Set<string> = $state(new Set());
   let errorMsg: string | null = $state(null);
-  let newProvider: Provider = $state("claude");
-  // The provider used for the active conversation's NEXT send.
-  // Defaults to the active conversation's own provider; the user can
-  // override via the picker (the override only affects the send — it
-  // doesn't rewrite history).
-  let sendProvider: Provider = $state("claude");
 
   // Per-conversation live message buffer. The active conversation's
   // buffer is mirrored to `messages` for rendering; non-active
@@ -70,6 +69,21 @@
     codex: "Codex",
     opencode: "OpenCode",
   };
+
+  // -- new-conversation dialog state --
+  // The dialog sets provider + model + cwd at creation (immutable
+  // thereafter — design "改动 1"). `model` comes from `listModels(p)`
+  // (probe) OR a manual text input (fallback if the probe list is
+  // empty). `cwd` pre-fills from the global config's `working_dir`.
+  let showDialog: boolean = $state(false);
+  let dialogProvider: Provider = $state("claude");
+  let dialogModel: string = $state("");
+  let dialogCwd: string = $state("");
+  let modelList: string[] = $state([]);
+  let probing: boolean = $state(false);
+  let probeError: string | null = $state(null);
+  let manualModel: boolean = $state(false);
+  let creating: boolean = $state(false);
 
   // Map a streamed MessageKind to a StoredMessage role — mirrors
   // db.rs::message_kind_to_role so the live buffer + the persisted
@@ -125,10 +139,6 @@
   async function selectConversation(convId: string) {
     activeConvId = convId;
     streamingConvIds = new Set(streamingConvIds); // touch for reactivity
-    const conv = conversations.find((c) => c.id === convId);
-    if (conv) {
-      sendProvider = (conv.provider as Provider) || "claude";
-    }
     try {
       const history = await loadHistory(convId);
       // Merge the persisted history with any live messages that
@@ -156,16 +166,115 @@
     }
   }
 
-  async function createConversation() {
+  // -- new-conversation dialog --
+
+  /** Open the dialog. Pre-fill provider from the global default_provider,
+   * cwd from the global working_dir, model from the per-agent
+   * default_model (SettingsView). Reset probe state. */
+  async function openDialog() {
+    showDialog = true;
+    probing = false;
+    probeError = null;
+    manualModel = false;
+    modelList = [];
+    dialogModel = "";
+    creating = false;
     try {
-      const conv = await newConversation(newProvider);
+      const s = await getSettings();
+      dialogProvider = (s.default_provider as Provider) || "claude";
+      dialogCwd = s.working_dir ?? "";
+      // Pre-fill model from the per-agent default (if set).
+      const dm = defaultModelFor(s, dialogProvider);
+      dialogModel = dm ?? "";
+      // Kick off the probe for the pre-filled provider so the model
+      // list is ready by the time the user looks at the dropdown.
+      void probeModels(dialogProvider);
+    } catch (e) {
+      // Settings load failed — the dialog still works with defaults.
+      probeError = `加载设置失败: ${e}`;
+    }
+  }
+
+  /** Probe models for `provider` via `listModels(provider)`. On empty
+   * result → switch to manual text entry (the design's 兜底). On non-
+   * empty → populate the dropdown; if the per-agent default isn't in
+   * the list, keep the pre-filled model but it won't be selectable
+   * from the dropdown (the user can switch to manual entry). */
+  async function probeModels(provider: Provider) {
+    probing = true;
+    probeError = null;
+    manualModel = false;
+    modelList = [];
+    try {
+      const list = await listModels(provider);
+      modelList = list;
+      if (list.length === 0) {
+        // Probe failed / empty → manual text entry. Keep dialogModel
+        // (the per-agent default pre-fill, if any) so the user sees
+        // what was configured + can edit it.
+        manualModel = true;
+      } else if (dialogModel && !list.includes(dialogModel)) {
+        // The pre-filled default isn't in the probed list — switch to
+        // manual entry so the user can edit/keep the pre-fill rather
+        // than silently dropping it.
+        manualModel = true;
+      } else if (!dialogModel) {
+        // No pre-fill + non-empty list → pick the first as a
+        // convenience default (the user can change it).
+        dialogModel = list[0];
+      }
+    } catch (e) {
+      probeError = `探测模型失败: ${e}`;
+      manualModel = true;
+    } finally {
+      probing = false;
+    }
+  }
+
+  /** Re-probe when the user changes the provider in the dialog. Also
+   * re-pull the per-agent default model for the new provider (the
+   * user may have configured a default for claude but not codex). */
+  async function onDialogProviderChange() {
+    dialogModel = "";
+    try {
+      const s = await getSettings();
+      const dm = defaultModelFor(s, dialogProvider);
+      dialogModel = dm ?? "";
+    } catch {
+      // ignore — settings load is best-effort here
+    }
+    await probeModels(dialogProvider);
+  }
+
+  /** Toggle manual entry (lets the user type a model name even when the
+   * probe returned a non-empty list — e.g. for a model not yet
+   * advertised by the CLI). */
+  function toggleManual() {
+    manualModel = !manualModel;
+  }
+
+  /** Confirm the dialog → create the conversation with the chosen
+   * provider + model + cwd. model is null when the field is empty
+   * (→ the agent's own default). */
+  async function confirmDialog() {
+    creating = true;
+    try {
+      const model = dialogModel.trim() || null;
+      const conv = await newConversation(dialogProvider, model, dialogCwd);
       conversations = [conv, ...conversations];
       liveBuffers.set(conv.id, []);
       await selectConversation(conv.id);
+      showDialog = false;
       errorMsg = null;
     } catch (e) {
       errorMsg = `新建会话失败: ${e}`;
+    } finally {
+      creating = false;
     }
+  }
+
+  function cancelDialog() {
+    showDialog = false;
   }
 
   // -- send --
@@ -192,7 +301,9 @@
     next.add(convId);
     streamingConvIds = next;
     try {
-      await chatSend(convId, prompt, sendProvider);
+      // Task 5 carry: NO `provider` arg — the backend uses
+      // conv.provider (fixed at creation, immutable).
+      await chatSend(convId, prompt);
       errorMsg = null;
     } catch (e) {
       errorMsg = `发送失败: ${e}`;
@@ -304,6 +415,13 @@
     activeConvId !== null && streamingConvIds.has(activeConvId),
   );
 
+  // The active conversation object (for the read-only provider/model/cwd
+  // header — the conversation's agent triple is fixed at creation, the
+  // UI does NOT offer changing them mid-conversation).
+  let activeConv = $derived(
+    conversations.find((c) => c.id === activeConvId) ?? null,
+  );
+
   // Auto-scroll the message list to the bottom on new messages.
   let scrollEl: HTMLDivElement | null = $state(null);
   $effect(() => {
@@ -316,19 +434,10 @@
 </script>
 
 <section class="chat">
-  <!-- Sidebar: conversation list + 新建 button + provider picker. -->
+  <!-- Sidebar: conversation list + 新建对话 button (opens the dialog). -->
   <aside class="sidebar">
     <div class="new-row">
-      <select
-        bind:value={newProvider}
-        aria-label="新建会话的 provider"
-        title="新建会话的 provider"
-      >
-        {#each PROVIDERS as p}
-          <option value={p}>{PROVIDER_LABEL[p]}</option>
-        {/each}
-      </select>
-      <button onclick={createConversation}>新建</button>
+      <button onclick={openDialog}>新建对话</button>
     </div>
     <ul class="conv-list">
       {#each conversations as conv (conv.id)}
@@ -340,6 +449,7 @@
           >
             <span class="conv-provider">{PROVIDER_LABEL[conv.provider as Provider] ?? conv.provider}</span>
             <span class="conv-title">{conv.title}</span>
+            {#if conv.model}<span class="conv-model">{conv.model}</span>{/if}
           </button>
         </li>
       {/each}
@@ -351,21 +461,21 @@
 
   <!-- Main pane: messages + composer. -->
   <div class="main">
-    {#if activeConvId === null}
+    {#if activeConv === null}
       <div class="no-conv">
-        <p>选择左侧会话或点击「新建」开始对话</p>
+        <p>选择左侧会话或点击「新建对话」开始对话</p>
       </div>
     {:else}
+      <!-- Read-only header: the conversation's fixed provider + model +
+           cwd. No per-send picker (the agent is immutable at creation). -->
       <div class="main-header">
-        <select
-          bind:value={sendProvider}
-          aria-label="本次发送的 provider"
-          title="本次发送的 provider"
-        >
-          {#each PROVIDERS as p}
-            <option value={p}>{PROVIDER_LABEL[p]}</option>
-          {/each}
-        </select>
+        <span class="hdr-chip">{PROVIDER_LABEL[activeConv.provider as Provider] ?? activeConv.provider}</span>
+        {#if activeConv.model}
+          <span class="hdr-chip model">{activeConv.model}</span>
+        {:else}
+          <span class="hdr-chip model muted">默认模型</span>
+        {/if}
+        <span class="hdr-chip cwd" title={activeConv.cwd}>{activeConv.cwd}</span>
         {#if isStreaming}<span class="streaming">生成中…</span>{/if}
       </div>
       <div class="messages" bind:this={scrollEl}>
@@ -392,6 +502,87 @@
   </div>
 </section>
 
+<!-- New-conversation dialog (Task 5). Provider select → listModels probe →
+     model dropdown (or manual text input fallback) + cwd input → confirm
+     → newConversation(provider, model, cwd). -->
+{#if showDialog}
+  <div class="dialog-backdrop" role="dialog" aria-modal="true" aria-label="新建对话">
+    <div class="dialog">
+      <h2>新建对话</h2>
+      <div class="dialog-field">
+        <label for="dlg-provider">Agent</label>
+        <select
+          id="dlg-provider"
+          bind:value={dialogProvider}
+          onchange={onDialogProviderChange}
+          disabled={probing || creating}
+        >
+          {#each PROVIDERS as p (p)}
+            <option value={p}>{PROVIDER_LABEL[p]}</option>
+          {/each}
+        </select>
+      </div>
+      <div class="dialog-field">
+        <label for="dlg-model">模型</label>
+        {#if probing}
+          <div class="model-probing">探测中…</div>
+        {:else if manualModel || modelList.length === 0}
+          <input
+            id="dlg-model"
+            type="text"
+            bind:value={dialogModel}
+            placeholder="手动输入模型名 (留空 = 用 agent 默认模型)"
+            disabled={creating}
+          />
+          {#if modelList.length === 0}
+            <small class="muted">未探测到模型列表，请手动填写</small>
+          {:else}
+            <small class="muted">已切换为手动输入</small>
+          {/if}
+          {#if modelList.length > 0}
+            <button class="link-btn" onclick={toggleManual} disabled={creating}>
+              改用下拉选择
+            </button>
+          {/if}
+        {:else}
+          <select
+            id="dlg-model"
+            bind:value={dialogModel}
+            disabled={creating}
+          >
+            {#each modelList as m (m)}
+              <option value={m}>{m}</option>
+            {/each}
+          </select>
+          <button class="link-btn" onclick={toggleManual} disabled={creating}>
+            手动输入
+          </button>
+        {/if}
+      </div>
+      <div class="dialog-field">
+        <label for="dlg-cwd">工作目录</label>
+        <input
+          id="dlg-cwd"
+          type="text"
+          bind:value={dialogCwd}
+          placeholder="留空 = 用全局工作目录"
+          disabled={creating}
+        />
+        <small class="muted">agent 子进程的 cwd。留空 = 用全局工作目录。</small>
+      </div>
+      {#if probeError}<div class="dialog-error">{probeError}</div>{/if}
+      <div class="dialog-actions">
+        <button onclick={confirmDialog} disabled={probing || creating}>
+          {creating ? "创建中…" : "确定"}
+        </button>
+        <button class="secondary" onclick={cancelDialog} disabled={creating}>
+          取消
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
+
 <style>
   .chat {
     display: flex;
@@ -416,16 +607,20 @@
     border-bottom: 1px solid #cbd5e1;
   }
 
-  .new-row select {
+  .new-row button {
     flex: 1;
-    font-size: 0.8rem;
-    padding: 2px 4px;
+    font-size: 0.85rem;
+    padding: 4px 8px;
+    cursor: pointer;
+    background: #2563eb;
+    color: white;
+    border: none;
+    border-radius: 4px;
   }
 
-  .new-row button {
-    font-size: 0.8rem;
-    padding: 2px 8px;
-    cursor: pointer;
+  .new-row button:disabled {
+    background: #94a3b8;
+    cursor: not-allowed;
   }
 
   .conv-list {
@@ -479,6 +674,12 @@
     width: 100%;
   }
 
+  .conv-model {
+    font-size: 0.65rem;
+    color: #475569;
+    font-family: ui-monospace, "Cascadia Code", monospace;
+  }
+
   .empty {
     padding: 1rem;
     text-align: center;
@@ -506,21 +707,48 @@
   .main-header {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 6px;
     padding: 6px 10px;
     border-bottom: 1px solid #cbd5e1;
     background: #f8fafc;
+    flex-wrap: wrap;
   }
 
-  .main-header select {
-    font-size: 0.8rem;
-    padding: 2px 4px;
+  .hdr-chip {
+    font-size: 0.72rem;
+    padding: 2px 8px;
+    border-radius: 10px;
+    background: #e2e8f0;
+    color: #334155;
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .hdr-chip.model {
+    background: #ddd6fe;
+    color: #5b21b6;
+    font-family: ui-monospace, "Cascadia Code", monospace;
+  }
+
+  .hdr-chip.model.muted {
+    background: #e2e8f0;
+    color: #94a3b8;
+    font-style: italic;
+  }
+
+  .hdr-chip.cwd {
+    background: #dcfce7;
+    color: #166534;
+    font-family: ui-monospace, "Cascadia Code", monospace;
   }
 
   .streaming {
     font-size: 0.75rem;
     color: #2563eb;
     font-style: italic;
+    margin-left: auto;
   }
 
   .messages {
@@ -635,5 +863,122 @@
     color: #991b1b;
     font-size: 0.8rem;
     border-top: 1px solid #fecaca;
+  }
+
+  /* -- new-conversation dialog -- */
+  .dialog-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.4);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+  }
+
+  .dialog {
+    background: white;
+    border-radius: 8px;
+    padding: 16px;
+    width: 420px;
+    max-width: 90vw;
+    max-height: 90vh;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+  }
+
+  .dialog h2 {
+    margin: 0;
+    font-size: 1rem;
+    color: #1f2937;
+  }
+
+  .dialog-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .dialog-field label {
+    font-size: 0.82rem;
+    color: #334155;
+    font-weight: 500;
+  }
+
+  .dialog-field select,
+  .dialog-field input[type="text"] {
+    font-size: 0.85rem;
+    padding: 4px 8px;
+    border: 1px solid #cbd5e1;
+    border-radius: 4px;
+    font-family: inherit;
+    background: white;
+    color: #1f2937;
+  }
+
+  .dialog-field .model-probing {
+    font-size: 0.85rem;
+    color: #2563eb;
+    font-style: italic;
+    padding: 4px 8px;
+  }
+
+  .dialog-field small.muted {
+    font-size: 0.7rem;
+    color: #94a3b8;
+  }
+
+  .link-btn {
+    align-self: flex-start;
+    background: transparent;
+    border: none;
+    color: #2563eb;
+    font-size: 0.75rem;
+    cursor: pointer;
+    padding: 2px 0;
+    text-decoration: underline;
+  }
+
+  .link-btn:disabled {
+    color: #94a3b8;
+    cursor: not-allowed;
+  }
+
+  .dialog-error {
+    font-size: 0.8rem;
+    color: #991b1b;
+    background: #fee2e2;
+    padding: 4px 8px;
+    border-radius: 4px;
+  }
+
+  .dialog-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 4px;
+  }
+
+  .dialog-actions button {
+    padding: 6px 16px;
+    font-size: 0.88rem;
+    cursor: pointer;
+    background: #2563eb;
+    color: white;
+    border: none;
+    border-radius: 4px;
+  }
+
+  .dialog-actions button:disabled {
+    background: #94a3b8;
+    cursor: not-allowed;
+  }
+
+  .dialog-actions button.secondary {
+    background: #e2e8f0;
+    color: #1f2937;
   }
 </style>

@@ -30,13 +30,21 @@ import { invoke } from "@tauri-apps/api/core";
 export type Provider = "claude" | "codex" | "opencode";
 
 /** Mirrors `agent::conversation::Conversation`. `created_at` is an
- * RFC3339 string at the IPC boundary (chrono serializes via serde). */
+ * RFC3339 string at the IPC boundary (chrono serializes via serde).
+ * Task 1: `model` + `cwd` are set at creation (immutable) — the
+ * frontend reads them for display but never rewrites them. */
 export interface Conversation {
   id: string;
   provider: string;
   session_id: string | null;
   title: string;
   created_at: string;
+  /** The model selected at creation (`null` = the agent's own default
+   * model — no `--model` flag). Immutable. Task 1. */
+  model: string | null;
+  /** The working directory the agent CLI runs in for this conversation.
+   * Immutable. Task 1. */
+  cwd: string;
 }
 
 /** Mirrors `agent::conversation::StoredMessage` (the persisted shape —
@@ -92,10 +100,18 @@ export async function listConversations(): Promise<Conversation[]> {
 }
 
 /** `chat::new_conversation` — create a row (id=uuid v4, session_id=
- * null, title="新对话", now) + return it. Called by the "新建" button
- * after the user picks a provider. */
-export async function newConversation(provider: Provider): Promise<Conversation> {
-  return invoke<Conversation>("new_conversation", { provider });
+ * null, title="新对话", now) + return it. Called by the new-conversation
+ * dialog (Task 5) after the user picks a provider + model + cwd. Task 5:
+ * `model` (null = use the agent's own default model) + `cwd` (the working
+ * directory the agent CLI runs in, pinned at creation — immutable) are
+ * passed from the dialog. An empty `cwd` falls back to the global
+ * config's `working_dir` server-side. */
+export async function newConversation(
+  provider: Provider,
+  model: string | null,
+  cwd: string,
+): Promise<Conversation> {
+  return invoke<Conversation>("new_conversation", { provider, model, cwd });
 }
 
 /** `chat::load_history` — all stored messages for a conversation
@@ -108,11 +124,22 @@ export async function loadHistory(convId: string): Promise<StoredMessage[]> {
 /** `chat::chat_send` — kick off a chat turn. Returns immediately
  * (run_chat_turn spawns the stream-drain task + returns); the live
  * message stream + final result arrive via `chat_message` /
- * `chat_result` events (subscribed in `stream.ts`). */
-export async function chatSend(
-  convId: string,
-  prompt: string,
-  provider: Provider,
-): Promise<void> {
-  await invoke("chat_send", { convId, prompt, provider });
+ * `chat_result` events (subscribed in `stream.ts`).
+ *
+ * Task 5 carry: NO `provider` arg — the conversation's agent is fixed
+ * at creation (`conv.provider`, immutable). The backend loads the
+ * conversation row + uses `conv.provider` for `agent::new`. The
+ * frontend no longer offers a per-send provider picker. */
+export async function chatSend(convId: string, prompt: string): Promise<void> {
+  await invoke("chat_send", { convId, prompt });
+}
+
+/** `list_models` — per-agent model discovery (Task 3). Returns the
+ * model IDs the agent's CLI advertises (claude `list_models` control
+ * request, codex `debug models`, opencode `models`). Empty list on any
+ * failure (binary missing / timeout / parse error) — the new-conv
+ * dialog + SettingsView fall back to a manual text input for the model
+ * name (design: 兜底). */
+export async function listModels(provider: Provider): Promise<string[]> {
+  return invoke<string[]>("list_models", { provider });
 }

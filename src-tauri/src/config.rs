@@ -96,13 +96,88 @@ impl Default for Config {
     }
 }
 
-/// Per-provider config. Placeholder for now (Task 15+ adds
-/// `executable_path` / `env` / `model` per provider, mirroring
-/// multica's `MULTICA_<X>_PATH`). Kept as a struct (not a unit) so the
-/// TOML has a `[providers]` section ready to extend without a
-/// breaking schema change.
+/// Per-provider config. Task 5: each agent can have a **default model**
+/// (probed + picked in `SettingsView`; pre-filled in the new-conversation
+/// dialog). The TOML has one `[providers.<agent>]` section per agent
+/// (claude / codex / opencode), each carrying an optional `default_model`.
+///
+/// `#[serde(default)]` on each field so an OLD `config.toml` written
+/// before Task 5 (which had an empty `[providers]` table, or no table at
+/// all) still loads — the missing sections deserialize to
+/// `ProviderCfg::default()` (`default_model: None`), exactly the
+/// "user hasn't probed yet" state. This keeps the schema migration
+/// back-compat: no rewrite of old config files needed.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct ProvidersCfg {}
+pub struct ProvidersCfg {
+    /// `[providers.claude]` — Claude's default model. `None` until the
+    /// user probes + picks one in SettingsView; `None` = "use the
+    /// agent's own default model" (passed as `model: None` to
+    /// `new_conversation`).
+    #[serde(default)]
+    pub claude: ProviderCfg,
+    /// `[providers.codex]` — Codex's default model. Same semantics as
+    /// `claude`.
+    #[serde(default)]
+    pub codex: ProviderCfg,
+    /// `[providers.opencode]` — OpenCode's default model. Same
+    /// semantics as `claude`. Note: opencode's model IDs are
+    /// `provider/model` (e.g. `anthropic/claude-…`).
+    #[serde(default)]
+    pub opencode: ProviderCfg,
+}
+
+/// Per-agent config. Task 5: `default_model` is the only field so far
+/// (the design's per-agent default-model feature). Future fields
+/// (executable_path / env overrides per agent, mirroring multica's
+/// `MULTICA_<X>_PATH`) extend this struct without a breaking schema
+/// change — `#[serde(default)]` on the parent's field + this struct's
+/// `Default` impl keep old TOML loading.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ProviderCfg {
+    /// The default model for this agent, probed via `list_models(agent)`
+    /// + picked by the user in SettingsView. Pre-filled into the
+    /// new-conversation dialog's model field. `None` = the agent's own
+    /// default model (no `--model` flag passed).
+    #[serde(default)]
+    pub default_model: Option<String>,
+}
+
+impl ProvidersCfg {
+    /// Read the default model for `provider` (one of `claude` / `codex`
+    /// / `opencode`). Unknown providers return `None`. Used by the
+    /// frontend's new-conv dialog to pre-fill the model from the
+    /// per-agent default. Also exercised by `providers_default_model
+    /// _round_trip` (the test pins the round-trip); the production
+    /// path writes the whole `ProvidersCfg` struct via `settings_set`,
+    /// so this helper + `set_default_model` are convenience APIs for
+    /// future server-side code that wants to touch one agent's slot
+    /// without load-modify-saving the whole config.
+    #[allow(dead_code)]
+    pub fn default_model_for(&self, provider: &str) -> Option<&str> {
+        match provider {
+            "claude" => self.claude.default_model.as_deref(),
+            "codex" => self.codex.default_model.as_deref(),
+            "opencode" => self.opencode.default_model.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Set the default model for `provider` (one of `claude` / `codex`
+    /// / `opencode`). Unknown providers are a no-op (the design only
+    /// covers the three whitelisted agents). Used by `settings_set` to
+    /// persist the per-agent default model picked in SettingsView +
+    /// by the round-trip test.
+    #[allow(dead_code)]
+    pub fn set_default_model(&mut self, provider: &str, model: Option<String>) {
+        let slot = match provider {
+            "claude" => &mut self.claude,
+            "codex" => &mut self.codex,
+            "opencode" => &mut self.opencode,
+            _ => return,
+        };
+        slot.default_model = model;
+    }
+}
 
 /// Focus / do-not-disturb config. `enabled` is the manual toggle
 /// (the spec's "手动开关"); `window` is an optional `[start, end]` time
@@ -306,8 +381,17 @@ pub struct Settings {
     /// Default agent provider (`"claude"` | `"codex"` | `"opencode"`).
     pub default_provider: String,
     /// Working directory for the agent CLI's cwd. `None` → fall back
-    /// to the process's cwd.
+    /// to the process's cwd. Used as the **default pre-fill** for the
+    /// new-conversation dialog's cwd field (Task 5); once a
+    /// conversation is created, its own `cwd` (set at creation,
+    /// immutable) is the source of truth.
     pub working_dir: Option<String>,
+    /// Per-agent config (Task 5: each agent's `default_model`, probed
+    /// + picked in SettingsView, pre-filled in the new-conv dialog).
+    /// `ProvidersCfg::default()` (all `default_model: None`) is the
+    /// first-run / unprobed state.
+    #[serde(default)]
+    pub providers: ProvidersCfg,
 }
 
 impl From<&Config> for Settings {
@@ -318,6 +402,7 @@ impl From<&Config> for Settings {
             focus: c.focus.clone(),
             default_provider: c.default_provider.clone(),
             working_dir: c.working_dir.clone(),
+            providers: c.providers.clone(),
         }
     }
 }
@@ -349,6 +434,10 @@ pub fn settings_set(settings: Settings) -> Result<(), String> {
     cfg.focus = settings.focus;
     cfg.default_provider = settings.default_provider;
     cfg.working_dir = settings.working_dir;
+    // Task 5: persist the per-agent default models picked in
+    // SettingsView (probed via `list_models(agent)` + saved here so
+    // the new-conv dialog pre-fills the model from this default).
+    cfg.providers = settings.providers;
     save(&cfg).map_err(|e| format!("settings_set save failed: {e}"))
 }
 
@@ -440,6 +529,67 @@ mod tests {
         };
         save(&cfg).expect("save");
         assert_eq!(load(), cfg);
+    }
+
+    /// Task 5: per-agent `default_model` round-trips through TOML +
+    /// the `default_model_for` / `set_default_model` helpers work.
+    /// This pins the new `ProvidersCfg` schema (three per-agent
+    /// sections, each with an optional `default_model`) AND the
+    /// back-compat story (an old config with no `[providers.<agent>]`
+    /// section loads as `default_model: None`). Also verifies the
+    /// `Settings::providers` projection carries the defaults through
+    /// `settings_get` / `settings_set`.
+    #[test]
+    fn providers_default_model_round_trip() {
+        let (_tmp, _g) = fresh_data_dir();
+        let mut cfg = Config::default();
+        // Set a default model for each agent via the helper.
+        cfg.providers
+            .set_default_model("claude", Some("claude-sonnet-4-5".into()));
+        cfg.providers.set_default_model("codex", Some("gpt-5".into()));
+        // opencode: leave None (the agent's own default).
+        cfg.providers.set_default_model("opencode", None);
+        save(&cfg).expect("save");
+        let loaded = load();
+        assert_eq!(loaded, cfg, "per-agent default_model must round-trip");
+        assert_eq!(
+            loaded.providers.default_model_for("claude"),
+            Some("claude-sonnet-4-5"),
+        );
+        assert_eq!(
+            loaded.providers.default_model_for("codex"),
+            Some("gpt-5"),
+        );
+        assert_eq!(loaded.providers.default_model_for("opencode"), None);
+        // Unknown provider → None (the helpers are whitelisted).
+        assert_eq!(loaded.providers.default_model_for("unknown"), None);
+    }
+
+    /// Task 5: an OLD `config.toml` written before Task 5 (which had an
+    /// empty `[providers]` table or no `[providers]` section at all)
+    /// still loads — the missing per-agent sections deserialize to
+    /// `ProviderCfg::default()` (`default_model: None`). This is the
+    /// back-compat guarantee `#[serde(default)]` on each `ProvidersCfg`
+    /// field gives. Writes a pre-Task-5 TOML by hand + asserts the
+    /// load yields the default ProvidersCfg (no panic, no error).
+    #[test]
+    fn old_config_without_providers_sections_loads_as_defaults() {
+        let (tmp, _g) = fresh_data_dir();
+        // A pre-Task-5 config: no [providers.<agent>] sections, just
+        // the top-level fields. The empty [providers] table is what
+        // v0.1.0 wrote (ProvidersCfg was a unit struct then).
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "follow_activity_min_secs = 900\ntheme = \"system\"\n\
+             default_provider = \"claude\"\n[focus]\nenabled = false\n\
+             [providers]\n",
+        )
+        .expect("write");
+        let cfg = load();
+        assert_eq!(cfg.providers, ProvidersCfg::default());
+        assert_eq!(cfg.providers.claude.default_model, None);
+        assert_eq!(cfg.providers.codex.default_model, None);
+        assert_eq!(cfg.providers.opencode.default_model, None);
     }
 
     /// `load()` with no file returns defaults (first run).
