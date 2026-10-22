@@ -52,6 +52,13 @@
   --acc-soft: #eef2ff;
   --code-bg: #1e1e2e;
   --code-ink: #e4e4e7;
+  /* Error pair: surfaced by ChatView's Error bubble + the banner +
+   * the new-conv dialog's probe-error line. Soft bg + dark ink in
+   * light; soft bg flips to a dark red-tinted block + light ink in
+   * dark so the error reads as "red" in BOTH themes without a
+   * hardcoded hex anywhere in the components. */
+  --err: #b91c1c;
+  --err-soft: #fef2f2;
   --shadow: 0 6px 24px rgba(20, 20, 30, 0.07),
     0 1px 3px rgba(20, 20, 30, 0.04);
 }
@@ -74,6 +81,8 @@
   --acc-soft: #1e1b3a;
   --code-bg: #0b0b0d;
   --code-ink: #d4d4d8;
+  --err: #f87171;
+  --err-soft: #2a1212;
   --shadow: 0 6px 24px rgba(0, 0, 0, 0.45),
     0 1px 3px rgba(0, 0, 0, 0.3);
 }
@@ -94,6 +103,8 @@
     --acc-soft: #1e1b3a;
     --code-bg: #0b0b0d;
     --code-ink: #d4d4d8;
+    --err: #f87171;
+    --err-soft: #2a1212;
     --shadow: 0 6px 24px rgba(0, 0, 0, 0.45),
       0 1px 3px rgba(0, 0, 0, 0.3);
   }

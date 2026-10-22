@@ -760,17 +760,28 @@
 {/if}
 
 <style>
+  /* Task 3: refined restyle. Every color is a theme.css token so the
+   * whole view flips with data-theme; no hardcoded hex anywhere. Soft
+   * shadow only on the truly elevated surface (the new-conv dialog).
+   * Radius ladder: bubbles → --r-bubble, chips/buttons → --r-chip,
+   * code/input blocks → --r-code, dialog card → --r-panel. Spacing
+   * follows the 8px rhythm (--space-1..5). The GLOBAL .bubble.md
+   * markdown element styles live in theme.css (Task 2) and are NOT
+   * duplicated here — only the bubble container + non-markdown blocks
+   * (Thinking/ToolUse/ToolResult/Status/Error) are styled below. */
+
   .chat {
     display: flex;
     height: 100%;
     min-height: 0;
   }
 
+  /* -- sidebar: conversation list + 新建对话 button -- */
   .sidebar {
     width: 200px;
     flex: 0 0 200px;
-    border-right: 1px solid #cbd5e1;
-    background: #f1f5f9;
+    border-right: 1px solid var(--bd);
+    background: var(--surface);
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -778,25 +789,31 @@
 
   .new-row {
     display: flex;
-    gap: 4px;
-    padding: 6px;
-    border-bottom: 1px solid #cbd5e1;
+    gap: var(--space-1);
+    padding: var(--space-2);
+    border-bottom: 1px solid var(--bd);
   }
 
   .new-row button {
     flex: 1;
     font-size: 0.85rem;
-    padding: 4px 8px;
+    padding: var(--space-1) var(--space-2);
     cursor: pointer;
-    background: #2563eb;
-    color: white;
+    background: var(--acc);
+    color: #fff;
     border: none;
-    border-radius: 4px;
+    border-radius: var(--r-chip);
+    transition: opacity var(--t-fast);
+  }
+
+  .new-row button:hover {
+    opacity: 0.9;
   }
 
   .new-row button:disabled {
-    background: #94a3b8;
+    background: var(--mut);
     cursor: not-allowed;
+    opacity: 1;
   }
 
   .conv-list {
@@ -818,32 +835,38 @@
     flex-direction: column;
     align-items: flex-start;
     gap: 2px;
-    padding: 6px 10px;
+    padding: var(--space-1) var(--space-3);
     background: transparent;
     border: none;
-    border-bottom: 1px solid #e2e8f0;
+    border-bottom: 1px solid var(--bd);
     cursor: pointer;
     text-align: left;
+    color: var(--ink);
+    transition: background var(--t-fast);
   }
 
   .conv-row:hover {
-    background: #e2e8f0;
+    background: var(--acc-soft);
   }
 
   .conv-row.active {
-    background: #dbeafe;
+    background: var(--acc-soft);
+  }
+
+  .conv-row.active .conv-title {
+    color: var(--acc);
   }
 
   .conv-provider {
     font-size: 0.65rem;
-    color: #64748b;
+    color: var(--mut);
     text-transform: uppercase;
     letter-spacing: 0.05em;
   }
 
   .conv-title {
     font-size: 0.85rem;
-    color: #1f2937;
+    color: var(--ink);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -852,17 +875,18 @@
 
   .conv-model {
     font-size: 0.65rem;
-    color: #475569;
-    font-family: ui-monospace, "Cascadia Code", monospace;
+    color: var(--mut);
+    font-family: var(--mono);
   }
 
   .empty {
-    padding: 1rem;
+    padding: var(--space-4);
     text-align: center;
-    color: #64748b;
+    color: var(--mut);
     font-size: 0.85rem;
   }
 
+  /* -- main pane -- */
   .main {
     flex: 1;
     display: flex;
@@ -876,26 +900,31 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    color: #64748b;
+    color: var(--mut);
     font-size: 0.9rem;
   }
 
+  /* Header chips: provider / model / cwd — all share the same pill
+   * treatment (bd border, mut text, bg fill) per the brief; the model
+   * + cwd chips additionally use the mono font as a subtle content
+   * cue. The "默认模型" muted variant drops to italic mut. */
   .main-header {
     display: flex;
     align-items: center;
-    gap: 6px;
-    padding: 6px 10px;
-    border-bottom: 1px solid #cbd5e1;
-    background: #f8fafc;
+    gap: var(--space-1);
+    padding: var(--space-2) var(--space-3);
+    border-bottom: 1px solid var(--bd);
+    background: var(--surface);
     flex-wrap: wrap;
   }
 
   .hdr-chip {
     font-size: 0.72rem;
-    padding: 2px 8px;
-    border-radius: 10px;
-    background: #e2e8f0;
-    color: #334155;
+    padding: 2px var(--space-2);
+    border-radius: var(--r-chip);
+    background: var(--bg);
+    color: var(--mut);
+    border: 1px solid var(--bd);
     max-width: 220px;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -903,46 +932,46 @@
   }
 
   .hdr-chip.model {
-    background: #ddd6fe;
-    color: #5b21b6;
-    font-family: ui-monospace, "Cascadia Code", monospace;
+    font-family: var(--mono);
   }
 
   .hdr-chip.model.muted {
-    background: #e2e8f0;
-    color: #94a3b8;
     font-style: italic;
   }
 
   .hdr-chip.cwd {
-    background: #dcfce7;
-    color: #166534;
-    font-family: ui-monospace, "Cascadia Code", monospace;
+    font-family: var(--mono);
   }
 
   .streaming {
     font-size: 0.75rem;
-    color: #2563eb;
+    color: var(--acc);
     font-style: italic;
     margin-left: auto;
   }
 
+  /* -- messages -- */
   .messages {
     flex: 1;
     overflow-y: auto;
-    padding: 10px;
+    padding: var(--space-3);
     display: flex;
     flex-direction: column;
-    gap: 6px;
-    background: #f8fafc;
+    gap: var(--space-2);
+    background: var(--bg);
   }
 
+  /* Bubble container. User = accent fill + white text (accent
+   * foreground); assistant = layered surface card (surface bg + bd
+   * border) so it reads as a raised tile over --bg; system = dimmed
+   * inline line. The inner markdown HTML is styled by the GLOBAL
+   * .bubble.md rules in theme.css — nothing here touches p/ul/code. */
   .bubble {
     max-width: 80%;
-    padding: 6px 10px;
-    border-radius: 8px;
+    padding: var(--space-2) var(--space-3);
+    border-radius: var(--r-bubble);
     font-size: 0.85rem;
-    line-height: 1.4;
+    line-height: 1.5;
     word-break: break-word;
     display: flex;
     flex-direction: column;
@@ -952,75 +981,89 @@
   .bubble .role {
     font-size: 0.65rem;
     text-transform: uppercase;
-    color: #64748b;
+    color: var(--mut);
     letter-spacing: 0.05em;
   }
 
   .bubble[data-role="user"] {
     align-self: flex-end;
-    background: #dbeafe;
-    color: #1e3a8a;
+    background: var(--acc);
+    color: #fff;
   }
 
   .bubble[data-role="user"] .role {
-    color: #1e40af;
+    color: #fff;
+    opacity: 0.8;
   }
 
   .bubble[data-role="assistant"] {
     align-self: flex-start;
-    background: #e2e8f0;
-    color: #1f2937;
+    background: var(--surface);
+    color: var(--ink);
+    border: 1px solid var(--bd);
   }
 
   .bubble[data-role="tool"] {
     align-self: flex-start;
-    background: #f1f5f9;
-    color: #475569;
-    font-family: ui-monospace, "Cascadia Code", monospace;
+    background: var(--surface);
+    color: var(--mut);
+    font-family: var(--mono);
     font-size: 0.78rem;
-    border: 1px solid #cbd5e1;
+    border: 1px solid var(--bd);
   }
 
   .bubble[data-role="system"] {
     align-self: center;
     background: transparent;
-    color: #64748b;
+    color: var(--mut);
     font-style: italic;
     font-size: 0.78rem;
   }
 
+  /* Error: red treatment via the --err/--err-soft tokens. Source order
+   * after the role rules so it overrides the assistant base. */
   .bubble[data-kind="Error"] {
-    background: #fee2e2;
-    color: #991b1b;
+    background: var(--err-soft);
+    color: var(--err);
+    border: 1px solid var(--err);
+  }
+
+  .bubble[data-kind="Error"] .role {
+    color: var(--err);
+    opacity: 0.85;
   }
 
   /* -- collapsible blocks (thinking / tool-use / tool-result) --
      Native <details>/<summary>: collapsed by default, expands on
-     click. No JS toggle needed. Used for the non-text MessageKinds
-     so the processing stream is scannable (multica-style) — the user
-     sees "🤔 思考" / "🔧 使用工具 X" / "✅ 工具结果" chips roll out
-     live + can expand any of them for the full content. */
+     click. No JS toggle needed. The .block card uses --r-bubble + a
+     --bd border + --surface fill; per-kind summary/content tints
+     follow (thinking → soft accent dimmed, tool-use → indigo summary
+     + dark code content, tool-result → muted summary + dark code
+     content). The inner <pre> block-content is a dark code block
+     (var(--code-bg)/var(--code-ink)) to match the markdown code
+     aesthetic in BOTH themes. */
   .block {
     align-self: flex-start;
     width: 100%;
     max-width: 96%;
-    border: 1px solid #cbd5e1;
-    border-radius: 6px;
-    background: #f8fafc;
+    border: 1px solid var(--bd);
+    border-radius: var(--r-bubble);
+    background: var(--surface);
     font-size: 0.8rem;
     overflow: hidden;
   }
 
   .block > summary {
     cursor: pointer;
-    padding: 4px 10px;
+    padding: var(--space-1) var(--space-3);
     font-size: 0.78rem;
     font-weight: 500;
     user-select: none;
     list-style: none;
     display: flex;
     align-items: center;
-    gap: 4px;
+    gap: var(--space-1);
+    color: var(--ink);
   }
 
   /* Drop the default disclosure triangle — the emoji is the marker + a
@@ -1032,8 +1075,8 @@
   .block > summary::before {
     content: "▸";
     font-size: 0.65rem;
-    color: #94a3b8;
-    transition: transform 0.1s ease;
+    color: var(--mut);
+    transition: transform var(--t-fast);
   }
 
   .block[open] > summary::before {
@@ -1041,76 +1084,79 @@
   }
 
   .block-content {
-    padding: 6px 10px;
-    border-top: 1px solid #e2e8f0;
+    padding: var(--space-2) var(--space-3);
+    border-top: 1px solid var(--bd);
     white-space: pre-wrap;
     word-break: break-word;
-    font-family: ui-monospace, "Cascadia Code", monospace;
+    font-family: var(--mono);
     font-size: 0.75rem;
     line-height: 1.4;
-    color: #334155;
+    color: var(--ink);
     /* Cap the height so a huge tool output doesn't swallow the whole
        panel — scroll inside the block instead. */
     max-height: 320px;
     overflow-y: auto;
   }
 
-  /* Thinking: dimmed purple (chain-of-thought). */
+  /* Thinking: soft accent-tinted card + dimmed muted italic content
+   * (chain-of-thought reads as secondary). */
   .block.thinking {
-    background: #f5f3ff;
-    border-color: #ddd6fe;
+    background: var(--acc-soft);
+    border-color: var(--acc-soft);
   }
 
   .block.thinking > summary {
-    color: #5b21b6;
-    background: rgba(221, 214, 254, 0.45);
+    color: var(--acc);
   }
 
   .block.thinking .block-content {
-    color: #6d28d9;
+    color: var(--mut);
     font-style: italic;
-    background: #faf5ff;
+    background: transparent;
+    border-top-color: var(--acc-soft);
   }
 
-  /* ToolUse: indigo (the agent is calling a tool). */
+  /* ToolUse: neutral card + indigo summary (the agent is acting) +
+   * dark code content (the tool input). */
   .block.tool-use {
-    background: #eef2ff;
-    border-color: #c7d2fe;
+    background: var(--surface);
+    border-color: var(--bd);
   }
 
   .block.tool-use > summary {
-    color: #3730a3;
-    background: rgba(199, 210, 254, 0.45);
+    color: var(--acc);
   }
 
   .block.tool-use .block-content {
-    color: #1e3a8a;
-    background: #f0f4ff;
+    background: var(--code-bg);
+    color: var(--code-ink);
+    border-top-color: var(--code-bg);
   }
 
-  /* ToolResult: green (the tool returned). */
+  /* ToolResult: neutral card + muted summary (the result is
+   * secondary) + dark code content (the tool output). */
   .block.tool-result {
-    background: #f0fdf4;
-    border-color: #bbf7d0;
+    background: var(--surface);
+    border-color: var(--bd);
   }
 
   .block.tool-result > summary {
-    color: #166534;
-    background: rgba(187, 247, 208, 0.45);
+    color: var(--mut);
   }
 
   .block.tool-result .block-content {
-    color: #14532d;
-    background: #f7fff9;
+    background: var(--code-bg);
+    color: var(--code-ink);
+    border-top-color: var(--code-bg);
   }
 
   /* Status: a small dimmed inline line (not a full bubble). */
   .status-line {
     align-self: center;
     font-size: 0.72rem;
-    color: #64748b;
+    color: var(--mut);
     font-style: italic;
-    padding: 2px 8px;
+    padding: 2px var(--space-2);
     text-align: center;
   }
 
@@ -1118,21 +1164,23 @@
   .log-line {
     align-self: flex-start;
     font-size: 0.68rem;
-    color: #94a3b8;
-    font-family: ui-monospace, "Cascadia Code", monospace;
-    padding: 1px 8px;
+    color: var(--mut);
+    font-family: var(--mono);
+    padding: 1px var(--space-2);
     max-width: 96%;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    opacity: 0.75;
   }
 
+  /* -- composer -- */
   .composer {
     display: flex;
-    gap: 6px;
-    padding: 8px;
-    border-top: 1px solid #cbd5e1;
-    background: #f1f5f9;
+    gap: var(--space-2);
+    padding: var(--space-2);
+    border-top: 1px solid var(--bd);
+    background: var(--surface);
   }
 
   .composer textarea {
@@ -1140,32 +1188,51 @@
     resize: vertical;
     font-family: inherit;
     font-size: 0.85rem;
-    padding: 6px;
-    border: 1px solid #cbd5e1;
-    border-radius: 4px;
+    padding: var(--space-2);
+    border: 1px solid var(--bd);
+    border-radius: var(--r-bubble);
+    background: var(--bg);
+    color: var(--ink);
+    transition: border-color var(--t-fast);
+  }
+
+  .composer textarea:focus {
+    border-color: var(--acc);
+    outline: none;
+  }
+
+  .composer textarea::placeholder {
+    color: var(--mut);
   }
 
   .composer button {
-    padding: 6px 14px;
+    padding: var(--space-2) var(--space-4);
     font-size: 0.85rem;
     cursor: pointer;
-    background: #2563eb;
-    color: white;
+    background: var(--acc);
+    color: #fff;
     border: none;
-    border-radius: 4px;
+    border-radius: var(--r-chip);
+    transition: opacity var(--t-fast);
+  }
+
+  .composer button:hover {
+    opacity: 0.9;
   }
 
   .composer button:disabled {
-    background: #94a3b8;
+    background: var(--mut);
     cursor: not-allowed;
+    opacity: 1;
   }
 
+  /* -- error banner (bottom of the main pane) -- */
   .error {
-    padding: 6px 10px;
-    background: #fee2e2;
-    color: #991b1b;
+    padding: var(--space-2) var(--space-3);
+    background: var(--err-soft);
+    color: var(--err);
     font-size: 0.8rem;
-    border-top: 1px solid #fecaca;
+    border-top: 1px solid var(--err);
   }
 
   /* -- new-conversation dialog -- */
@@ -1179,66 +1246,76 @@
     z-index: 1000;
   }
 
+  /* The elevated card: surface fill + bd border + panel radius + the
+   * soft shadow token — the one truly raised surface in this view. */
   .dialog {
-    background: white;
-    border-radius: 8px;
-    padding: 16px;
+    background: var(--surface);
+    border: 1px solid var(--bd);
+    border-radius: var(--r-panel);
+    padding: var(--space-4);
     width: 420px;
     max-width: 90vw;
     max-height: 90vh;
     overflow-y: auto;
     display: flex;
     flex-direction: column;
-    gap: 12px;
-    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+    gap: var(--space-3);
+    box-shadow: var(--shadow);
   }
 
   .dialog h2 {
     margin: 0;
     font-size: 1rem;
-    color: #1f2937;
+    color: var(--ink);
   }
 
   .dialog-field {
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    gap: var(--space-1);
   }
 
   .dialog-field label {
     font-size: 0.82rem;
-    color: #334155;
+    color: var(--ink);
     font-weight: 500;
   }
 
   .dialog-field select,
   .dialog-field input[type="text"] {
     font-size: 0.85rem;
-    padding: 4px 8px;
-    border: 1px solid #cbd5e1;
-    border-radius: 4px;
+    padding: var(--space-1) var(--space-2);
+    border: 1px solid var(--bd);
+    border-radius: var(--r-code);
     font-family: inherit;
-    background: white;
-    color: #1f2937;
+    background: var(--bg);
+    color: var(--ink);
   }
 
+  .dialog-field select:focus,
+  .dialog-field input[type="text"]:focus {
+    border-color: var(--acc);
+    outline: none;
+  }
+
+  /* Probing state: accent italic hint. */
   .dialog-field .model-probing {
     font-size: 0.85rem;
-    color: #2563eb;
+    color: var(--acc);
     font-style: italic;
-    padding: 4px 8px;
+    padding: var(--space-1) var(--space-2);
   }
 
   .dialog-field small.muted {
     font-size: 0.7rem;
-    color: #94a3b8;
+    color: var(--mut);
   }
 
   .link-btn {
     align-self: flex-start;
     background: transparent;
     border: none;
-    color: #2563eb;
+    color: var(--acc);
     font-size: 0.75rem;
     cursor: pointer;
     padding: 2px 0;
@@ -1246,42 +1323,54 @@
   }
 
   .link-btn:disabled {
-    color: #94a3b8;
+    color: var(--mut);
     cursor: not-allowed;
   }
 
   .dialog-error {
     font-size: 0.8rem;
-    color: #991b1b;
-    background: #fee2e2;
-    padding: 4px 8px;
-    border-radius: 4px;
+    color: var(--err);
+    background: var(--err-soft);
+    padding: var(--space-1) var(--space-2);
+    border-radius: var(--r-code);
   }
 
   .dialog-actions {
     display: flex;
     justify-content: flex-end;
-    gap: 8px;
-    margin-top: 4px;
+    gap: var(--space-2);
+    margin-top: var(--space-1);
   }
 
   .dialog-actions button {
-    padding: 6px 16px;
+    padding: var(--space-2) var(--space-4);
     font-size: 0.88rem;
     cursor: pointer;
-    background: #2563eb;
-    color: white;
+    background: var(--acc);
+    color: #fff;
     border: none;
-    border-radius: 4px;
+    border-radius: var(--r-chip);
+    transition: opacity var(--t-fast);
+  }
+
+  .dialog-actions button:hover {
+    opacity: 0.9;
   }
 
   .dialog-actions button:disabled {
-    background: #94a3b8;
+    background: var(--mut);
     cursor: not-allowed;
+    opacity: 1;
   }
 
   .dialog-actions button.secondary {
-    background: #e2e8f0;
-    color: #1f2937;
+    background: var(--bg);
+    color: var(--ink);
+    border: 1px solid var(--bd);
+  }
+
+  .dialog-actions button.secondary:hover {
+    background: var(--acc-soft);
+    opacity: 1;
   }
 </style>
