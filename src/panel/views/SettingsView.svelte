@@ -15,6 +15,8 @@
   import {
     getSettings,
     saveSettings,
+    getAutostart,
+    setAutostart,
     type Settings,
     type Provider,
     type ProviderCfg,
@@ -45,6 +47,9 @@
   let useFocusWindow: boolean = $state(false);
   let defaultProvider: Provider = $state("claude");
   let workingDir: string = $state("");
+  let autostart: boolean = $state(false);
+  // Responsible persons roster for the 代办 tab — comma-separated text.
+  let responsiblePersons: string = $state("");
   // Task 5: per-agent default model local-edit copies. The user probes
   // + picks; the global 保存 button persists all three to
   // Config.providers.<agent>.default_model.
@@ -87,11 +92,18 @@
       }
       defaultProvider = (s.default_provider as Provider) || "claude";
       workingDir = s.working_dir ?? "";
+      responsiblePersons = (s.responsible_persons ?? []).join(", ");
       providerModels = {
         claude: s.providers.claude.default_model ?? null,
         codex: s.providers.codex.default_model ?? null,
         opencode: s.providers.opencode.default_model ?? null,
       };
+      // Query the OS-level autostart state (registry is source of truth).
+      try {
+        autostart = await getAutostart();
+      } catch {
+        autostart = false;
+      }
       errorMsg = null;
     } catch (e) {
       errorMsg = `加载设置失败: ${e}`;
@@ -142,6 +154,20 @@
     probeState[agent].manual = !probeState[agent].manual;
   }
 
+  /** Toggle autostart immediately (no save button needed — the OS registry
+   * is the source of truth, written right now). */
+  async function toggleAutostart() {
+    const next = !autostart;
+    autostart = next;
+    try {
+      await setAutostart(next);
+    } catch (e) {
+      // Revert on failure + surface the error
+      autostart = !next;
+      errorMsg = `设置开机自启失败: ${e}`;
+    }
+  }
+
   async function save() {
     // Enforce the 15min floor on follow_activity_min (the design spec
     // + the brain's FOLLOW_ACTIVITY_MIN constant both treat 900s as
@@ -172,6 +198,10 @@
         codex: buildCfg("codex"),
         opencode: buildCfg("opencode"),
       },
+      responsible_persons: responsiblePersons
+        .split(",")
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0),
     };
     try {
       await saveSettings(newSettings);
@@ -252,6 +282,17 @@
         <label>
           <input
             type="checkbox"
+            checked={autostart}
+            onchange={toggleAutostart}
+          />
+          开机自启动
+        </label>
+      </div>
+
+      <div class="field">
+        <label>
+          <input
+            type="checkbox"
             bind:checked={useFocusWindow}
             disabled={!focusEnabled}
           />
@@ -283,6 +324,17 @@
           placeholder="留空 = 使用进程当前目录"
         />
         <small>对话发送时 agent 子进程的 cwd。新建对话时作为默认预填值；留空则使用宠物进程的当前目录。</small>
+      </div>
+
+      <div class="field">
+        <label for="resp-persons">代办责任人</label>
+        <input
+          id="resp-persons"
+          type="text"
+          bind:value={responsiblePersons}
+          placeholder="用英文逗号分隔，如：张三,李四,王五"
+        />
+        <small>代办页的责任人下拉列表从这里的配置读取。</small>
       </div>
 
       <!-- Task 5: per-agent default model. Each agent has a row with a

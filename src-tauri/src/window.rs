@@ -504,22 +504,20 @@ fn compute_panel_spawn(
     (panel_x, panel_y)
 }
 
-/// Open the `"panel"` window next to the `"pet"` window, choosing flip
-/// direction based on which side of the pet has room on the pet's current
-/// monitor's work area, then `set_position` + `show` + `set_focus` the panel.
+/// Toggle the `"panel"` window: if visible → hide; if hidden → position next
+/// to the `"pet"` window (choosing flip direction based on which side has
+/// room) + `show` + `set_focus`.
 ///
 /// This is the entry point the frontend `Pet.svelte` click handler invokes
 /// (via the `open_panel_above_pet` Tauri command registered in `lib.rs`).
-/// It deliberately *always opens* the panel (no toggle) — the toggle-on-click
-/// behavior is reserved for the tray icon's left-click via
-/// [`show_panel_or_toggle_pet`]. Re-clicking the robot while the panel is
-/// already open re-positions the panel to the current pet location (so if the
-/// user dragged the pet, the panel follows).
+/// Clicking the robot toggles the panel: first click opens it, second click
+/// closes it. The toggle is here (not in the tray's left-click handler)
+/// because the tray already has its own toggle (`show_panel_or_toggle_pet`).
 ///
-/// Panel size: prefers the persisted rect (if the user resized it earlier
-/// this session) so re-opening honors that; falls back to the panel's current
-/// outer size, which on first open reflects the 380×560 default from
-/// `tauri.conf.json`.
+/// When opening, the panel size prefers the persisted rect (if the user
+/// resized it earlier this session) so re-opening honors that; falls back to
+/// the panel's current outer size, which on first open reflects the 380×560
+/// default from `tauri.conf.json`.
 pub fn open_panel_above_pet<R: Runtime, M: Manager<R>>(app: &M) -> Result<(), String> {
     let pet: WebviewWindow<R> = app
         .get_webview_window("pet")
@@ -528,6 +526,18 @@ pub fn open_panel_above_pet<R: Runtime, M: Manager<R>>(app: &M) -> Result<(), St
         .get_webview_window("panel")
         .ok_or_else(|| "window 'panel' not found".to_string())?;
 
+    // Toggle: if the panel is already visible, hide it.
+    let panel_visible = panel
+        .is_visible()
+        .map_err(|e| format!("panel.is_visible() failed: {e}"))?;
+    if panel_visible {
+        panel
+            .hide()
+            .map_err(|e| format!("panel.hide() failed: {e}"))?;
+        return Ok(());
+    }
+
+    // Panel hidden → position next to the pet + show + focus.
     let pet_pos = pet
         .outer_position()
         .map_err(|e| format!("pet.outer_position() failed: {e}"))?;

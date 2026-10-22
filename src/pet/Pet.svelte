@@ -174,17 +174,150 @@
   let nudgeActivityTimer: ReturnType<typeof setTimeout> | null = null;
 
   // ---------------------------------------------------------------------------
-  // Drag tracking state. `dragStart` records the pet's outer position at
-  // mousedown; `dragArmed` tracks whether a drag is in-flight (so the
-  // window-level mouseup/pointerup + safety timeout + blur backstop can all
-  // funnel through a single idempotent endDrag that clears the Rust-side
-  // DRAGGING flag and — if the pet moved more than 2px — invokes
-  // `save_pet_pos`. Plain `let` (not `$state`) because none of these are
-  // read by the template — they're only touched in event handlers.
+  // Drag state. The drag is started from the Rust side via `start_pet_drag`
+  // (atomically sets DRAGGING=true + calls start_dragging()). But
+  // `start_dragging()` may use PostMessage (non-blocking), so the IPC
+  // returns BEFORE the OS drag loop starts. To avoid treating a drag as
+  // a click, disambiguation happens on `mouseup` (not right after the IPC).
   // ---------------------------------------------------------------------------
-  let dragStart: { x: number; y: number } | null = null;
   let dragArmed = false;
+  let dragStartWin: { x: number; y: number } | null = null;
   let dragSafetyTimer: ReturnType<typeof setTimeout> | null = null;
+
+  async function onRobotMouseDown(e: MouseEvent) {
+    e.preventDefault();
+    if (dragArmed) return;
+    dragArmed = true;
+
+    // Record the window's start position for click-vs-drag disambiguation.
+    try {
+      const pos = await getCurrentWindow().outerPosition();
+      dragStartWin = { x: pos.x, y: pos.y };
+    } catch (err) {
+      console.warn("[pet] outerPosition at mousedown failed:", err);
+    }
+
+    // Fire-and-forget: the Rust side sets DRAGGING=true + calls
+    // start_dragging(). Whether start_dragging blocks or returns
+    // immediately, we register a mouseup listener so disambiguation
+    // happens when the user actually releases the mouse — NOT right
+    // after the IPC (which could be before the drag even starts).
+    invoke("start_pet_drag").catch((err) =>
+      console.warn("[pet] start_pet_drag failed:", err),
+    );
+
+    // Register a one-time mouseup listener for drag-end disambiguation.
+    // This fires after the OS drag loop exits (if the modal loop passes
+    // WM_LBUTTONUP through to the webview) OR immediately if the drag
+    // didn't start (start_pet_drag failed).
+    window.addEventListener("mouseup", onDragMouseUp, { once: true });
+
+    // Safety timeout: if the mouseup is consumed by the OS modal drag
+    // loop and never reaches the webview, clear DRAGGING after 5s so
+    // the poller doesn't stay pinned forever.
+    if (dragSafetyTimer) clearTimeout(dragSafetyTimer);
+    dragSafetyTimer = setTimeout(() => {
+      if (dragArmed) {
+        console.warn("[pet] drag safety timeout — clearing DRAGGING");
+        dragArmed = false;
+        dragStartWin = null;
+        void invoke("set_pet_dragging", { dragging: false }).catch(() => {});
+      }
+    }, 5000);
+  }
+
+  // Drag end (mouseup). Clears DRAGGING, then does click-vs-drag
+  // disambiguation: if the window moved >2px it's a drag (save position);
+  // otherwise it's a click (toggle panel / dismiss alert).
+  async function onDragMouseUp() {
+    if (!dragArmed) return;
+    dragArmed = false;
+
+    if (dragSafetyTimer) {
+      clearTimeout(dragSafetyTimer);
+      dragSafetyTimer = null;
+    }
+
+    // Clear the DRAGGING flag so the poller resumes normal click-through.
+    try {
+      await invoke("set_pet_dragging", { dragging: false });
+    } catch (err) {
+      console.warn("[pet] set_pet_dragging(false) failed:", err);
+    }
+
+    // Click-vs-drag: compare start/end window positions.
+    let endPos: { x: number; y: number } | null = null;
+    try {
+      const pos = await getCurrentWindow().outerPosition();
+      endPos = { x: pos.x, y: pos.y };
+    } catch (err) {
+      console.warn("[pet] outerPosition at drag end failed:", err);
+    }
+
+    const start = dragStartWin;
+    dragStartWin = null;
+
+    if (!start || !endPos) {
+      onRobotClick();
+      return;
+    }
+
+    const dx = Math.abs(endPos.x - start.x);
+    const dy = Math.abs(endPos.y - start.y);
+    if (dx <= 2 && dy <= 2) {
+      // Click — toggle the panel (or dismiss alert).
+      onRobotClick();
+    } else {
+      // Drag — persist the new position (within-session).
+      try {
+        await invoke("save_pet_pos", { x: endPos.x, y: endPos.y });
+      } catch (err) {
+        console.warn("[pet] save_pet_pos failed:", err);
+      }
+    }
+  }
+
+  function onRobotClick() {
+    // When the pet is in `NeedsYou` (showing `?`), clicking the robot
+    // DISMISSES the alert instead of opening the panel. Any other state:
+    // toggle the panel (open if hidden, close if visible).
+    if (nudgeTimer) clearTimeout(nudgeTimer);
+    nudge = true;
+    nudgeTimer = setTimeout(() => {
+      nudge = false;
+      nudgeTimer = null;
+    }, 100);
+
+    if (petState === "NeedsYou") {
+      console.log("[pet] robot clicked — 需要你 → dismiss");
+      dismissPetAlert().catch((e) =>
+        console.warn("[pet] dismiss_pet_alert failed:", e),
+      );
+      return;
+    }
+    console.log("[pet] robot clicked — toggle panel");
+    invoke("open_panel_above_pet").catch((e) =>
+      console.warn("[pet] open_panel_above_pet failed:", e),
+    );
+  }
+
+  // Keyboard-equivalent of the click so the robot is operable without a
+  // mouse (Enter / Space), satisfying the Svelte a11y rule for the click
+  // handler on a non-interactive <svg> that carries role="button".
+  function onRobotKeydown(e: KeyboardEvent) {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      onRobotClick();
+    }
+  }
+
+  // Disable the browser context menu (right-click menu) — the desktop
+  // pet is not a web page and right-click should do nothing.
+  $effect(() => {
+    const handler = (e: MouseEvent) => e.preventDefault();
+    window.addEventListener("contextmenu", handler);
+    return () => window.removeEventListener("contextmenu", handler);
+  });
 
   // ---------------------------------------------------------------------------
   // Tauri event listeners + cleanup (Task 7).
@@ -266,224 +399,21 @@
       }
     };
   });
-
-  // The single funnel for "drag end". Idempotent: the first call does the
-  // work, subsequent calls (e.g. mouseup + pointerup + safety timeout all
-  // firing) are no-ops because `dragArmed` was cleared. Always releases the
-  // Rust-side DRAGGING flag (the hard guarantee). The `fromRelease` arg
-  // distinguishes a genuine user release (which should disambiguate
-  // click-vs-drag) from a recovery path (which should only clear the flag —
-  // opening a panel on a stuck-drag recovery would be wrong, since the user
-  // didn't click).
-  async function endDrag(fromRelease: boolean) {
-    if (!dragArmed) return;
-    dragArmed = false;
-    if (dragSafetyTimer) {
-      clearTimeout(dragSafetyTimer);
-      dragSafetyTimer = null;
-    }
-
-    // Always release the Rust-side DRAGGING flag — even if the mousedown
-    // invoke failed, the poller must not stay pinned forever (the brief's
-    // hard guarantee).
-    try {
-      await invoke("set_pet_dragging", { dragging: false });
-    } catch (e) {
-      console.warn("[pet] set_pet_dragging(false) failed:", e);
-    }
-
-    // Recovery paths (safety timeout, blur) stop here — they only
-    // guarantee DRAGGING is cleared. The click-vs-drag disambiguation
-    // runs only on a genuine user release so a stuck-drag recovery
-    // doesn't pop a panel the user didn't ask for.
-    if (!fromRelease) return;
-
-    let end: { x: number; y: number } | null = null;
-    try {
-      const pos = await getCurrentWindow().outerPosition();
-      end = { x: pos.x, y: pos.y };
-    } catch (e) {
-      console.warn("[pet] outerPosition at drag end failed:", e);
-    }
-
-    const start = dragStart;
-    dragStart = null;
-
-    if (!start || !end) {
-      // Couldn't read either position (e.g. the bridge hiccupped). Fall
-      // back to the click behavior so the user still gets a panel.
-      void onRobotClick();
-      return;
-    }
-
-    // Threshold for "this was a click, not a drag": 2px in any axis.
-    // Tauri's start_dragging consumes tiny movements as part of a click
-    // (the OS drag threshold), but a true click should produce identical
-    // start/end positions. Use a small epsilon to be safe under DPI.
-    const dx = Math.abs(end.x - start.x);
-    const dy = Math.abs(end.y - start.y);
-    if (dx <= 2 && dy <= 2) {
-      void onRobotClick();
-    } else {
-      // Drag → persist the new position (within-session).
-      try {
-        await invoke("save_pet_pos", { x: end.x, y: end.y });
-      } catch (e) {
-        console.warn("[pet] save_pet_pos failed:", e);
-      }
-    }
-  }
-
-  // Mousedown on the robot: arm the drag. DRAGGING=true is dispatched
-  // fire-and-forget (no await) at the very start, BEFORE Tauri's
-  // drag-region listener calls `start_dragging` and blocks the JS event
-  // loop for the duration of the OS modal drag. If the IPC ordering races
-  // (Tauri's listener is registered before ours) and Rust processes
-  // `start_dragging` first, the flag may be set late — but the safety
-  // timeout + blur backstop in `endDrag` guarantee it never sticks true.
-  function onRobotMouseDown() {
-    // Arm first so any race that fires endDrag before the invoke lands
-    // still has a drag to end. Synchronous, no await.
-    dragArmed = true;
-    // Fire-and-forget the DRAGGING=true IPC so it's dispatched before
-    // Tauri's drag-region listener takes over. Errors are logged, not
-    // awaited — the drag still works without it (natural cursor-on-
-    // robot behavior keeps ignore=false during the drag).
-    void invoke("set_pet_dragging", { dragging: true }).catch((e) =>
-      console.warn("[pet] set_pet_dragging(true) failed:", e),
-    );
-    // Record the start position asynchronously. If the OS drag starts
-    // before this resolves, dragStart stays null and endDrag's
-    // click-vs-drag path falls back to onRobotClick (acceptable — the
-    // click is the friendlier fallback).
-    void (async () => {
-      try {
-        const pos = await getCurrentWindow().outerPosition();
-        if (dragArmed) dragStart = { x: pos.x, y: pos.y };
-      } catch (e) {
-        console.warn("[pet] outerPosition at mousedown failed:", e);
-      }
-    })();
-    // Safety timeout: if no release arrives within 5s (e.g. the OS modal
-    // drag loop swallowed the mouseup entirely), clear DRAGGING anyway so
-    // the click-through poller never stays pinned. 5s is well above any
-    // reasonable drag duration; the safety only fires on a genuinely
-    // stuck state. Cleared on a real release in endDrag.
-    if (dragSafetyTimer) clearTimeout(dragSafetyTimer);
-    dragSafetyTimer = setTimeout(() => {
-      console.warn("[pet] drag safety timeout — clearing DRAGGING");
-      void endDrag(false);
-    }, 5000);
-  }
-
-  function onRobotClick() {
-    // Task 16: when the pet is in `NeedsYou` (showing `?`), clicking
-    // the robot DISMISSES the alert (applies `Signal::Dismissed` via
-    // the `dismiss_pet_alert` Tauri command) instead of opening the
-    // panel — so the `?` clears on the same click. Any other state:
-    // open the panel above/below the pet (Task 2/4 behavior).
-    //
-    // Reading `petState` here is safe: it's the subscribed `pet_state`
-    // event's latest payload (kept up to date by the listen handler
-    // in onMount). The dismiss command applies `Signal::Dismissed` +
-    // emits the resulting state immediately, so the frontend's `?`
-    // clears without waiting for the next 1s brain tick.
-    if (petState === "NeedsYou") {
-      console.log("[pet] robot clicked — 需要你 → dismiss");
-      if (nudgeTimer) clearTimeout(nudgeTimer);
-      nudge = true;
-      nudgeTimer = setTimeout(() => {
-        nudge = false;
-        nudgeTimer = null;
-      }, 100);
-      dismissPetAlert().catch((e) =>
-        console.warn("[pet] dismiss_pet_alert failed:", e),
-      );
-      return;
-    }
-    console.log("[pet] robot clicked — 待命 → 打开面板");
-    if (nudgeTimer) clearTimeout(nudgeTimer);
-    nudge = true;
-    nudgeTimer = setTimeout(() => {
-      nudge = false;
-      nudgeTimer = null;
-    }, 100);
-    // Open the panel above/below the pet (flip direction decided in
-    // window.rs::open_panel_above_pet). Best-effort: errors are logged
-    // to the dev console rather than surfaced to the user (a click that
-    // fails to open the panel is recoverable on the next click).
-    invoke("open_panel_above_pet").catch((e) =>
-      console.warn("[pet] open_panel_above_pet failed:", e),
-    );
-  }
-
-  // Keyboard-equivalent of the click so the robot is operable without a
-  // mouse (Enter / Space), satisfying the Svelte a11y rule for the click
-  // handler on a non-interactive <svg> that carries role="button". A
-  // keyboard activation is always a click, never a drag, so it goes straight
-  // to onRobotClick.
-  function onRobotKeydown(e: KeyboardEvent) {
-    if (e.key === "Enter" || e.key === " ") {
-      e.preventDefault();
-      onRobotClick();
-    }
-  }
-
-  // Register window-level drag-end listeners (mouseup, pointerup) and a
-  // blur backstop. These catch the drag release even when the OS modal drag
-  // loop steals the SVG element-level mouseup — the primary fix for the
-  // Task 4 review's Important finding. All funnel through endDrag, which is
-  // idempotent so duplicate firing (mouseup + pointerup both firing, or a
-  // late safety-timeout after a real release) is harmless.
-  //
-  // `pointerup` covers touch/pen in addition to mouse; registering both is
-  // belt-and-suspenders since some OS drag-loop paths may swallow one but
-  // not the other. `blur` is the focus-loss backstop: if the pet window
-  // loses focus mid-drag (e.g. the user alt-tabbed, or the OS stole focus),
-  // the drag is definitively over and DRAGGING must clear.
-  //
-  // $effect ensures the listeners are registered after mount (window is
-  // available) and cleaned up on component destroy. The effect body reads
-  // no reactive state during setup (only `window` and the stable function
-  // refs), so it runs exactly once on mount.
-  $effect(() => {
-    const handleUp = () => void endDrag(true);
-    const handleBlur = () => void endDrag(false);
-    window.addEventListener("mouseup", handleUp);
-    window.addEventListener("pointerup", handleUp);
-    window.addEventListener("blur", handleBlur);
-    return () => {
-      window.removeEventListener("mouseup", handleUp);
-      window.removeEventListener("pointerup", handleUp);
-      window.removeEventListener("blur", handleBlur);
-      // Clear any in-flight safety timer so the component can tear down
-      // without a dangling setTimeout firing after destroy.
-      if (dragSafetyTimer) {
-        clearTimeout(dragSafetyTimer);
-        dragSafetyTimer = null;
-      }
-      // Defensive: if a drag was armed when the component unmounted (not
-      // expected in normal use — the pet window lives for the whole
-      // session), release the Rust-side DRAGGING flag so the poller
-      // doesn't stay pinned. This is the last-resort backstop.
-      if (dragArmed) {
-        dragArmed = false;
-        void invoke("set_pet_dragging", { dragging: false }).catch(() => {});
-      }
-    };
-  });
 </script>
 
 <main class="pet">
   <!--
-    The robot SVG. `data-tauri-drag-region` on the root makes Tauri call
-    `start_dragging` on mousedown, so grabbing the robot body drags the pet
-    window. The click-through poller keeps ignore=false while the cursor is
-    on the robot, so the mousedown reaches us. We pair it with our own
-    onmousedown to (a) pin the Rust-side DRAGGING flag and (b) record the
-    drag start position. The drag-end (DRAGGING release + save_pet_pos /
-    click-vs-drag) is handled by WINDOW-level mouseup/pointerup + blur
-    listeners registered in the $effect above.
+    The robot SVG. Mousedown on the robot is handled by `onRobotMouseDown`
+    (below), which calls `set_pet_dragging(true)` BEFORE `start_dragging()`
+    to pin `ignore=false` on the Rust poller for the duration of the drag,
+    then enters the OS modal drag loop via `getCurrentWindow().startDragging()`.
+    When the drag loop returns, click-vs-drag disambiguation runs inline —
+    no window-level backstops needed.
+
+    The old approach used `data-tauri-drag-region`, which made Tauri's
+    drag-region listener fire before ours and enter the modal loop before
+    `set_pet_dragging(true)` could be dispatched — leaving DRAGGING=false
+    during the drag so the poller broke the drag by flipping pass-through on.
 
     Task 7: the SVG root carries the per-state CSS class (`stateClass`)
     which drives styling + animation (or lack thereof) from `states.css`.
@@ -498,7 +428,6 @@
     class="robot {stateClass}"
     class:nudge
     class:activity-nudge={nudgeActivity}
-    data-tauri-drag-region
     viewBox="0 0 96 96"
     width="96"
     height="96"

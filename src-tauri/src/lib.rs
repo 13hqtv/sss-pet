@@ -45,6 +45,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use brain::{BrainState, PetBrain};
 use db::Reminder;
 use state::machine::Signal;
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 // Task 15: chat-turn controller — `run_chat_turn` core + the four
 // Tauri commands (`list_conversations`, `new_conversation`,
 // `load_history`, `chat_send`) the panel's ChatView consumes. Owns
@@ -66,17 +67,39 @@ fn set_pet_click_through(app: tauri::AppHandle, ignore: bool) -> Result<(), Stri
     window::set_click_through(&app, "pet", ignore)
 }
 
-/// Frontend hook for "the user started/stopped dragging the pet". Sets the
-/// [`window::DRAGGING`] flag so the click-through poller pins `ignore=false`
-/// for the duration of the drag (avoids a race where the cursor momentarily
-/// leaves the (stale) robot rect between OS drag ticks and the poller would
-/// otherwise flip pass-through on, breaking the drag). Called by
-/// `Pet.svelte`'s `mousedown` (`true`) / `mouseup` (`false`) handler around
-/// the `data-tauri-drag-region` OS drag.
+/// Set the [`window::DRAGGING`] flag. Called by the `set_pet_dragging` Tauri command
+/// (registered in `lib.rs`), which the frontend invokes on `mousedown`
+/// (`true`) / `mouseup` (`false`) handler around the `data-tauri-drag-region`
+/// OS drag of the pet window.
 #[tauri::command]
 fn set_pet_dragging(dragging: bool) -> Result<(), String> {
     window::set_pet_dragging_state(dragging);
     Ok(())
+}
+
+/// Start a pet-window drag from the Rust side — sets `DRAGGING=true`
+/// **synchronously** then calls `start_dragging()` in the SAME function.
+/// This eliminates the race condition that occurred when the JS side did
+/// two separate IPC calls (set_pet_dragging → start_dragging): between
+/// them, the click-through poller could flip `ignore=true` (pass-through),
+/// breaking the drag. Here both happen atomically on the main thread.
+///
+/// `start_dragging()` enters the Windows modal drag loop
+/// (`DefWindowProc WM_NCLBUTTONDOWN HTCAPTION`), which blocks the main
+/// thread until the user releases the mouse. The poller (separate thread)
+/// sees `DRAGGING=true` throughout and pins `ignore=false`. When the
+/// IPC returns, the drag is done; the frontend clears the flag + does
+/// click-vs-drag disambiguation.
+#[tauri::command]
+fn start_pet_drag(app: tauri::AppHandle) -> Result<(), String> {
+    // Set DRAGGING=true SYNCHRONOUSLY before start_dragging — the poller
+    // (separate thread) will see this on its next tick and pin ignore=false.
+    window::set_pet_dragging_state(true);
+    let pet = app
+        .get_webview_window("pet")
+        .ok_or_else(|| "window 'pet' not found".to_string())?;
+    pet.start_dragging()
+        .map_err(|e| format!("start_dragging failed: {e}"))
 }
 
 /// Frontend hook for "open the panel next to the pet, choosing flip direction
@@ -164,16 +187,68 @@ fn todo_list(db: State<'_, Arc<Mutex<Connection>>>) -> Result<Vec<db::Todo>, Str
     db::todo_list(&conn).map_err(|e| format!("todo_list: {e}"))
 }
 
+/// Add a todo with full metadata. `priority` defaults to "medium"
+/// when None; the other Option fields are nullable on disk.
 #[tauri::command]
-fn todo_add(db: State<'_, Arc<Mutex<Connection>>>, text: String) -> Result<i64, String> {
+fn todo_add(
+    db: State<'_, Arc<Mutex<Connection>>>,
+    text: String,
+    priority: Option<String>,
+    assignee: Option<String>,
+    start_at: Option<String>,
+    end_at: Option<String>,
+    notes: Option<String>,
+) -> Result<i64, String> {
     let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
-    db::todo_add(&conn, &text).map_err(|e| format!("todo_add: {e}"))
+    db::todo_add(
+        &conn,
+        &text,
+        priority.as_deref().unwrap_or("medium"),
+        assignee.as_deref(),
+        start_at.as_deref(),
+        end_at.as_deref(),
+        notes.as_deref(),
+    )
+    .map_err(|e| format!("todo_add: {e}"))
 }
 
+/// Update all editable fields of a todo (text, priority, assignee,
+/// start_at, end_at, notes). Status is NOT changed here — use
+/// `todo_set_status` for that.
 #[tauri::command]
-fn todo_toggle(db: State<'_, Arc<Mutex<Connection>>>, id: i64) -> Result<(), String> {
+fn todo_update(
+    db: State<'_, Arc<Mutex<Connection>>>,
+    id: i64,
+    text: String,
+    priority: Option<String>,
+    assignee: Option<String>,
+    start_at: Option<String>,
+    end_at: Option<String>,
+    notes: Option<String>,
+) -> Result<(), String> {
     let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
-    db::todo_toggle(&conn, id).map_err(|e| format!("todo_toggle: {e}"))
+    db::todo_update(
+        &conn,
+        id,
+        &text,
+        priority.as_deref().unwrap_or("medium"),
+        assignee.as_deref(),
+        start_at.as_deref(),
+        end_at.as_deref(),
+        notes.as_deref(),
+    )
+    .map_err(|e| format!("todo_update: {e}"))
+}
+
+/// Set the status of a todo (pending | in_progress | completed | cancelled).
+#[tauri::command]
+fn todo_set_status(
+    db: State<'_, Arc<Mutex<Connection>>>,
+    id: i64,
+    status: String,
+) -> Result<(), String> {
+    let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+    db::todo_set_status(&conn, id, &status).map_err(|e| format!("todo_set_status: {e}"))
 }
 
 #[tauri::command]
@@ -284,6 +359,32 @@ async fn list_models(provider: String) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Query whether auto-start is currently enabled (the OS registry / macOS
+/// LaunchAgent is the source of truth — not the config.toml file). Called
+/// by SettingsView on mount to initialize the checkbox.
+#[tauri::command]
+fn get_autostart(app: tauri::AppHandle) -> Result<bool, String> {
+    app.autolaunch()
+        .is_enabled()
+        .map_err(|e| format!("autostart is_enabled: {e}"))
+}
+
+/// Enable or disable auto-start. Called by SettingsView when the user
+/// toggles the checkbox. Takes effect immediately (the registry entry is
+/// written/removed right now — no save button needed for this setting).
+#[tauri::command]
+fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    if enabled {
+        app.autolaunch()
+            .enable()
+            .map_err(|e| format!("autostart enable: {e}"))
+    } else {
+        app.autolaunch()
+            .disable()
+            .map_err(|e| format!("autostart disable: {e}"))
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -295,9 +396,17 @@ pub fn run() {
         // (the JS-side `notification` API needs the capability; the
         // Rust path doesn't — it's all in-process).
         .plugin(tauri_plugin_notification::init())
+        // Auto-start on boot. The settings tab toggles this via
+        // `get_autostart` / `set_autostart` commands. On Windows this
+        // writes/removes a `HKCU\…\Run` registry entry.
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            None,
+        ))
         .invoke_handler(tauri::generate_handler![
             set_pet_click_through,
             set_pet_dragging,
+            start_pet_drag,
             open_panel_above_pet,
             // config.rs commands (Task 4 in-session window-state
             // persistence; Task 14 backed them with a real TOML file
@@ -344,7 +453,8 @@ pub fn run() {
             // `?` instead of opening the panel.
             todo_list,
             todo_add,
-            todo_toggle,
+            todo_update,
+            todo_set_status,
             todo_delete,
             reminder_list,
             reminder_add,
@@ -352,6 +462,8 @@ pub fn run() {
             config::settings_get,
             settings_set_with_focus,
             dismiss_pet_alert,
+            get_autostart,
+            set_autostart,
         ])
         .setup(|app| {
             // Default the pet overlay to click-through (pass-through) so the
@@ -373,6 +485,25 @@ pub fn run() {
                 if let Some((x, y)) = window::pet_startup_position(app) {
                     let _ = pet.set_position(tauri::PhysicalPosition::new(x, y));
                 }
+            }
+            // Prevent the panel window from being destroyed when the user
+            // clicks the OS close (X) button — hide it instead so it can be
+            // reopened by clicking the robot or the tray. Without this,
+            // closing the panel destroys the window, and
+            // `get_webview_window("panel")` returns None on subsequent
+            // calls → `open_panel_above_pet` / `show_panel` fail silently
+            // (the bug where "after closing the window, clicking the robot
+            // doesn't show it again" and "tray 设置 no response").
+            if let Some(panel) = app.get_webview_window("panel") {
+                let app_handle = app.app_handle().clone();
+                panel.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        if let Some(p) = app_handle.get_webview_window("panel") {
+                            let _ = p.hide();
+                        }
+                    }
+                });
             }
             // Task 7 + Task 16: manage the PetBrain (state machine +
             // follow-activity throttle + HasSomething auto-clear timer)

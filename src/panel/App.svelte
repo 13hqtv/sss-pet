@@ -18,6 +18,7 @@
 
   import { invoke } from "@tauri-apps/api/core";
   import { getCurrentWindow } from "@tauri-apps/api/window";
+  import { listen } from "@tauri-apps/api/event";
 
   import ChatView from "./views/ChatView.svelte";
   import TodosView from "./views/TodosView.svelte";
@@ -108,6 +109,40 @@
   function switchTab(id: TabId) {
     activeTab = id;
   }
+
+  // Disable the browser context menu (right-click menu) — the panel is
+  // a desktop app, not a web page.
+  $effect(() => {
+    const handler = (e: MouseEvent) => e.preventDefault();
+    window.addEventListener("contextmenu", handler);
+    return () => window.removeEventListener("contextmenu", handler);
+  });
+
+  // Listen for the `switch_tab` event from Rust (e.g. the tray's 设置 menu
+  // item emits this to switch the panel to the settings tab before showing
+  // it, so the user sees the settings view immediately rather than whatever
+  // tab was last active).
+  $effect(() => {
+    let unlisten: (() => void) | null = null;
+    (async () => {
+      try {
+        unlisten = await listen<string>("switch_tab", (e) => {
+          const tab = e.payload as TabId;
+          if (
+            tab === "chat" ||
+            tab === "todos" ||
+            tab === "reminders" ||
+            tab === "settings"
+          ) {
+            activeTab = tab;
+          }
+        });
+      } catch (e) {
+        console.warn("[panel] switch_tab listen failed:", e);
+      }
+    })();
+    return () => unlisten?.();
+  });
 </script>
 
 <main class="panel">

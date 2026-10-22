@@ -284,6 +284,25 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     // doubled "使用工具 工具" fallback. Idempotent like the others
     // (PRAGMA table_info guard → ADD COLUMN skipped if already present).
     add_column_if_missing(conn, "messages", "tool", "TEXT")?;
+
+    // Todos v2: extend the minimal todos table (id, text, done, created_at)
+    // into a full task tracker with status, priority, assignee, time range,
+    // and notes. The `status` column replaces the boolean `done` column:
+    // existing rows with done=1 are migrated to status='completed'. The
+    // `done` column itself is kept (SQLite < 3.35 can't DROP COLUMN, and
+    // leaving it is harmless — we just stop reading it).
+    add_column_if_missing(conn, "todos", "status", "TEXT NOT NULL DEFAULT 'pending'")?;
+    add_column_if_missing(conn, "todos", "priority", "TEXT NOT NULL DEFAULT 'medium'")?;
+    add_column_if_missing(conn, "todos", "assignee", "TEXT")?;
+    add_column_if_missing(conn, "todos", "start_at", "TEXT")?;
+    add_column_if_missing(conn, "todos", "end_at", "TEXT")?;
+    add_column_if_missing(conn, "todos", "notes", "TEXT")?;
+    // One-time data migration: rows that were done=1 (the old boolean)
+    // get status='completed'. Idempotent — only touches rows where
+    // status is still the default 'pending' AND done=1.
+    conn.execute_batch(
+        "UPDATE todos SET status = 'completed' WHERE done = 1 AND status = 'pending';",
+    )?;
     Ok(())
 }
 
@@ -514,20 +533,21 @@ pub fn append_message(conn: &Connection, conv_id: &str, msg: &StoredMessage) -> 
 /// `tool: None` and the frontend's fallback wording handles that.
 pub fn load_messages(conn: &Connection, conv_id: &str) -> rusqlite::Result<Vec<StoredMessage>> {
     let mut stmt = conn.prepare(
-        "SELECT role, content, kind, tool FROM messages WHERE conv_id = ?1 ORDER BY id",
+        "SELECT role, content, kind, tool, created_at FROM messages WHERE conv_id = ?1 ORDER BY id",
     )?;
     let rows = stmt.query_map([conv_id], |row| {
         let role: String = row.get(0)?;
         let content: String = row.get(1)?;
         let kind: Option<String> = row.get(2)?;
         let tool: Option<String> = row.get(3)?;
-        Ok((role, content, kind, tool))
+        let created_at: Option<String> = row.get(4).ok();
+        Ok((role, content, kind, tool, created_at))
     })?;
     let mut out = Vec::new();
     for r in rows {
-        let (role, content, kind, tool) = r?;
+        let (role, content, kind, tool, created_at) = r?;
         let kind = kind.or_else(|| infer_kind_from_role(&role));
-        out.push(StoredMessage { role, content, kind, tool });
+        out.push(StoredMessage { role, content, kind, tool, created_at });
     }
     Ok(out)
 }
@@ -596,6 +616,8 @@ pub fn save_turn_record(
             content: m.content.clone(),
             kind: Some(message_kind_to_name(m.kind)),
             tool: m.tool.clone(),
+            // `created_at` is set by `append_message` internally (now()).
+            created_at: None,
         };
         append_message(&tx, conv_id, &sm)?;
     }
@@ -674,26 +696,42 @@ fn parse_dt(s: &str) -> rusqlite::Result<chrono::DateTime<chrono::Utc>> {
 // Todos (Task 16 todos tab)
 // ===========================================================================
 
-/// One persisted todo row. `done` is `bool` at the Rust boundary, `INTEGER`
-/// (0/1) on disk (SQLite has no native bool).
+/// One persisted todo row. The `status` field replaces the old boolean
+/// `done` — four states: `pending`, `in_progress`, `completed`,
+/// `cancelled`. `priority` is `high` | `medium` | `low`. `assignee`,
+/// `start_at`, `end_at`, `notes` are all optional (NULL on disk). The
+/// `done` column still exists in the table for back-compat but is no
+/// longer read or written.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Todo {
     pub id: i64,
     pub text: String,
-    pub done: bool,
+    pub status: String,
+    pub priority: String,
+    pub assignee: Option<String>,
+    pub start_at: Option<String>,
+    pub end_at: Option<String>,
+    pub notes: Option<String>,
     pub created_at: String,
 }
 
 /// List all todos, oldest-first.
 pub fn todo_list(conn: &Connection) -> rusqlite::Result<Vec<Todo>> {
-    let mut stmt =
-        conn.prepare("SELECT id, text, done, created_at FROM todos ORDER BY id")?;
+    let mut stmt = conn.prepare(
+        "SELECT id, text, status, priority, assignee, start_at, end_at, notes, created_at \
+         FROM todos ORDER BY id",
+    )?;
     let rows = stmt.query_map([], |row| {
         Ok(Todo {
             id: row.get(0)?,
             text: row.get(1)?,
-            done: row.get::<_, i64>(2)? != 0,
-            created_at: row.get(3)?,
+            status: row.get(2)?,
+            priority: row.get(3)?,
+            assignee: row.get(4)?,
+            start_at: row.get(5)?,
+            end_at: row.get(6)?,
+            notes: row.get(7)?,
+            created_at: row.get(8)?,
         })
     })?;
     let mut out = Vec::new();
@@ -703,20 +741,58 @@ pub fn todo_list(conn: &Connection) -> rusqlite::Result<Vec<Todo>> {
     Ok(out)
 }
 
-/// Add a todo. Returns the new row id.
-pub fn todo_add(conn: &Connection, text: &str) -> rusqlite::Result<i64> {
+/// Add a todo with full metadata. Returns the new row id.
+pub fn todo_add(
+    conn: &Connection,
+    text: &str,
+    priority: &str,
+    assignee: Option<&str>,
+    start_at: Option<&str>,
+    end_at: Option<&str>,
+    notes: Option<&str>,
+) -> rusqlite::Result<i64> {
     conn.execute(
-        "INSERT INTO todos (text, done, created_at) VALUES (?1, 0, ?2)",
-        rusqlite::params![text, chrono::Utc::now().to_rfc3339()],
+        "INSERT INTO todos (text, status, priority, assignee, start_at, end_at, notes, created_at) \
+         VALUES (?1, 'pending', ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            text,
+            priority,
+            assignee,
+            start_at,
+            end_at,
+            notes,
+            chrono::Utc::now().to_rfc3339(),
+        ],
     )?;
     Ok(conn.last_insert_rowid())
 }
 
-/// Flip a todo's `done` flag.
-pub fn todo_toggle(conn: &Connection, id: i64) -> rusqlite::Result<()> {
+/// Update all editable fields of a todo (everything except `status` —
+/// use [`todo_set_status`] for that, and `created_at` which is immutable).
+pub fn todo_update(
+    conn: &Connection,
+    id: i64,
+    text: &str,
+    priority: &str,
+    assignee: Option<&str>,
+    start_at: Option<&str>,
+    end_at: Option<&str>,
+    notes: Option<&str>,
+) -> rusqlite::Result<()> {
     conn.execute(
-        "UPDATE todos SET done = CASE done WHEN 0 THEN 1 ELSE 0 END WHERE id = ?1",
-        rusqlite::params![id],
+        "UPDATE todos SET text = ?2, priority = ?3, assignee = ?4, start_at = ?5, end_at = ?6, notes = ?7 \
+         WHERE id = ?1",
+        rusqlite::params![id, text, priority, assignee, start_at, end_at, notes],
+    )?;
+    Ok(())
+}
+
+/// Set the status of a todo (pending | in_progress | completed | cancelled).
+/// Replaces the old `todo_toggle` which flipped a boolean `done` flag.
+pub fn todo_set_status(conn: &Connection, id: i64, status: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE todos SET status = ?2 WHERE id = ?1",
+        rusqlite::params![id, status],
     )?;
     Ok(())
 }
@@ -915,9 +991,9 @@ mod tests {
         };
         save_conversation(&conn, &conv).expect("save");
         let msgs = vec![
-            StoredMessage { role: "user".into(), content: "hello".into(), kind: None, tool: None },
-            StoredMessage { role: "assistant".into(), content: "hi".into(), kind: None, tool: None },
-            StoredMessage { role: "tool".into(), content: "{\"result\":42}".into(), kind: None, tool: None },
+            StoredMessage { role: "user".into(), content: "hello".into(), kind: None, tool: None, created_at: None },
+            StoredMessage { role: "assistant".into(), content: "hi".into(), kind: None, tool: None, created_at: None },
+            StoredMessage { role: "tool".into(), content: "{\"result\":42}".into(), kind: None, tool: None, created_at: None },
         ];
         for m in &msgs {
             append_message(&conn, &conv.id, m).expect("append");
@@ -1166,28 +1242,157 @@ mod tests {
     fn todo_crud_round_trip() {
         let (_tmp, conn) = fresh_db();
         assert!(todo_list(&conn).expect("list").is_empty());
-        let id1 = todo_add(&conn, "buy milk").expect("add1");
-        let id2 = todo_add(&conn, "walk dog").expect("add2");
+
+        // Add two todos with full metadata.
+        let id1 = todo_add(
+            &conn,
+            "buy milk",
+            "high",
+            Some("alice"),
+            None,
+            Some("2026-10-22T18:00:00Z"),
+            Some("2L organic"),
+        )
+        .expect("add1");
+        let id2 = todo_add(
+            &conn,
+            "walk dog",
+            "low",
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("add2");
         assert!(id1 < id2, "ids must increase");
+
         let list = todo_list(&conn).expect("list");
         assert_eq!(list.len(), 2);
-        assert!(!list[0].done);
-        assert!(!list[1].done);
-        // Toggle the first.
-        todo_toggle(&conn, id1).expect("toggle");
+
+        // Defaults: pending status, priority + assignee + times + notes
+        // round-trip through SELECT.
+        let t1 = &list[0];
+        assert_eq!(t1.id, id1);
+        assert_eq!(t1.text, "buy milk");
+        assert_eq!(t1.status, "pending");
+        assert_eq!(t1.priority, "high");
+        assert_eq!(t1.assignee.as_deref(), Some("alice"));
+        assert!(t1.start_at.is_none());
+        assert_eq!(t1.end_at.as_deref(), Some("2026-10-22T18:00:00Z"));
+        assert_eq!(t1.notes.as_deref(), Some("2L organic"));
+
+        let t2 = &list[1];
+        assert_eq!(t2.priority, "low");
+        assert!(t2.assignee.is_none());
+        assert!(t2.notes.is_none());
+
+        // Set status: pending → in_progress → completed.
+        todo_set_status(&conn, id1, "in_progress").expect("set in_progress");
         let list = todo_list(&conn).expect("list2");
         let first = list.iter().find(|t| t.id == id1).expect("found1");
-        assert!(first.done, "first todo now done");
-        // Toggle back.
-        todo_toggle(&conn, id1).expect("toggle2");
+        assert_eq!(first.status, "in_progress");
+
+        todo_set_status(&conn, id1, "completed").expect("set completed");
         let list = todo_list(&conn).expect("list3");
         let first = list.iter().find(|t| t.id == id1).expect("found2");
-        assert!(!first.done, "first todo back to not-done");
+        assert_eq!(first.status, "completed");
+
+        // Update all editable fields.
+        todo_update(
+            &conn,
+            id1,
+            "buy oat milk",
+            "medium",
+            Some("bob"),
+            Some("2026-10-21T09:00:00Z"),
+            Some("2026-10-23T20:00:00Z"),
+            Some("updated note"),
+        )
+        .expect("update");
+        let list = todo_list(&conn).expect("list4");
+        let first = list.iter().find(|t| t.id == id1).expect("found3");
+        assert_eq!(first.text, "buy oat milk");
+        assert_eq!(first.priority, "medium");
+        assert_eq!(first.assignee.as_deref(), Some("bob"));
+        assert_eq!(first.start_at.as_deref(), Some("2026-10-21T09:00:00Z"));
+        assert_eq!(first.end_at.as_deref(), Some("2026-10-23T20:00:00Z"));
+        assert_eq!(first.notes.as_deref(), Some("updated note"));
+        // Status is NOT changed by todo_update.
+        assert_eq!(first.status, "completed");
+
         // Delete the second.
         todo_delete(&conn, id2).expect("delete");
-        let list = todo_list(&conn).expect("list4");
+        let list = todo_list(&conn).expect("list5");
         assert_eq!(list.len(), 1);
         assert!(list.iter().all(|t| t.id != id2));
+    }
+
+    /// Migration: a pre-v2 todo row with done=1 (the old boolean) is
+    /// migrated to status='completed' by the `migrate` function's
+    /// `UPDATE todos SET status = 'completed' WHERE done = 1` step.
+    /// A row with done=0 stays 'pending' (the column default).
+    #[test]
+    fn todo_migration_done_to_status() {
+        let (_tmp, conn) = fresh_db();
+        // fresh_db already ran migrate once. Insert a row the old way
+        // (done column still exists) to simulate pre-v2 data.
+        conn.execute(
+            "INSERT INTO todos (text, done, created_at) VALUES (?1, 1, ?2)",
+            rusqlite::params!["legacy done task", "2026-01-01T00:00:00Z"],
+        )
+        .expect("insert legacy done row");
+        conn.execute(
+            "INSERT INTO todos (text, done, created_at) VALUES (?1, 0, ?2)",
+            rusqlite::params!["legacy not-done task", "2026-01-02T00:00:00Z"],
+        )
+        .expect("insert legacy not-done row");
+
+        // Re-run migrate — the done→status UPDATE is idempotent.
+        migrate(&conn).expect("migrate");
+
+        let list = todo_list(&conn).expect("list");
+        assert_eq!(list.len(), 2, "two rows total");
+        // The done=1 row → status='completed'.
+        let done_row = list
+            .iter()
+            .find(|t| t.text == "legacy done task")
+            .expect("found done row");
+        assert_eq!(done_row.status, "completed");
+        // The done=0 row → status='pending' (the column default).
+        let notdone_row = list
+            .iter()
+            .find(|t| t.text == "legacy not-done task")
+            .expect("found not-done row");
+        assert_eq!(notdone_row.status, "pending");
+        // New columns default correctly on legacy rows.
+        assert_eq!(notdone_row.priority, "medium");
+        assert!(notdone_row.assignee.is_none());
+        assert!(notdone_row.notes.is_none());
+    }
+
+    /// The migration adds all six new columns to the `todos` table.
+    #[test]
+    fn migrate_adds_todo_v2_columns() {
+        let (_tmp, conn) = fresh_db();
+        let cols = column_names(&conn, "todos");
+        for expected in [
+            "status",
+            "priority",
+            "assignee",
+            "start_at",
+            "end_at",
+            "notes",
+        ] {
+            assert!(
+                cols.contains(&expected.to_string()),
+                "todos.{expected} missing: got {cols:?}"
+            );
+        }
+        // The old `done` column is still present (not dropped).
+        assert!(
+            cols.contains(&"done".to_string()),
+            "todos.done should still exist (kept for back-compat): got {cols:?}"
+        );
     }
 
     // -- reminders CRUD --

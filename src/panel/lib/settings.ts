@@ -8,13 +8,22 @@
 import { invoke } from "@tauri-apps/api/core";
 
 // ---------------------------------------------------------------------------
-// Todos (db::Todo: id, text, done, created_at)
+// Todos (db::Todo: id, text, status, priority, assignee, start_at,
+//        end_at, notes, created_at)
 // ---------------------------------------------------------------------------
+
+export type TodoStatus = "pending" | "in_progress" | "completed" | "cancelled";
+export type TodoPriority = "high" | "medium" | "low";
 
 export interface Todo {
   id: number;
   text: string;
-  done: boolean;
+  status: TodoStatus;
+  priority: TodoPriority;
+  assignee: string | null;
+  start_at: string | null;
+  end_at: string | null;
+  notes: string | null;
   created_at: string;
 }
 
@@ -22,12 +31,46 @@ export async function listTodos(): Promise<Todo[]> {
   return invoke<Todo[]>("todo_list");
 }
 
-export async function addTodo(text: string): Promise<number> {
-  return invoke<number>("todo_add", { text });
+export async function addTodo(params: {
+  text: string;
+  priority?: TodoPriority;
+  assignee?: string | null;
+  startAt?: string | null;
+  endAt?: string | null;
+  notes?: string | null;
+}): Promise<number> {
+  return invoke<number>("todo_add", {
+    text: params.text,
+    priority: params.priority ?? null,
+    assignee: params.assignee ?? null,
+    startAt: params.startAt ?? null,
+    endAt: params.endAt ?? null,
+    notes: params.notes ?? null,
+  });
 }
 
-export async function toggleTodo(id: number): Promise<void> {
-  await invoke("todo_toggle", { id });
+export async function updateTodo(params: {
+  id: number;
+  text: string;
+  priority?: TodoPriority;
+  assignee?: string | null;
+  startAt?: string | null;
+  endAt?: string | null;
+  notes?: string | null;
+}): Promise<void> {
+  await invoke("todo_update", {
+    id: params.id,
+    text: params.text,
+    priority: params.priority ?? null,
+    assignee: params.assignee ?? null,
+    startAt: params.startAt ?? null,
+    endAt: params.endAt ?? null,
+    notes: params.notes ?? null,
+  });
+}
+
+export async function setTodoStatus(id: number, status: TodoStatus): Promise<void> {
+  await invoke("todo_set_status", { id, status });
 }
 
 export async function deleteTodo(id: number): Promise<void> {
@@ -83,6 +126,9 @@ export interface Settings {
    * Mirrors `config::ProvidersCfg`. `default_model: null` = "use the
    * agent's own default model". */
   providers: ProvidersCfg;
+  /** Roster of responsible persons for the 代办 tab. Configured as
+   * comma-separated text in SettingsView. */
+  responsible_persons: string[];
 }
 
 /** Mirrors `config::ProviderCfg` — the per-agent config (Task 5:
@@ -128,4 +174,20 @@ export async function saveSettings(settings: Settings): Promise<void> {
 
 export async function dismissPetAlert(): Promise<void> {
   await invoke("dismiss_pet_alert");
+}
+
+// ---------------------------------------------------------------------------
+// Auto-start (tauri-plugin-autostart — OS registry is the source of truth)
+// ---------------------------------------------------------------------------
+
+/** Query whether auto-start is enabled. The OS registry is the source of
+ * truth, not config.toml. Called by SettingsView on mount. */
+export async function getAutostart(): Promise<boolean> {
+  return invoke<boolean>("get_autostart");
+}
+
+/** Enable or disable auto-start. Takes effect immediately — no save button
+ * needed for this setting. */
+export async function setAutostart(enabled: boolean): Promise<void> {
+  await invoke("set_autostart", { enabled });
 }

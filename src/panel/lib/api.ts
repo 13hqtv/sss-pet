@@ -63,6 +63,9 @@ export interface StoredMessage {
   content: string;
   kind?: string | null;
   tool?: string | null;
+  /** RFC3339 UTC timestamp (set by the backend at persist time).
+   * The frontend converts this to local `YYYY-MM-DD HH:MM:SS` for display. */
+  created_at?: string | null;
 }
 
 /** Mirrors `agent::MessageKind`. The streamed Message carries this tag

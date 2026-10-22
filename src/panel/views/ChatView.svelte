@@ -66,6 +66,30 @@
     content: string;
     kind?: MessageKind;
     tool?: string | null;
+    timestamp?: string | null;
+  }
+
+  // Format the current local time as YYYY-MM-DD HH:MM:SS (the format the
+  // user requested: 2026-10-22 15:45:32). Used for live-streamed messages
+  // (user sends + agent responds) — the timestamp is set when the message
+  // arrives at the frontend, which is close enough to when it was actually
+  // sent/received for display purposes.
+  function nowTimestamp(): string {
+    const d = new Date();
+    const pad = (n: number) => n.toString().padStart(2, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+
+  // Convert an RFC3339 UTC timestamp (from the db) to local YYYY-MM-DD
+  // HH:MM:SS for display. Returns null if the input is missing or
+  // unparseable (the history row predates the created_at column, or the
+  // stored value is malformed).
+  function formatTimestamp(rfc3339: string | null | undefined): string | null {
+    if (!rfc3339) return null;
+    const d = new Date(rfc3339);
+    if (isNaN(d.getTime())) return null;
+    const pad = (n: number) => n.toString().padStart(2, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
   }
 
   const PROVIDERS: Provider[] = ["claude", "codex", "opencode"];
@@ -209,6 +233,10 @@
           // null/undefined for pre-fix rows + non-tool kinds; the chip
           // fallback handles those.
           tool: m.tool ?? null,
+          // Convert the persisted RFC3339 UTC timestamp to local
+          // YYYY-MM-DD HH:MM:SS for display. null for pre-created_at
+          // rows (the formatTimestamp helper handles gracefully).
+          timestamp: formatTimestamp(m.created_at),
         }));
         liveBuffers.set(convId, [...messages]);
       }
@@ -358,6 +386,7 @@
       role: "user",
       content: prompt,
       kind: "Text",
+      timestamp: nowTimestamp(),
     };
     messages = [...messages, userMsg];
     liveBuffers.set(convId, [...(liveBuffers.get(convId) ?? []), userMsg]);
@@ -392,6 +421,7 @@
       // rows ALSO carry `tool` now (Task 6 fix-round-1 persisted it
       // — the history-load map passes `m.tool`); null → "（未知）".
       tool: message.tool,
+      timestamp: nowTimestamp(),
     };
     // Append to the conv's live buffer.
     const buf = liveBuffers.get(convId) ?? [];
@@ -425,6 +455,7 @@
         role: "assistant",
         content: `本轮出错: ${detail}`,
         kind: "Error",
+        timestamp: nowTimestamp(),
       };
       const buf = liveBuffers.get(convId) ?? [];
       buf.push(errBubble);
@@ -448,6 +479,7 @@
       role: "system",
       content: message,
       kind: "Status",
+      timestamp: nowTimestamp(),
     };
     const buf = liveBuffers.get(convId) ?? [];
     buf.push(errBubble);
@@ -474,18 +506,48 @@
     };
   });
 
-  // Keyboard: Ctrl/Cmd+Enter sends.
+  // Keyboard: Enter sends; Shift+Enter or Ctrl/Cmd+Enter inserts a newline
+  // (conventional chat-composer behavior — Enter alone is the primary send
+  // gesture, multi-line input needs an explicit modifier).
   function onKeydown(e: KeyboardEvent) {
-    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+    if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
       e.preventDefault();
       void send();
     }
+    // Ctrl/Cmd+Enter or Shift+Enter → fall through (textarea inserts a newline)
   }
 
   // Derived: is the active conversation currently streaming?
   let isStreaming = $derived(
     activeConvId !== null && streamingConvIds.has(activeConvId),
   );
+
+  // Live status label for the streaming indicator — derived from the latest
+  // streamed message kind, similar to multica's TaskStatusPill. Shows what
+  // the agent is doing RIGHT NOW (thinking, using a tool, generating text)
+  // rather than a generic "生成中…". Falls back to "处理中…" when no
+  // messages have arrived yet (the agent is still initializing).
+  let streamingLabel = $derived.by(() => {
+    if (!isStreaming) return "";
+    const last = messages[messages.length - 1];
+    if (!last) return "连接中…";
+    switch (last.kind) {
+      case "Thinking":
+        return "思考中…";
+      case "ToolUse":
+        return last.tool ? `使用 ${last.tool}…` : "使用工具…";
+      case "ToolResult":
+        return "处理结果中…";
+      case "Text":
+        return "生成中…";
+      case "Status":
+        return last.content || "处理中…";
+      case "Error":
+        return "出错了";
+      default:
+        return "处理中…";
+    }
+  });
 
   // The active conversation object (for the read-only provider/model/cwd
   // header — the conversation's agent triple is fixed at creation, the
@@ -548,7 +610,7 @@
           <span class="hdr-chip model muted">默认模型</span>
         {/if}
         <span class="hdr-chip cwd" title={activeConv.cwd}>{activeConv.cwd}</span>
-        {#if isStreaming}<span class="streaming">生成中…</span>{/if}
+        {#if isStreaming}<span class="streaming">{streamingLabel}</span>{/if}
       </div>
       <div class="messages" bind:this={scrollEl}>
         {#each messages as m (m)}
@@ -630,6 +692,7 @@
               <div class="content">
                 {#if m.role === "user"}{m.content}{:else}{@html renderMarkdown(m.content)}{/if}
               </div>
+              {#if m.timestamp}<span class="msg-time">{m.timestamp}</span>{/if}
             </div>
           {/if}
         {/each}
@@ -638,7 +701,7 @@
         <textarea
           bind:value={draft}
           onkeydown={onKeydown}
-          placeholder="输入消息… (Ctrl+Enter 发送)"
+          placeholder="输入消息… (Enter 发送, Shift+Enter 换行)"
           rows="3"
         ></textarea>
         <button onclick={send} disabled={!draft.trim() || isStreaming}>
@@ -865,7 +928,7 @@
   }
 
   .conv-title {
-    font-size: 0.85rem;
+    font-size: 0.8rem;
     color: var(--ink);
     white-space: nowrap;
     overflow: hidden;
@@ -919,7 +982,7 @@
   }
 
   .hdr-chip {
-    font-size: 0.72rem;
+    font-size: 0.68rem;
     padding: 2px var(--space-2);
     border-radius: var(--r-chip);
     background: var(--bg);
@@ -944,7 +1007,7 @@
   }
 
   .streaming {
-    font-size: 0.75rem;
+    font-size: 0.7rem;
     color: var(--acc);
     font-style: italic;
     margin-left: auto;
@@ -970,7 +1033,7 @@
     max-width: 80%;
     padding: var(--space-2) var(--space-3);
     border-radius: var(--r-bubble);
-    font-size: 0.85rem;
+    font-size: 0.8rem;
     line-height: 1.5;
     word-break: break-word;
     display: flex;
@@ -979,10 +1042,22 @@
   }
 
   .bubble .role {
-    font-size: 0.65rem;
+    font-size: 0.6rem;
     text-transform: uppercase;
     color: var(--mut);
     letter-spacing: 0.05em;
+  }
+
+  /* Timestamp line below the message content — small, muted, mono font.
+   * Shows the local time the message was sent (user) or received (agent)
+   * in YYYY-MM-DD HH:MM:SS format. */
+  .msg-time {
+    font-size: 0.62rem;
+    color: currentColor;
+    font-family: var(--mono);
+    opacity: 0.55;
+    margin-top: 2px;
+    align-self: flex-end;
   }
 
   .bubble[data-role="user"] {
@@ -1008,7 +1083,7 @@
     background: var(--surface);
     color: var(--mut);
     font-family: var(--mono);
-    font-size: 0.78rem;
+    font-size: 0.72rem;
     border: 1px solid var(--bd);
   }
 
@@ -1017,7 +1092,7 @@
     background: transparent;
     color: var(--mut);
     font-style: italic;
-    font-size: 0.78rem;
+    font-size: 0.72rem;
   }
 
   /* Error: red treatment via the --err/--err-soft tokens. Source order
@@ -1049,14 +1124,14 @@
     border: 1px solid var(--bd);
     border-radius: var(--r-bubble);
     background: var(--surface);
-    font-size: 0.8rem;
+    font-size: 0.75rem;
     overflow: hidden;
   }
 
   .block > summary {
     cursor: pointer;
     padding: var(--space-1) var(--space-3);
-    font-size: 0.78rem;
+    font-size: 0.72rem;
     font-weight: 500;
     user-select: none;
     list-style: none;
@@ -1089,7 +1164,7 @@
     white-space: pre-wrap;
     word-break: break-word;
     font-family: var(--mono);
-    font-size: 0.75rem;
+    font-size: 0.7rem;
     line-height: 1.4;
     color: var(--ink);
     /* Cap the height so a huge tool output doesn't swallow the whole
@@ -1153,7 +1228,7 @@
   /* Status: a small dimmed inline line (not a full bubble). */
   .status-line {
     align-self: center;
-    font-size: 0.72rem;
+    font-size: 0.68rem;
     color: var(--mut);
     font-style: italic;
     padding: 2px var(--space-2);
@@ -1187,7 +1262,7 @@
     flex: 1;
     resize: vertical;
     font-family: inherit;
-    font-size: 0.85rem;
+    font-size: 0.8rem;
     padding: var(--space-2);
     border: 1px solid var(--bd);
     border-radius: var(--r-bubble);
@@ -1207,7 +1282,7 @@
 
   .composer button {
     padding: var(--space-2) var(--space-4);
-    font-size: 0.85rem;
+    font-size: 0.8rem;
     cursor: pointer;
     background: var(--acc);
     color: #fff;

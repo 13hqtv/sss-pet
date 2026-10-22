@@ -70,6 +70,11 @@ pub struct StoredMessage {
     pub content: String,
     pub kind: Option<String>,
     pub tool: Option<String>,
+    /// RFC3339 UTC timestamp (set by `db::append_message` at persist time).
+    /// `None` only if the column was somehow not readable (defensive — the
+    /// column is `NOT NULL` in the schema). The frontend converts this to
+    /// local time `YYYY-MM-DD HH:MM:SS` for display.
+    pub created_at: Option<String>,
 }
 
 /// One persisted conversation thread. `id` is the desktop-pet's own
@@ -485,12 +490,14 @@ mod tests {
                 content: "what is 2+2".into(),
                 kind: None,
                 tool: None,
+                created_at: None,
             },
             StoredMessage {
                 role: "assistant".into(),
                 content: "4".into(),
                 kind: None,
                 tool: None,
+                created_at: None,
             },
         ]
     }

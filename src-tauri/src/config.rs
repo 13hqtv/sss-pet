@@ -71,6 +71,13 @@ pub struct Config {
     /// the project dir the agent runs in (e.g. `C:\code\my-project`).
     #[serde(default)]
     pub working_dir: Option<String>,
+    /// Roster of responsible persons for the 代办 (todos) tab. The user
+    /// configures this as a comma-separated string in SettingsView; the
+    /// TodosView's assignee dropdown reads from this list. Empty by
+    /// default (first run). `#[serde(default)]` keeps old config files
+    /// loading (the field is absent in pre-v2 configs).
+    #[serde(default)]
+    pub responsible_persons: Vec<String>,
 }
 
 /// Default for `Config::default_provider`. Kept as a function so
@@ -92,6 +99,7 @@ impl Default for Config {
             panel_rect: None,
             default_provider: default_provider(),
             working_dir: None,
+            responsible_persons: Vec::new(),
         }
     }
 }
@@ -392,6 +400,12 @@ pub struct Settings {
     /// first-run / unprobed state.
     #[serde(default)]
     pub providers: ProvidersCfg,
+    /// Roster of responsible persons for the 代办 tab. Configured as
+    /// comma-separated text in SettingsView; the TodosView's assignee
+    /// dropdown reads from this list. `#[serde(default)]` keeps old
+    /// configs loading (empty list when the field is absent).
+    #[serde(default)]
+    pub responsible_persons: Vec<String>,
 }
 
 impl From<&Config> for Settings {
@@ -403,6 +417,7 @@ impl From<&Config> for Settings {
             default_provider: c.default_provider.clone(),
             working_dir: c.working_dir.clone(),
             providers: c.providers.clone(),
+            responsible_persons: c.responsible_persons.clone(),
         }
     }
 }
@@ -438,6 +453,7 @@ pub fn settings_set(settings: Settings) -> Result<(), String> {
     // SettingsView (probed via `list_models(agent)` + saved here so
     // the new-conv dialog pre-fills the model from this default).
     cfg.providers = settings.providers;
+    cfg.responsible_persons = settings.responsible_persons;
     save(&cfg).map_err(|e| format!("settings_set save failed: {e}"))
 }
 
@@ -488,6 +504,7 @@ mod tests {
         assert!(cfg.focus.window.is_none());
         assert!(cfg.pet_pos.is_none());
         assert!(cfg.panel_rect.is_none());
+        assert!(cfg.responsible_persons.is_empty(), "empty roster by default");
     }
 
     // -- round-trip --
@@ -507,6 +524,7 @@ mod tests {
             panel_rect: Some((50, 60, 380, 560)),
             default_provider: "codex".into(),
             working_dir: Some("C:\\code\\proj".into()),
+            responsible_persons: vec!["alice".into(), "bob".into()],
         };
         save(&cfg).expect("save");
         let loaded = load();
@@ -526,6 +544,7 @@ mod tests {
             panel_rect: None,
             default_provider: "claude".into(),
             working_dir: None,
+            responsible_persons: Vec::new(),
         };
         save(&cfg).expect("save");
         assert_eq!(load(), cfg);

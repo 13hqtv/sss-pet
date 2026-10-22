@@ -59,6 +59,13 @@
    * hardcoded hex anywhere in the components. */
   --err: #b91c1c;
   --err-soft: #fef2f2;
+  /* Status semantic colors: green for completed, amber for in-progress /
+   * overdue. These are used by the 代办 (todos) tab's card backgrounds
+   * and priority badges — the chat view doesn't use them. */
+  --ok: #15803d;
+  --ok-soft: #f0fdf4;
+  --warn: #b45309;
+  --warn-soft: #fffbeb;
   --shadow: 0 6px 24px rgba(20, 20, 30, 0.07),
     0 1px 3px rgba(20, 20, 30, 0.04);
 }
@@ -83,6 +90,10 @@
   --code-ink: #d4d4d8;
   --err: #f87171;
   --err-soft: #2a1212;
+  --ok: #4ade80;
+  --ok-soft: #0a2818;
+  --warn: #fbbf24;
+  --warn-soft: #2a1f0a;
   --shadow: 0 6px 24px rgba(0, 0, 0, 0.45),
     0 1px 3px rgba(0, 0, 0, 0.3);
 }
@@ -105,6 +116,10 @@
     --code-ink: #d4d4d8;
     --err: #f87171;
     --err-soft: #2a1212;
+    --ok: #4ade80;
+    --ok-soft: #0a2818;
+    --warn: #fbbf24;
+    --warn-soft: #2a1f0a;
     --shadow: 0 6px 24px rgba(0, 0, 0, 0.45),
       0 1px 3px rgba(0, 0, 0, 0.3);
   }
@@ -336,7 +351,7 @@ body {
 .bubble.md table {
   border-collapse: collapse;
   margin: 0 0 var(--space-2);
-  font-size: 0.85rem;
+  font-size: 0.75rem;
 }
 .bubble.md table:last-child {
   margin-bottom: 0;

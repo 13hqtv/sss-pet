@@ -16,7 +16,7 @@
 
 use tauri::menu::{MenuBuilder, MenuEvent};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Runtime};
+use tauri::{AppHandle, Emitter, Runtime};
 
 use crate::window;
 
@@ -100,6 +100,9 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: MenuEvent) {
             if let Err(e) = window::show_panel(app) {
                 eprintln!("[tray] 设置 failed: {e}");
             }
+            // Switch the panel to the 设置 tab so the user sees the
+            // settings view immediately (not whatever tab was last active).
+            let _ = app.emit_to("panel", "switch_tab", "settings");
         }
         MENU_ID_QUIT => {
             // 退出 → exit the app. `exit(0)` runs the normal Tauri

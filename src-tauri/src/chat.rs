@@ -132,6 +132,8 @@ pub async fn run_chat_turn(
             kind: Some("Text".into()),
             // The user's prompt carries no tool — `None` (non-tool kind).
             tool: None,
+            // `created_at` is set by `append_message` internally (now()).
+            created_at: None,
         };
         db::append_message(&conn, conv_id, &user_msg)
             .map_err(|e| format!("append user msg: {e}"))?;
@@ -422,15 +424,17 @@ pub async fn chat_send(
     let cfg = BackendConfig::default();
     let backend =
         agent::new(&provider, cfg).map_err(|e| format!("agent::new({provider}): {e}"))?;
-    // The emit closure: wraps `app.emit(event, payload)`. Captures the
-    // AppHandle by value (it's Clone + Send + Sync + 'static); the
-    // closure is `Fn` (AppHandle::emit takes &self). Best-effort —
-    // `emit` returns Err if there's no webview listener (panel hidden),
+    // The emit closure: wraps `app_handle.emit_to("panel", event, payload)`
+    // to target the panel window specifically. This is more reliable than
+    // `emit` (broadcast to all windows) — the panel is the only listener
+    // for chat events, and targeting it explicitly avoids any edge case
+    // where a broadcast might not reach a specific window. Best-effort —
+    // `emit_to` returns Err if the panel window is hidden (no listener),
     // we swallow that (the message is buffered in the TurnRecord +
     // persisted regardless — Review Focus #3).
     let app_handle = app.clone();
     let emit = move |event: &str, payload: Value| {
-        let _ = app_handle.emit(event, payload);
+        let _ = app_handle.emit_to("panel", event, payload);
     };
     // The managed State<'_, Arc<Mutex<Connection>>> only lives as long
     // as the command call; clone the Arc out so the spawn (which

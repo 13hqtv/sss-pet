@@ -28,6 +28,9 @@ tauri-plugin-opener = "2"
 # the app needing to do its own AUMID registration. Used by
 # `notify::toast` (a thin wrapper the reminder scheduler calls).
 tauri-plugin-notification = "2"
+# Auto-start on boot (Windows registry, macOS LaunchAgent). The settings
+# tab toggles this via `get_autostart` / `set_autostart` commands.
+tauri-plugin-autostart = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Cross-platform global cursor query. Used by window.rs's click-through poller

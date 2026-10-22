@@ -6,3 +6,5 @@ src-tauri/target
 # opencode runtime artifacts (session snapshots etc.) created when the
 # opencode backend runs against this repo — never part of the source.
 .omo/
+# ZCode IDE workspace state
+.zcode/
