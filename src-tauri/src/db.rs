@@ -227,8 +227,13 @@ pub fn open() -> rusqlite::Result<Connection> {
     Connection::open(path)
 }
 
-/// Create all five tables + the messages index if they don't exist.
-/// Idempotent (`CREATE TABLE IF NOT EXISTS`).
+/// Create all five tables + the messages index if they don't exist, then
+/// idempotently add the Task 1 columns (`conversations.model` /
+/// `conversations.cwd` / `messages.kind`). Idempotent throughout —
+/// `CREATE TABLE IF NOT EXISTS` for the tables, and the `ALTER TABLE …
+/// ADD COLUMN` statements are guarded by a `PRAGMA table_info` check so
+/// re-running `migrate` on an already-migrated db is a no-op (the
+/// `ADD COLUMN` would otherwise error with "duplicate column name").
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS conversations (
@@ -263,7 +268,63 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             state TEXT NOT NULL,
             at TEXT NOT NULL
         );",
-    )
+    )?;
+    // Task 1: idempotent column adds. SQLite's `ALTER TABLE … ADD COLUMN`
+    // errors on a pre-existing column ("duplicate column name"), so guard
+    // each with a `PRAGMA table_info` lookup first. The default for `cwd`
+    // is `'.'` (matches `ExecOptions`'s pre-Task-1 `cwd: PathBuf::from(".")`
+    // placeholder in `resume_or_replay`) so old conversation rows — which
+    // predate the column — backfill to the process's cwd rather than NULL
+    // (the column is NOT NULL).
+    add_column_if_missing(conn, "conversations", "model", "TEXT")?;
+    add_column_if_missing(conn, "conversations", "cwd", "TEXT NOT NULL DEFAULT '.'")?;
+    add_column_if_missing(conn, "messages", "kind", "TEXT")?;
+    Ok(())
+}
+
+/// Add a column to `table` if (and only if) it's not already present —
+/// the idempotency guard for [`migrate`]'s `ALTER TABLE … ADD COLUMN`
+/// statements. `def` is the full column definition after the name
+/// (e.g. `"TEXT"`, `"TEXT NOT NULL DEFAULT '.'"`). Returns `Ok(())`
+/// whether the column was added or already present.
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    def: &str,
+) -> rusqlite::Result<()> {
+    if has_column(conn, table, column)? {
+        return Ok(());
+    }
+    // `def` and `column` are call-site string literals (not user input),
+    // so format!-interpolation is safe here.
+    let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {def};");
+    match conn.execute_batch(&sql) {
+        Ok(()) => Ok(()),
+        // A race between the `has_column` check and the `ALTER` (two
+        // `migrate` calls on the same db in two processes) can land
+        // here with a "duplicate column name" error. Re-check and
+        // swallow it if the column is now present — idempotent. (The
+        // error binding is intentionally unused: if the column IS now
+        // present we discard the error; if not, the original error is
+        // returned via the catch-all arm below.)
+        Err(_) if has_column(conn, table, column).unwrap_or(false) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// True iff `table` has a column named `column`. Uses `PRAGMA
+/// table_info` (the name column is index 1).
+fn has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let sql = format!("PRAGMA table_info({table})");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+    for r in rows {
+        if r? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 // ===========================================================================
@@ -271,11 +332,14 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
 // ===========================================================================
 
 /// Insert (or upsert on `id` conflict) a [`Conversation`] row. Round-trips
-/// `created_at` as an RFC3339 string (chrono).
+/// `created_at` as an RFC3339 string (chrono). Task 1: also stores the
+/// conversation's immutable `model` + `cwd` (set at creation by
+/// [`new_conversation`], never updated thereafter — the design's "定了不
+/// 改" ruling — so the UPSERT's `DO UPDATE` arm does NOT touch them).
 pub fn save_conversation(conn: &Connection, conv: &Conversation) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO conversations (id, provider, session_id, title, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)
+        "INSERT INTO conversations (id, provider, session_id, title, created_at, model, cwd)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(id) DO UPDATE SET
             provider = excluded.provider,
             session_id = excluded.session_id,
@@ -287,15 +351,60 @@ pub fn save_conversation(conn: &Connection, conv: &Conversation) -> rusqlite::Re
             conv.session_id,
             conv.title,
             conv.created_at.to_rfc3339(),
+            conv.model,
+            conv.cwd,
         ],
     )?;
     Ok(())
 }
 
-/// Load one conversation by id, or `None` if no such row.
+/// Create a fresh [`Conversation`] row and persist it: `id` = a fresh
+/// uuid v4, `provider` + `model` + `cwd` from the caller, `session_id =
+/// None` (the agent has no native session yet — the first turn either
+/// starts one or replays), `title = "新对话"`, `created_at = now`.
+/// Returns the new [`Conversation`] (with the assigned id + timestamp).
+///
+/// Task 1 helper — the design's "改动 1" ruling is that a conversation's
+/// `agent + model + cwd` triple is fixed at creation and never changes.
+/// This is the single construction site for that triple; the chat
+/// command (`chat::new_conversation`) delegates here so the uuid +
+/// default-title + persist logic lives in one place.
+///
+/// **Signature note:** the brief lists `new_conversation(provider, model,
+/// cwd) -> Conversation` (no connection arg). The implemented signature
+/// takes a `&Connection` first — matching every other helper in this
+/// module (`save_conversation(conn, …)`, `load_conversation(conn, …)`,
+/// …) AND the chat command's managed `Arc<Mutex<Connection>>` (single
+/// connection, serialized writes). A no-arg variant that called `open()`
+/// internally would bypass that serialization and, in tests, miss the
+/// thread-local path override (the `fresh_db()` guard drops before the
+/// call). Returns `rusqlite::Result<Conversation>` (not a bare
+/// `Conversation`) because [`save_conversation`] is fallible I/O.
+pub fn new_conversation(
+    conn: &Connection,
+    provider: &str,
+    model: Option<String>,
+    cwd: &str,
+) -> rusqlite::Result<Conversation> {
+    let conv = Conversation {
+        id: uuid::Uuid::new_v4().to_string(),
+        provider: provider.to_string(),
+        session_id: None,
+        title: "新对话".to_string(),
+        created_at: chrono::Utc::now(),
+        model,
+        cwd: cwd.to_string(),
+    };
+    save_conversation(conn, &conv)?;
+    Ok(conv)
+}
+
+/// Load one conversation by id, or `None` if no such row. Task 1: also
+/// reads the immutable `model` + `cwd` columns.
 pub fn load_conversation(conn: &Connection, id: &str) -> rusqlite::Result<Option<Conversation>> {
     let row = conn.query_row(
-        "SELECT id, provider, session_id, title, created_at FROM conversations WHERE id = ?1",
+        "SELECT id, provider, session_id, title, created_at, model, cwd \
+         FROM conversations WHERE id = ?1",
         [id],
         |row| {
             Ok((
@@ -304,11 +413,13 @@ pub fn load_conversation(conn: &Connection, id: &str) -> rusqlite::Result<Option
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, String>(6)?,
             ))
         },
     );
     match row {
-        Ok((id, provider, session_id, title, created_at_str)) => {
+        Ok((id, provider, session_id, title, created_at_str, model, cwd)) => {
             let created_at = parse_dt(&created_at_str)?;
             Ok(Some(Conversation {
                 id,
@@ -316,6 +427,8 @@ pub fn load_conversation(conn: &Connection, id: &str) -> rusqlite::Result<Option
                 session_id,
                 title,
                 created_at,
+                model,
+                cwd,
             }))
         }
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -324,9 +437,12 @@ pub fn load_conversation(conn: &Connection, id: &str) -> rusqlite::Result<Option
 }
 
 /// List all conversations, oldest-first (Task 15's history sidebar).
+/// Task 1: also reads the immutable `model` + `cwd` columns (the
+/// sidebar labels threads by project dir + model).
 pub fn list_conversations(conn: &Connection) -> rusqlite::Result<Vec<Conversation>> {
     let mut stmt = conn.prepare(
-        "SELECT id, provider, session_id, title, created_at FROM conversations ORDER BY created_at",
+        "SELECT id, provider, session_id, title, created_at, model, cwd \
+         FROM conversations ORDER BY created_at",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok((
@@ -335,17 +451,21 @@ pub fn list_conversations(conn: &Connection) -> rusqlite::Result<Vec<Conversatio
             row.get::<_, Option<String>>(2)?,
             row.get::<_, String>(3)?,
             row.get::<_, String>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, String>(6)?,
         ))
     })?;
     let mut out = Vec::new();
     for r in rows {
-        let (id, provider, session_id, title, created_at_str) = r?;
+        let (id, provider, session_id, title, created_at_str, model, cwd) = r?;
         out.push(Conversation {
             id,
             provider,
             session_id,
             title,
             created_at: parse_dt(&created_at_str)?,
+            model,
+            cwd,
         });
     }
     Ok(out)
@@ -353,45 +473,83 @@ pub fn list_conversations(conn: &Connection) -> rusqlite::Result<Vec<Conversatio
 
 /// Append one stored message to a conversation. `created_at` is the
 /// current UTC time (the message's row id preserves insertion order —
-/// `load_messages` orders by id).
+/// `load_messages` orders by id). Task 1: also stores the message's
+/// `kind` (the [`MessageKind`](crate::agent::MessageKind) variant name,
+/// or `None` for rows written without one — e.g. the user-prompt append
+/// in `chat::run_chat_turn` which has no `MessageKind` tag).
 pub fn append_message(conn: &Connection, conv_id: &str, msg: &StoredMessage) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO messages (conv_id, role, content, created_at) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO messages (conv_id, role, content, created_at, kind) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
         rusqlite::params![
             conv_id,
             msg.role,
             msg.content,
             chrono::Utc::now().to_rfc3339(),
+            msg.kind,
         ],
     )?;
     Ok(())
 }
 
 /// Load all stored messages for a conversation, in arrival order.
+/// Task 1: reads the `kind` column. For rows where `kind IS NULL` (pre-
+/// Task-1 data, OR new rows written without a kind), infer a `kind`
+/// from `role`: assistant→`Some("Text")`, user/tool→
+/// `Some("ToolResult")`, else `None`. The backfill is a heuristic so
+/// reopening a pre-Task-1 history still renders sensible kinds (text
+/// bubbles for assistant turns, tool-result chips for the user/tool
+/// side) instead of all-`None`.
 pub fn load_messages(conn: &Connection, conv_id: &str) -> rusqlite::Result<Vec<StoredMessage>> {
     let mut stmt = conn.prepare(
-        "SELECT role, content FROM messages WHERE conv_id = ?1 ORDER BY id",
+        "SELECT role, content, kind FROM messages WHERE conv_id = ?1 ORDER BY id",
     )?;
     let rows = stmt.query_map([conv_id], |row| {
-        Ok(StoredMessage {
-            role: row.get(0)?,
-            content: row.get(1)?,
-        })
+        let role: String = row.get(0)?;
+        let content: String = row.get(1)?;
+        let kind: Option<String> = row.get(2)?;
+        Ok((role, content, kind))
     })?;
     let mut out = Vec::new();
     for r in rows {
-        out.push(r?);
+        let (role, content, kind) = r?;
+        let kind = kind.or_else(|| infer_kind_from_role(&role));
+        out.push(StoredMessage { role, content, kind });
     }
     Ok(out)
 }
 
+/// Backfill heuristic for pre-Task-1 `messages` rows (whose `kind`
+/// column is NULL after the migration). Maps `role` → a sensible
+/// `MessageKind` name so reopening an old history still renders
+/// thinking/tool blocks: assistant turns → plain text bubbles
+/// (`"Text"`); user prompts + tool results → tool-result chips
+/// (`"ToolResult"`); everything else (system / unknown) → `None` (the
+/// frontend renders `None`-kind rows as plain text).
+fn infer_kind_from_role(role: &str) -> Option<String> {
+    match role {
+        "assistant" => Some("Text".into()),
+        "user" | "tool" => Some("ToolResult".into()),
+        _ => None,
+    }
+}
+
 /// Persist a whole turn: append every [`Message`](crate::agent::Message)
 /// in [`TurnRecord::messages`] (mapped to a [`StoredMessage`] —
-/// kind→role, content verbatim), AND if
+/// kind→role AND now also kind→kind name string, content verbatim), AND if
 /// `record.result.session_id` is `Some`, update the conversation's
 /// `session_id` so the NEXT turn resumes the agent's native session
 /// (mirrors multica's `ResumeSessionID`). Called by Task 15's chat
 /// controller after a turn's stream + result resolve.
+///
+/// **Task 1: `kind` persistence.** Each appended `StoredMessage` now
+/// carries `kind = Some(message_kind_to_name(m.kind))` — the variant
+/// name string (`"Text"` / `"Thinking"` / `"ToolUse"` / `"ToolResult"` /
+/// `"Status"` / `"Error"` / `"Log"`). This is what lets history replay
+/// render thinking / tool blocks the same way the live stream did
+/// (design "改动 3"). The `role` column is STILL derived from kind via
+/// `message_kind_to_role` (backward compat with the v0.1.0 role-based
+/// rendering); `kind` is supplementary, not a replacement.
 ///
 /// **Atomicity (fix-round-1, brief's SQL-hygiene "transactions for
 /// multi-statement"):** this runs N message INSERTs followed by a
@@ -414,11 +572,13 @@ pub fn save_turn_record(
     // propagates any error and, in doing so, DROPS `tx` — rusqlite's
     // `Drop for Transaction` issues `ROLLBACK`, so no partial commit.
     let tx = conn.transaction()?;
-    // 1. Append all messages as StoredMessages (kind → role string).
+    // 1. Append all messages as StoredMessages (kind → role string AND
+    //    kind → kind-name string, content verbatim).
     for m in &record.messages {
         let sm = StoredMessage {
             role: message_kind_to_role(m.kind),
             content: m.content.clone(),
+            kind: Some(message_kind_to_name(m.kind)),
         };
         append_message(&tx, conv_id, &sm)?;
     }
@@ -436,11 +596,34 @@ pub fn save_turn_record(
     Ok(())
 }
 
+/// Map a streamed [`MessageKind`](crate::agent::MessageKind) to its
+/// variant-name string for the `messages.kind` column — the design
+/// "改动 3" ruling is that `kind` stores the `MessageKind` NAME so
+/// reopening history shows thinking / tool blocks. Matches the serde
+/// representation (`MessageKind` serializes as the bare variant name,
+/// e.g. `"ToolUse"` — see `agent::tests::message_kind_serializes_as_expected`).
+/// A dedicated match (rather than `serde_json::to_string` + trim) keeps
+/// this allocation-free for the hot append path and avoids a serde
+/// dependency in the db layer.
+fn message_kind_to_name(kind: crate::agent::MessageKind) -> String {
+    use crate::agent::MessageKind::*;
+    match kind {
+        Text => "Text",
+        Thinking => "Thinking",
+        ToolUse => "ToolUse",
+        ToolResult => "ToolResult",
+        Status => "Status",
+        Error => "Error",
+        Log => "Log",
+    }
+    .into()
+}
+
 /// Map a streamed [`MessageKind`](crate::agent::MessageKind) to a stored
-/// role string. The persisted shape ([`StoredMessage`]) keeps only
-/// role+content — the kind tag / tool / call_id are dropped (the design
-/// spec calls this the "persisted shape, distinct from the streamed
-/// Message"). Mapping:
+/// role string. The persisted shape ([`StoredMessage`]) keeps
+/// role+content+kind — the kind tag carries the precise variant; `role`
+/// is the v0.1.0-compatible coarse bucket (assistant / tool / system).
+/// Mapping:
 /// - `Text` / `Thinking` / `ToolUse` / `Error` → `"assistant"` (all
 ///   are emissions from the assistant side of the turn).
 /// - `ToolResult` → `"tool"` (matches multica's tool-result role).
@@ -681,6 +864,8 @@ mod tests {
             session_id: None,
             title: "Round trip".into(),
             created_at: chrono::Utc::now(),
+            model: None,
+            cwd: ".".into(),
         };
         save_conversation(&conn, &conv).expect("save");
         let loaded = load_conversation(&conn, &conv.id).expect("load");
@@ -708,12 +893,14 @@ mod tests {
             session_id: None,
             title: "Msgs".into(),
             created_at: chrono::Utc::now(),
+            model: None,
+            cwd: ".".into(),
         };
         save_conversation(&conn, &conv).expect("save");
         let msgs = vec![
-            StoredMessage { role: "user".into(), content: "hello".into() },
-            StoredMessage { role: "assistant".into(), content: "hi".into() },
-            StoredMessage { role: "tool".into(), content: "{\"result\":42}".into() },
+            StoredMessage { role: "user".into(), content: "hello".into(), kind: None },
+            StoredMessage { role: "assistant".into(), content: "hi".into(), kind: None },
+            StoredMessage { role: "tool".into(), content: "{\"result\":42}".into(), kind: None },
         ];
         for m in &msgs {
             append_message(&conn, &conv.id, m).expect("append");
@@ -740,6 +927,8 @@ mod tests {
             session_id: None, // first turn — no native session yet
             title: "Turn".into(),
             created_at: chrono::Utc::now(),
+            model: None,
+            cwd: ".".into(),
         };
         save_conversation(&conn, &conv).expect("save");
         // TurnRecord with two messages + a result that surfaces a new
@@ -816,6 +1005,8 @@ mod tests {
             session_id: Some("existing-sess".into()),
             title: "Preserved".into(),
             created_at: chrono::Utc::now(),
+            model: None,
+            cwd: ".".into(),
         };
         save_conversation(&conn, &conv).expect("save");
         let record = TurnRecord {
@@ -862,7 +1053,11 @@ mod tests {
         let (_tmp, mut conn) = fresh_db();
         // Rebuild `conversations` with a CHECK that rejects the poison
         // session_id. The CHECK turns the UPDATE into the failing
-        // statement that the transaction must roll back from.
+        // statement that the transaction must roll back from. Includes
+        // the Task 1 `model` / `cwd` columns so `save_conversation`'s
+        // INSERT (which now writes them) doesn't itself fail before the
+        // poison UPDATE ever runs (which would make the test pass for
+        // the wrong reason).
         conn.execute_batch(
             "DROP TABLE conversations;
              CREATE TABLE conversations (
@@ -870,7 +1065,9 @@ mod tests {
                 provider TEXT NOT NULL,
                 session_id TEXT CHECK (session_id IS NULL OR session_id != '__POISON_SESS__'),
                 title TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                model TEXT,
+                cwd TEXT NOT NULL DEFAULT '.'
              );",
         )
         .expect("rebuild conversations with CHECK");
@@ -881,6 +1078,8 @@ mod tests {
             session_id: Some("original-sess".into()), // a valid (non-poison) value
             title: "Atomicity".into(),
             created_at: chrono::Utc::now(),
+            model: None,
+            cwd: ".".into(),
         };
         save_conversation(&conn, &conv).expect("save conversation with valid session_id");
 
@@ -1076,6 +1275,8 @@ mod tests {
             session_id: None,
             title: "Fallback".into(),
             created_at: chrono::Utc::now(),
+            model: None,
+            cwd: ".".into(),
         };
         save_conversation(&conn, &conv).expect("save must succeed on the fallback path");
         let loaded = load_conversation(&conn, &conv.id).expect("load").expect("present");
@@ -1097,5 +1298,257 @@ mod tests {
         migrate(&conn).expect("migrate");
         let db_in_exe = exe_dir.path().join("swd-pet.db");
         assert!(db_in_exe.exists(), "db file should be in the exe dir (portable case)");
+    }
+
+    // =======================================================================
+    // Task 1: schema migration — conversation model/cwd + message kind
+    // (TDD: written first, RED before implementation.)
+    // =======================================================================
+
+    /// Helper: the column names of `table` via `PRAGMA table_info`. The
+    /// name column is index 1 (`cid` is 0). Used by the migration tests
+    /// to assert that `model` / `cwd` / `kind` are present.
+    fn column_names(conn: &Connection, table: &str) -> Vec<String> {
+        // PRAGMA doesn't bind the table name as a parameter in bundled
+        // SQLite; the table names here are test-only string literals
+        // (no injection surface).
+        let sql = format!("PRAGMA table_info({table})");
+        let mut stmt = conn.prepare(&sql).expect("prepare pragma");
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .expect("query");
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.expect("row"));
+        }
+        out
+    }
+
+    /// `migrate` is idempotent: running it again on an already-migrated
+    /// db MUST NOT error. The Task 1 migration's `ALTER TABLE … ADD
+    /// COLUMN` path checks `PRAGMA table_info` for the column first, so
+    /// the second (and third) run is a no-op for already-present columns
+    /// — without that guard, `ADD COLUMN` on an existing column errors
+    /// with "duplicate column name".
+    #[test]
+    fn migrate_is_idempotent() {
+        let (_tmp, conn) = fresh_db();
+        // fresh_db already ran migrate once; running it again must not
+        // error (this is the regression test for the idempotency guard).
+        migrate(&conn).expect("migrate twice must not error");
+        // A third time catches "second-add succeeds but third fails"
+        // regressions on the idempotency check.
+        migrate(&conn).expect("migrate thrice must not error");
+    }
+
+    /// The Task 1 migration adds three columns: `conversations.model`
+    /// (TEXT NULL), `conversations.cwd` (TEXT NOT NULL DEFAULT '.'), and
+    /// `messages.kind` (TEXT NULL). PRAGMA table_info must list all
+    /// three after `migrate` runs.
+    #[test]
+    fn migrate_adds_model_cwd_kind_columns() {
+        let (_tmp, conn) = fresh_db();
+
+        let conv_cols = column_names(&conn, "conversations");
+        assert!(
+            conv_cols.contains(&"model".to_string()),
+            "conversations.model missing: got {conv_cols:?}"
+        );
+        assert!(
+            conv_cols.contains(&"cwd".to_string()),
+            "conversations.cwd missing: got {conv_cols:?}"
+        );
+
+        let msg_cols = column_names(&conn, "messages");
+        assert!(
+            msg_cols.contains(&"kind".to_string()),
+            "messages.kind missing: got {msg_cols:?}"
+        );
+    }
+
+    /// `new_conversation(provider, model, cwd)` persists a Conversation
+    /// row with the given model + cwd; `load_conversation` round-trips
+    /// both fields back (model as Option, cwd as the exact string). The
+    /// created row has `session_id=None`, `title="新对话"`, a uuid v4 id,
+    /// and `created_at=now`.
+    #[test]
+    fn new_conversation_round_trips_model_and_cwd() {
+        let (_tmp, conn) = fresh_db();
+        let conv = new_conversation(&conn, "claude", Some("sonnet".into()), "/tmp")
+            .expect("new_conversation");
+        assert_eq!(conv.provider, "claude");
+        assert_eq!(conv.model.as_deref(), Some("sonnet"));
+        assert_eq!(conv.cwd, "/tmp");
+        assert!(conv.session_id.is_none(), "fresh conv has no session_id");
+        assert_eq!(conv.title, "新对话");
+        assert!(!conv.id.is_empty(), "id must be a non-empty uuid");
+
+        let loaded = load_conversation(&conn, &conv.id)
+            .expect("load")
+            .expect("conversation present after new_conversation");
+        assert_eq!(loaded.id, conv.id);
+        assert_eq!(loaded.model.as_deref(), Some("sonnet"), "model must round-trip");
+        assert_eq!(loaded.cwd, "/tmp", "cwd must round-trip");
+        assert_eq!(loaded.provider, "claude");
+        assert_eq!(loaded.title, "新对话");
+        assert!(loaded.session_id.is_none());
+    }
+
+    /// `new_conversation` with `model: None` round-trips as `None` —
+    /// the agent will use its own default model (Task 4 wires that path
+    /// through `resume_or_replay` → `ExecOptions.model`). The `cwd`
+    /// default of `"."` matches the column's `DEFAULT '.'`.
+    #[test]
+    fn new_conversation_none_model_round_trips() {
+        let (_tmp, conn) = fresh_db();
+        let conv = new_conversation(&conn, "codex", None, ".").expect("new_conversation");
+        assert!(conv.model.is_none(), "None model stored as None");
+        let loaded = load_conversation(&conn, &conv.id)
+            .expect("load")
+            .expect("present");
+        assert!(loaded.model.is_none(), "None model must round-trip as None");
+        assert_eq!(loaded.cwd, ".");
+    }
+
+    /// `save_turn_record` persists each `Message`'s `MessageKind` as a
+    /// `kind` string (the variant name); `load_messages` returns
+    /// `StoredMessage`s whose `kind` matches the original `MessageKind`
+    /// name (Text/Thinking/ToolUse/ToolResult). The `role` column is
+    /// STILL derived from `MessageKind` via `message_kind_to_role`
+    /// (backward compat with the v0.1.0 role-based rendering) — `kind`
+    /// is ADDITIONAL, not a replacement.
+    #[test]
+    fn save_turn_record_persists_message_kinds() {
+        let (_tmp, mut conn) = fresh_db();
+        let conv = Conversation {
+            id: unique_id("kind"),
+            provider: "claude".into(),
+            model: None,
+            cwd: ".".into(),
+            session_id: None,
+            title: "Kinds".into(),
+            created_at: chrono::Utc::now(),
+        };
+        save_conversation(&conn, &conv).expect("save");
+
+        let record = TurnRecord {
+            messages: vec![
+                Message {
+                    kind: MessageKind::Text,
+                    content: "hello".into(),
+                    tool: None,
+                    call_id: None,
+                },
+                Message {
+                    kind: MessageKind::Thinking,
+                    content: "hmm".into(),
+                    tool: None,
+                    call_id: None,
+                },
+                Message {
+                    kind: MessageKind::ToolUse,
+                    content: "ls".into(),
+                    tool: Some("Bash".into()),
+                    call_id: Some("c1".into()),
+                },
+                Message {
+                    kind: MessageKind::ToolResult,
+                    content: "file.txt".into(),
+                    tool: Some("Bash".into()),
+                    call_id: Some("c1".into()),
+                },
+            ],
+            // No result → save_turn_record only appends messages (no
+            // session_id update). The kind-persistence path is what's
+            // under test here.
+            result: None,
+        };
+        save_turn_record(&mut conn, &conv.id, &record).expect("save_turn_record");
+
+        let msgs = load_messages(&conn, &conv.id).expect("load");
+        assert_eq!(msgs.len(), 4, "all four messages persisted");
+        assert_eq!(msgs[0].kind.as_deref(), Some("Text"), "first msg kind (Text)");
+        assert_eq!(msgs[1].kind.as_deref(), Some("Thinking"), "second msg kind (Thinking)");
+        assert_eq!(msgs[2].kind.as_deref(), Some("ToolUse"), "third msg kind (ToolUse)");
+        assert_eq!(msgs[3].kind.as_deref(), Some("ToolResult"), "fourth msg kind (ToolResult)");
+        // role mapping is unchanged (Text/Thinking/ToolUse→assistant,
+        // ToolResult→tool) — kind is supplementary, role preserved.
+        assert_eq!(msgs[0].role, "assistant");
+        assert_eq!(msgs[1].role, "assistant");
+        assert_eq!(msgs[2].role, "assistant");
+        assert_eq!(msgs[3].role, "tool");
+    }
+
+    /// Old rows (pre-Task-1 migration, `kind IS NULL`) get a `kind`
+    /// INFERRED from `role` on load: assistant→`Some("Text")`,
+    /// user/tool→`Some("ToolResult")`, else `None`. This is the
+    /// backfill heuristic so reopening a pre-Task-1 history still
+    /// renders sensible kinds (text bubbles for assistant turns, tool-
+    /// result chips for the user/tool side) instead of all-None.
+    #[test]
+    fn load_messages_infers_kind_for_null_rows() {
+        let (_tmp, conn) = fresh_db();
+        let conv = Conversation {
+            id: unique_id("old"),
+            provider: "claude".into(),
+            model: None,
+            cwd: ".".into(),
+            session_id: None,
+            title: "Old".into(),
+            created_at: chrono::Utc::now(),
+        };
+        save_conversation(&conn, &conv).expect("save");
+
+        // Insert four rows with kind=NULL, simulating pre-Task-1 data
+        // (one per role branch of the inference rule). The backfill is
+        // what's under test — the rows are written directly, bypassing
+        // save_turn_record (which would now set kind explicitly).
+        let now = chrono::Utc::now().to_rfc3339();
+        for (role, content) in [
+            ("assistant", "hi"),
+            ("user", "go"),
+            ("tool", "{\"r\":1}"),
+            ("system", "started"),
+        ] {
+            conn.execute(
+                "INSERT INTO messages (conv_id, role, content, created_at, kind) \
+                 VALUES (?1, ?2, ?3, ?4, NULL)",
+                rusqlite::params![conv.id, role, content, now],
+            )
+            .unwrap_or_else(|e| panic!("insert {role} null-kind row: {e}"));
+        }
+
+        let msgs = load_messages(&conn, &conv.id).expect("load");
+        assert_eq!(msgs.len(), 4);
+        // assistant → Text
+        assert_eq!(msgs[0].role, "assistant");
+        assert_eq!(msgs[0].kind.as_deref(), Some("Text"), "assistant null→Text");
+        // user → ToolResult
+        assert_eq!(msgs[1].role, "user");
+        assert_eq!(msgs[1].kind.as_deref(), Some("ToolResult"), "user null→ToolResult");
+        // tool → ToolResult
+        assert_eq!(msgs[2].role, "tool");
+        assert_eq!(msgs[2].kind.as_deref(), Some("ToolResult"), "tool null→ToolResult");
+        // system → None (no sensible inference for a system row)
+        assert_eq!(msgs[3].role, "system");
+        assert_eq!(msgs[3].kind, None, "system null→None");
+    }
+
+    /// `list_conversations` returns the `model` + `cwd` fields too (not
+    /// just `load_conversation`) — the history sidebar labels threads by
+    /// their project dir (cwd) + model, so the list path must surface
+    /// both.
+    #[test]
+    fn list_conversations_returns_model_and_cwd() {
+        let (_tmp, conn) = fresh_db();
+        let conv = new_conversation(&conn, "claude", Some("sonnet".into()), "/proj")
+            .expect("new_conversation");
+        let list = list_conversations(&conn).expect("list");
+        let found = list
+            .iter()
+            .find(|c| c.id == conv.id)
+            .expect("new conv appears in list");
+        assert_eq!(found.model.as_deref(), Some("sonnet"));
+        assert_eq!(found.cwd, "/proj");
     }
 }

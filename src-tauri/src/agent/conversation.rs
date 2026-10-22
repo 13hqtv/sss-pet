@@ -45,10 +45,21 @@ use super::{Backend, BackendError, ExecOptions, ExecResult, Message, Session};
 /// controller preflight ruling places this type HERE (not in the db layer)
 /// so Task 14 can `use crate::agent::conversation::StoredMessage` without
 /// a circular dep.
+///
+/// **Task 1: `kind` field.** The [`crate::agent::MessageKind`] variant name
+/// (e.g. `"Text"` / `"Thinking"` / `"ToolUse"` / `"ToolResult"` /
+/// `"Status"` / `"Error"` / `"Log"`), set by [`db::save_turn_record`]
+/// (Task 1) when persisting a streamed [`Message`]. `None` for rows
+/// written before Task 1's migration (the db layer infers a `kind` from
+/// `role` on load — see [`db::load_messages`]). Carrying `kind` on the
+/// persisted shape lets history replay render thinking / tool blocks the
+/// same way the live stream did (design "改动 3": reopen a chat and see
+/// the processing, not just plain text).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredMessage {
     pub role: String,
     pub content: String,
+    pub kind: Option<String>,
 }
 
 /// One persisted conversation thread. `id` is the desktop-pet's own
@@ -59,6 +70,20 @@ pub struct StoredMessage {
 /// the agent's own session; when `None`, it replays the history as context
 /// (the agent has no native session to resume). `title` is the
 /// user-facing label; `created_at` is when the conversation started.
+///
+/// **Task 1: `model` + `cwd` fields.** Both are set at conversation
+/// creation (by [`db::new_conversation`]) and IMMUTABLE thereafter — the
+/// design "改动 1" ruling is "一次对话 = agent + model + cwd 三件套，
+/// 开对话时定、定了不改" (one conversation = agent + model + cwd triple,
+/// fixed at creation, never changed mid-conversation). `model: None`
+/// means "use the agent's own default model" (Task 4 wires `conv.model`
+/// through `resume_or_replay` → `ExecOptions.model`; the three backends
+/// already accept `opts.model` — Tasks 10/11/12). `cwd` is the working
+/// directory the agent CLI is spawned in for this conversation (so file
+/// tools resolve relative to the project the user picked when opening
+/// the chat). The immutability naturally closes the v0.1.0 hazard of
+/// swapping provider/model mid-conversation (which mismatched the
+/// agent-native `session_id`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conversation {
     pub id: String,
@@ -66,6 +91,12 @@ pub struct Conversation {
     pub session_id: Option<String>,
     pub title: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// The model selected at creation (`None` = agent's default).
+    /// Immutable. Task 1.
+    pub model: Option<String>,
+    /// The working directory the agent CLI runs in for this conversation.
+    /// Immutable. Task 1.
+    pub cwd: String,
 }
 
 /// One turn's captured record: the streamed [`Message`]s the backend
@@ -411,6 +442,8 @@ mod tests {
             session_id: Some("s1".into()),
             title: "Test".into(),
             created_at: chrono::Utc::now(),
+            model: None,
+            cwd: ".".into(),
         }
     }
 
@@ -421,6 +454,8 @@ mod tests {
             session_id: None,
             title: "Test".into(),
             created_at: chrono::Utc::now(),
+            model: None,
+            cwd: ".".into(),
         }
     }
 
@@ -429,10 +464,12 @@ mod tests {
             StoredMessage {
                 role: "user".into(),
                 content: "what is 2+2".into(),
+                kind: None,
             },
             StoredMessage {
                 role: "assistant".into(),
                 content: "4".into(),
+                kind: None,
             },
         ]
     }

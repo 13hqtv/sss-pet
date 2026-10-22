@@ -124,6 +124,12 @@ pub async fn run_chat_turn(
         let user_msg = StoredMessage {
             role: "user".into(),
             content: prompt.into(),
+            // The user's prompt is plain text — tag it `Text` so the
+            // frontend renders a text bubble (NOT `ToolResult`, which
+            // the NULL-kind backfill heuristic would infer for a `user`
+            // role). New rows set `kind` explicitly to avoid the
+            // heuristic; only pre-Task-1 NULL rows rely on it.
+            kind: Some("Text".into()),
         };
         db::append_message(&conn, conv_id, &user_msg)
             .map_err(|e| format!("append user msg: {e}"))?;
@@ -325,21 +331,24 @@ pub fn list_conversations(
 /// persist it via `save_conversation`, return the new `Conversation`.
 /// The frontend's "新建" button calls this after the user picks a
 /// provider (claude / codex / opencode).
+///
+/// Task 1: delegates to `db::new_conversation` so the uuid +
+/// default-title + persist logic lives in one place (the db layer).
+/// `model` is `None` here (Task 4 will wire the model picker through
+/// this command's signature); `cwd` is the user-pinned working
+/// directory from `config::resolve_agent_cwd()` (the same value
+/// `chat_send` uses — so a fresh conversation's cwd matches the dir
+/// the agent CLI will spawn in on the first turn).
 #[tauri::command]
 pub fn new_conversation(
     db: State<'_, Arc<Mutex<Connection>>>,
     provider: String,
 ) -> Result<Conversation, String> {
-    let conv = Conversation {
-        id: uuid::Uuid::new_v4().to_string(),
-        provider: provider.clone(),
-        session_id: None,
-        title: "新对话".into(),
-        created_at: chrono::Utc::now(),
-    };
+    let cwd = crate::config::resolve_agent_cwd();
+    let cwd_str = cwd.to_string_lossy().to_string();
     let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
-    db::save_conversation(&conn, &conv).map_err(|e| format!("save_conversation: {e}"))?;
-    Ok(conv)
+    db::new_conversation(&conn, &provider, None, &cwd_str)
+        .map_err(|e| format!("new_conversation: {e}"))
 }
 
 /// Load all stored messages for a conversation (arrival order). Called
@@ -497,6 +506,8 @@ mod tests {
             session_id: None, // first turn — no native session yet
             title: "Survives hide".into(),
             created_at: chrono::Utc::now(),
+            model: None,
+            cwd: ".".into(),
         };
         {
             let conn = db_state.lock().unwrap();
@@ -628,6 +639,8 @@ mod tests {
             session_id: None,
             title: "Emits".into(),
             created_at: chrono::Utc::now(),
+            model: None,
+            cwd: ".".into(),
         };
         {
             let conn = db_state.lock().unwrap();
