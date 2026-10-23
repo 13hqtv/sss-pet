@@ -34,6 +34,8 @@ async fn real_claude_replies_hello() {
         model: None,
         resume_session_id: None,
         timeout: Some(Duration::from_secs(60)),
+        system_prompt: None,
+        mcp_config: None,
     };
 
     let mut session = backend

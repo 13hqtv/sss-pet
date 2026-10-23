@@ -52,6 +52,7 @@ use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 // the `chat_survives_hide` test (Review Focus #3 — run_chat_turn +
 // FakeBackend + no-op emit).
 pub mod chat;
+pub mod mcp_server;
 
 /// Toggle click-through on the pet overlay window from the frontend.
 ///
@@ -257,6 +258,206 @@ fn todo_delete(db: State<'_, Arc<Mutex<Connection>>>, id: i64) -> Result<(), Str
     db::todo_delete(&conn, id).map_err(|e| format!("todo_delete: {e}"))
 }
 
+// ===========================================================================
+// Agent management (agents + skills + agent_skills)
+// ===========================================================================
+
+#[tauri::command]
+fn agent_list(db: State<'_, Arc<Mutex<Connection>>>) -> Result<Vec<db::Agent>, String> {
+    let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+    db::agent_list(&conn).map_err(|e| format!("agent_list: {e}"))
+}
+
+#[tauri::command]
+fn agent_get(db: State<'_, Arc<Mutex<Connection>>>, id: String) -> Result<Option<db::Agent>, String> {
+    let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+    db::agent_get(&conn, &id).map_err(|e| format!("agent_get: {e}"))
+}
+
+#[tauri::command]
+fn agent_create(
+    db: State<'_, Arc<Mutex<Connection>>>,
+    name: String,
+    description: Option<String>,
+    provider: String,
+    model: Option<String>,
+    system_prompt: Option<String>,
+    mcp_config: Option<String>,
+    cwd: Option<String>,
+) -> Result<String, String> {
+    let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+    db::agent_create(
+        &conn, &name, description.as_deref(), &provider,
+        model.as_deref(), system_prompt.as_deref(),
+        mcp_config.as_deref(), cwd.as_deref(),
+    )
+    .map_err(|e| format!("agent_create: {e}"))
+}
+
+#[tauri::command]
+fn agent_update(
+    db: State<'_, Arc<Mutex<Connection>>>,
+    id: String,
+    name: String,
+    description: Option<String>,
+    provider: String,
+    model: Option<String>,
+    system_prompt: Option<String>,
+    mcp_config: Option<String>,
+    cwd: Option<String>,
+) -> Result<(), String> {
+    let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+    db::agent_update(
+        &conn, &id, &name, description.as_deref(), &provider,
+        model.as_deref(), system_prompt.as_deref(),
+        mcp_config.as_deref(), cwd.as_deref(),
+    )
+    .map_err(|e| format!("agent_update: {e}"))
+}
+
+#[tauri::command]
+fn agent_delete(db: State<'_, Arc<Mutex<Connection>>>, id: String) -> Result<(), String> {
+    let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+    db::agent_delete(&conn, &id).map_err(|e| format!("agent_delete: {e}"))
+}
+
+#[tauri::command]
+fn skill_list(db: State<'_, Arc<Mutex<Connection>>>) -> Result<Vec<db::Skill>, String> {
+    let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+    db::skill_list(&conn).map_err(|e| format!("skill_list: {e}"))
+}
+
+#[tauri::command]
+fn skill_create(
+    db: State<'_, Arc<Mutex<Connection>>>,
+    name: String,
+    description: Option<String>,
+    content: Option<String>,
+) -> Result<String, String> {
+    let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+    db::skill_create(&conn, &name, description.as_deref(), content.as_deref())
+        .map_err(|e| format!("skill_create: {e}"))
+}
+
+#[tauri::command]
+fn skill_update(
+    db: State<'_, Arc<Mutex<Connection>>>,
+    id: String,
+    name: String,
+    description: Option<String>,
+    content: Option<String>,
+) -> Result<(), String> {
+    let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+    db::skill_update(&conn, &id, &name, description.as_deref(), content.as_deref())
+        .map_err(|e| format!("skill_update: {e}"))
+}
+
+#[tauri::command]
+fn skill_delete(db: State<'_, Arc<Mutex<Connection>>>, id: String) -> Result<(), String> {
+    let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+    db::skill_delete(&conn, &id).map_err(|e| format!("skill_delete: {e}"))
+}
+
+#[tauri::command]
+fn agent_skills_list(
+    db: State<'_, Arc<Mutex<Connection>>>,
+    agent_id: String,
+) -> Result<Vec<(db::Skill, bool)>, String> {
+    let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+    db::agent_skills_list(&conn, &agent_id).map_err(|e| format!("agent_skills_list: {e}"))
+}
+
+#[tauri::command]
+fn agent_skill_add(
+    db: State<'_, Arc<Mutex<Connection>>>,
+    agent_id: String,
+    skill_id: String,
+) -> Result<(), String> {
+    let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+    db::agent_skill_add(&conn, &agent_id, &skill_id).map_err(|e| format!("agent_skill_add: {e}"))
+}
+
+#[tauri::command]
+fn agent_skill_remove(
+    db: State<'_, Arc<Mutex<Connection>>>,
+    agent_id: String,
+    skill_id: String,
+) -> Result<(), String> {
+    let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+    db::agent_skill_remove(&conn, &agent_id, &skill_id).map_err(|e| format!("agent_skill_remove: {e}"))
+}
+
+#[tauri::command]
+fn agent_skill_set_enabled(
+    db: State<'_, Arc<Mutex<Connection>>>,
+    agent_id: String,
+    skill_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+    db::agent_skill_set_enabled(&conn, &agent_id, &skill_id, enabled)
+        .map_err(|e| format!("agent_skill_set_enabled: {e}"))
+}
+
+/// The system prompt for the AI agent builder. Instructs the LLM to
+/// generate an agent configuration as JSON in `<agent_draft>` tags.
+const AGENT_BUILDER_PROMPT: &str = r#"你是一个智能体构建器。根据用户的描述，生成一个智能体配置。
+
+你的回复必须包含一个 <agent_draft> JSON 块，格式如下：
+<agent_draft>{"name":"","description":"","system_prompt":"","provider":"","model":""}</agent_draft>
+
+字段说明：
+- name: 简短、有辨识度的智能体名称（2-8个字）
+- description: 一句话描述智能体的用途
+- system_prompt: 详细的系统提示词，定义智能体的角色、能力、行为规范、输出格式等。要具体、可操作。
+- provider: 必须是 "claude"、"codex" 或 "opencode" 之一
+- model: 留空字符串 "" 表示使用 provider 的默认模型，或填写具体模型名
+
+规则：
+- JSON 必须是合法的紧凑格式（单行，不要换行）
+- 字符串内的换行用 \n 转义
+- 在 <agent_draft> 标签之外可以有自然语言说明
+- 根据用户的需求描述，设计合适的系统提示词"#;
+
+/// AI-powered agent creation: a one-shot LLM call that takes a natural-
+/// language description and returns the LLM's text response (which should
+/// contain an `<agent_draft>` JSON block the frontend parses). Uses the
+/// default provider + model from config.
+#[tauri::command]
+async fn agent_generate(
+    description: String,
+    provider: Option<String>,
+) -> Result<String, String> {
+    let cfg = config::load();
+    let provider = provider.unwrap_or_else(|| cfg.default_provider.clone());
+    let model = cfg.providers.default_model_for(&provider).map(|s| s.to_string());
+    let backend_cfg = agent::BackendConfig::default();
+    let backend = agent::new(&provider, backend_cfg)
+        .map_err(|e| format!("agent::new({provider}): {e}"))?;
+    let opts = agent::ExecOptions {
+        cwd: config::resolve_agent_cwd(),
+        model,
+        resume_session_id: None,
+        timeout: Some(std::time::Duration::from_secs(120)),
+        system_prompt: Some(AGENT_BUILDER_PROMPT.to_string()),
+        mcp_config: None,
+    };
+    let mut session = backend
+        .execute(&description, opts)
+        .await
+        .map_err(|e| format!("agent_generate execute: {e}"))?;
+    // Collect all text messages into a single string.
+    let mut full_text = String::new();
+    while let Some(msg) = session.messages.recv().await {
+        if msg.kind == agent::MessageKind::Text {
+            full_text.push_str(&msg.content);
+            full_text.push('\n');
+        }
+    }
+    let _ = session.result.await;
+    Ok(full_text)
+}
+
 #[tauri::command]
 fn reminder_list(db: State<'_, Arc<Mutex<Connection>>>) -> Result<Vec<Reminder>, String> {
     let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
@@ -385,6 +586,16 @@ fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
     }
 }
 
+/// Returns the path to the current exe. Used by the AgentsView to
+/// auto-fill the MCP config's `command` field for the swd-pet-todos
+/// MCP server.
+#[tauri::command]
+fn get_exe_path() -> Result<String, String> {
+    std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .map_err(|e| format!("current_exe: {e}"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -459,11 +670,28 @@ pub fn run() {
             reminder_list,
             reminder_add,
             reminder_delete,
+            // Agent management: agent CRUD + skill CRUD + agent-skill
+            // assignment + AI-powered agent creation.
+            agent_list,
+            agent_get,
+            agent_create,
+            agent_update,
+            agent_delete,
+            skill_list,
+            skill_create,
+            skill_update,
+            skill_delete,
+            agent_skills_list,
+            agent_skill_add,
+            agent_skill_remove,
+            agent_skill_set_enabled,
+            agent_generate,
             config::settings_get,
             settings_set_with_focus,
             dismiss_pet_alert,
             get_autostart,
             set_autostart,
+            get_exe_path,
         ])
         .setup(|app| {
             // Default the pet overlay to click-through (pass-through) so the

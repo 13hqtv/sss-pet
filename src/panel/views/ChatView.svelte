@@ -27,6 +27,8 @@
     type MessageKind,
     type ExecResult,
     type Provider,
+    type Agent,
+    listAgents,
   } from "../lib/api";
   import { getSettings, defaultModelFor } from "../lib/settings";
   import { subscribeChatStream } from "../lib/stream";
@@ -109,6 +111,8 @@
   let dialogProvider: Provider = $state("claude");
   let dialogModel: string = $state("");
   let dialogCwd: string = $state("");
+  let dialogAgentId: string | null = $state(null);
+  let agents: Agent[] = $state([]);
   let modelList: string[] = $state([]);
   let probing: boolean = $state(false);
   let probeError: string | null = $state(null);
@@ -257,8 +261,11 @@
     manualModel = false;
     modelList = [];
     dialogModel = "";
+    dialogAgentId = null;
     creating = false;
     try {
+      // Load saved agent profiles for the selector.
+      agents = await listAgents();
       const s = await getSettings();
       dialogProvider = (s.default_provider as Provider) || "claude";
       dialogCwd = s.working_dir ?? "";
@@ -326,9 +333,32 @@
     }
   }
 
+  /** When the user selects a saved agent profile, auto-fill
+   *  provider/model/cwd from the profile (read-only). When "无" is
+   *  selected, revert to manual provider/model/cwd entry. */
+  function onAgentChange() {
+    if (!dialogAgentId) {
+      // "无" — manual mode: reset to defaults and re-probe
+      dialogModel = "";
+      manualModel = false;
+      modelList = [];
+      void onDialogProviderChange();
+      return;
+    }
+    const agent = agents.find((a) => a.id === dialogAgentId);
+    if (!agent) return;
+    // Auto-fill from the agent profile
+    dialogProvider = agent.provider as Provider;
+    dialogModel = agent.model ?? "";
+    dialogCwd = agent.cwd ?? "";
+    manualModel = true; // skip probe; the model comes from the profile
+    modelList = [];
+    probing = false;
+  }
+
   /** Re-probe when the user changes the provider in the dialog. Also
-   * re-pull the per-agent default model for the new provider (the
-   * user may have configured a default for claude but not codex). */
+   *  re-pull the per-agent default model for the new provider (the
+   *  user may have configured a default for claude but not codex). */
   async function onDialogProviderChange() {
     dialogModel = "";
     try {
@@ -355,7 +385,7 @@
     creating = true;
     try {
       const model = dialogModel.trim() || null;
-      const conv = await newConversation(dialogProvider, model, dialogCwd);
+      const conv = await newConversation(dialogProvider, model, dialogCwd, dialogAgentId);
       conversations = [conv, ...conversations];
       liveBuffers.set(conv.id, []);
       await selectConversation(conv.id);
@@ -720,13 +750,29 @@
   <div class="dialog-backdrop" role="dialog" aria-modal="true" aria-label="新建对话">
     <div class="dialog">
       <h2>新建对话</h2>
+      {#if agents.length > 0}
+        <div class="dialog-field">
+          <label for="dlg-agent">智能体</label>
+          <select
+            id="dlg-agent"
+            bind:value={dialogAgentId}
+            onchange={onAgentChange}
+            disabled={creating}
+          >
+            <option value={null}>无（直接选 Provider）</option>
+            {#each agents as a (a.id)}
+              <option value={a.id}>{a.name}</option>
+            {/each}
+          </select>
+        </div>
+      {/if}
       <div class="dialog-field">
         <label for="dlg-provider">Agent</label>
         <select
           id="dlg-provider"
           bind:value={dialogProvider}
           onchange={onDialogProviderChange}
-          disabled={probing || creating}
+          disabled={probing || creating || dialogAgentId !== null}
         >
           {#each PROVIDERS as p (p)}
             <option value={p}>{PROVIDER_LABEL[p]}</option>
@@ -759,7 +805,7 @@
             type="text"
             bind:value={dialogModel}
             placeholder="手动输入模型名 (留空 = 用 agent 默认模型)"
-            disabled={creating}
+            disabled={creating || dialogAgentId !== null}
           />
           {#if modelList.length === 0}
             <small class="muted">未探测到模型列表，请手动填写</small>
@@ -793,7 +839,7 @@
           type="text"
           bind:value={dialogCwd}
           placeholder="留空 = 用全局工作目录"
-          disabled={creating}
+          disabled={creating || dialogAgentId !== null}
         />
         <small class="muted">agent 子进程的 cwd。留空 = 用全局工作目录。</small>
       </div>

@@ -134,6 +134,15 @@ pub struct ExecOptions {
     pub model: Option<String>,
     pub resume_session_id: Option<String>,
     pub timeout: Option<Duration>,
+    /// The agent's system prompt / persona instructions. Threaded into
+    /// the provider CLI's native system-prompt mechanism: claude
+    /// `--append-system-prompt`, codex `baseInstructions`/`developerInstructions`,
+    /// opencode prepended to the prompt text.
+    pub system_prompt: Option<String>,
+    /// MCP server config as a JSON string (the `mcpServers` object).
+    /// Threaded into the provider CLI's native MCP mechanism: claude
+    /// `--mcp-config <file>`, codex `config` field. `None` = no MCP override.
+    pub mcp_config: Option<String>,
 }
 
 /// Final outcome of an `execute` session. `status` is agent-native

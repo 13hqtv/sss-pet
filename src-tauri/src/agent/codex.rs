@@ -418,10 +418,17 @@ pub(crate) fn build_thread_start_request(
     prompt: &str,
     cwd: &str,
     model: Option<&str>,
+    system_prompt: Option<&str>,
+    mcp_config: Option<&str>,
 ) -> Value {
     let model_val = model
         .map(String::from)
         .map(Value::String)
+        .unwrap_or(Value::Null);
+    let base_instructions = system_prompt.map(|s| Value::String(s.to_string())).unwrap_or(Value::Null);
+    let dev_instructions = system_prompt.map(|s| Value::String(s.to_string())).unwrap_or(Value::Null);
+    let config_val = mcp_config
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
         .unwrap_or(Value::Null);
     json!({
         "jsonrpc": "2.0",
@@ -434,9 +441,9 @@ pub(crate) fn build_thread_start_request(
             "cwd": cwd,
             "approvalPolicy": null,
             "sandbox": null,
-            "config": null,
-            "baseInstructions": null,
-            "developerInstructions": null,
+            "config": config_val,
+            "baseInstructions": base_instructions,
+            "developerInstructions": dev_instructions,
             "compactPrompt": null,
             "includeApplyPatchTool": null,
             "experimentalRawEvents": false,
@@ -463,10 +470,16 @@ pub(crate) fn build_thread_resume_request(
     prompt: &str,
     cwd: &str,
     model: Option<&str>,
+    system_prompt: Option<&str>,
+    mcp_config: Option<&str>,
 ) -> Value {
     let model_val = model
         .map(String::from)
         .map(Value::String)
+        .unwrap_or(Value::Null);
+    let dev_instructions = system_prompt.map(|s| Value::String(s.to_string())).unwrap_or(Value::Null);
+    let config_val = mcp_config
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
         .unwrap_or(Value::Null);
     json!({
         "jsonrpc": "2.0",
@@ -476,7 +489,8 @@ pub(crate) fn build_thread_resume_request(
             "threadId": session_id,
             "cwd": cwd,
             "model": model_val,
-            "developerInstructions": null,
+            "developerInstructions": dev_instructions,
+            "config": config_val,
             // Only omit history from the response, not the resumed model
             // context — mirrors multica codex.go:2010-2018.
             "excludeTurns": true,
@@ -778,8 +792,8 @@ impl Backend for CodexBackend {
         // 3. thread/start (id=2) or thread/resume (id=2). Extract the
         // session/thread id from the response (multica's extractThreadID).
         let thread_req = match &opts.resume_session_id {
-            Some(sid) => build_thread_resume_request(2, sid, prompt, &cwd_str, model_str),
-            None => build_thread_start_request(2, prompt, &cwd_str, model_str),
+            Some(sid) => build_thread_resume_request(2, sid, prompt, &cwd_str, model_str, opts.system_prompt.as_deref(), opts.mcp_config.as_deref()),
+            None => build_thread_start_request(2, prompt, &cwd_str, model_str, opts.system_prompt.as_deref(), opts.mcp_config.as_deref()),
         };
         write_request(&mut stdin, &thread_req)
             .await
@@ -1155,7 +1169,7 @@ mod tests {
 
     #[test]
     fn build_thread_start_request_shape() {
-        let req = build_thread_start_request(2, "hello", "/tmp/proj", None);
+        let req = build_thread_start_request(2, "hello", "/tmp/proj", None, None, None);
         assert_eq!(req["jsonrpc"], "2.0");
         assert_eq!(req["id"], 2);
         assert_eq!(req["method"], "thread/start");
@@ -1167,7 +1181,7 @@ mod tests {
 
     #[test]
     fn build_thread_start_request_with_model() {
-        let req = build_thread_start_request(2, "hi", "/tmp", Some("gpt-5.5"));
+        let req = build_thread_start_request(2, "hi", "/tmp", Some("gpt-5.5"), None, None);
         assert_eq!(req["params"]["model"], "gpt-5.5");
     }
 
@@ -1175,7 +1189,7 @@ mod tests {
 
     #[test]
     fn build_thread_resume_request_shape() {
-        let req = build_thread_resume_request(2, "th_prior", "again", "/tmp", None);
+        let req = build_thread_resume_request(2, "th_prior", "again", "/tmp", None, None, None);
         assert_eq!(req["jsonrpc"], "2.0");
         assert_eq!(req["id"], 2);
         assert_eq!(req["method"], "thread/resume");
@@ -1189,7 +1203,7 @@ mod tests {
 
     #[test]
     fn build_thread_resume_request_with_model() {
-        let req = build_thread_resume_request(2, "th_prior", "hi", "/tmp", Some("o3"));
+        let req = build_thread_resume_request(2, "th_prior", "hi", "/tmp", Some("o3"), None, None);
         assert_eq!(req["params"]["model"], "o3");
     }
 
@@ -1242,6 +1256,8 @@ mod tests {
             model: None,
             resume_session_id: None,
             timeout: None,
+            system_prompt: None,
+            mcp_config: None,
         };
         let res = backend.execute("hi", opts).await;
         assert!(
@@ -1270,6 +1286,8 @@ mod tests {
             model: None,
             resume_session_id: None,
             timeout: Some(Duration::from_secs(120)),
+            system_prompt: None,
+            mcp_config: None,
         };
         let mut session = backend
             .execute("Reply with exactly: hello", opts)

@@ -41,6 +41,8 @@ async fn real_opencode_replies_hello() {
         model: Some("aliyun/glm-5.2".into()),
         resume_session_id: None,
         timeout: Some(Duration::from_secs(120)),
+        system_prompt: None,
+        mcp_config: None,
     };
 
     let mut session = backend

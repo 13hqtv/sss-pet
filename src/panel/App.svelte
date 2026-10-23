@@ -24,8 +24,9 @@
   import TodosView from "./views/TodosView.svelte";
   import RemindersView from "./views/RemindersView.svelte";
   import SettingsView from "./views/SettingsView.svelte";
+  import AgentsView from "./views/AgentsView.svelte";
 
-  type TabId = "chat" | "todos" | "reminders" | "settings";
+  type TabId = "chat" | "agents" | "todos" | "reminders" | "settings";
 
   interface Tab {
     id: TabId;
@@ -34,6 +35,7 @@
 
   const TABS: Tab[] = [
     { id: "chat", label: "对话" },
+    { id: "agents", label: "智能体" },
     { id: "todos", label: "代办" },
     { id: "reminders", label: "提醒" },
     { id: "settings", label: "设置" },
@@ -130,6 +132,7 @@
           const tab = e.payload as TabId;
           if (
             tab === "chat" ||
+            tab === "agents" ||
             tab === "todos" ||
             tab === "reminders" ||
             tab === "settings"
@@ -188,6 +191,8 @@
   <section class="body">
     {#if activeTab === "chat"}
       <ChatView />
+    {:else if activeTab === "agents"}
+      <AgentsView />
     {:else if activeTab === "todos"}
       <TodosView />
     {:else if activeTab === "reminders"}

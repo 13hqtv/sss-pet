@@ -58,7 +58,27 @@ pub(crate) fn build_args(opts: &ExecOptions) -> Vec<String> {
         args.push("--resume".into());
         args.push(id.clone());
     }
+    if let Some(prompt) = &opts.system_prompt {
+        args.push("--append-system-prompt".into());
+        args.push(prompt.clone());
+    }
+    if let Some(mcp) = &opts.mcp_config {
+        if let Ok(path) = write_mcp_temp_file(mcp) {
+            args.push("--mcp-config".into());
+            args.push(path.to_string_lossy().to_string());
+        }
+    }
     args
+}
+
+/// Write the MCP config JSON to a temporary file and return its path.
+/// The claude CLI's `--mcp-config` flag expects a file path, not inline JSON.
+fn write_mcp_temp_file(mcp_json: &str) -> std::io::Result<std::path::PathBuf> {
+    let dir = std::env::temp_dir().join("swd-pet-mcp");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("mcp-{}.json", std::process::id()));
+    std::fs::write(&path, mcp_json)?;
+    Ok(path)
 }
 
 /// Build the stream-json user-message payload written to the claude CLI's
@@ -400,6 +420,8 @@ mod tests {
             model: None,
             resume_session_id: None,
             timeout: None,
+            system_prompt: None,
+            mcp_config: None,
         };
         let args = build_args(&opts);
         assert_eq!(
@@ -422,6 +444,8 @@ mod tests {
             model: Some("claude-opus-4-8".into()),
             resume_session_id: Some("abc-123".into()),
             timeout: None,
+            system_prompt: None,
+            mcp_config: None,
         };
         let args = build_args(&opts);
         assert_eq!(

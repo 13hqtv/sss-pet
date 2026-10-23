@@ -377,13 +377,21 @@ impl Backend for OpencodeBackend {
             .take()
             .ok_or_else(|| BackendError::Exec("opencode stdout pipe not captured".into()))?;
 
-        // Write the raw prompt text to stdin, then close it. `opencode run`
+        // Write the prompt text to stdin, then close it. `opencode run`
         // merges its variadic `[message..]` positional with piped stdin; with
         // no positionals the piped text is the entire run message
         // (multica opencode.go:129-152). Closing stdin is what ends the prompt
         // — opencode reads stdin to EOF (`await Bun.stdin.text()`), so a stdin
         // left open hangs the run forever.
-        if let Err(e) = stdin.write_all(prompt.as_bytes()).await {
+        //
+        // opencode doesn't support CLI system-prompt flags, so the agent's
+        // system_prompt (if set) is prepended to the prompt text.
+        let effective_prompt = if let Some(sp) = &opts.system_prompt {
+            format!("{sp}\n\n{prompt}")
+        } else {
+            prompt.to_string()
+        };
+        if let Err(e) = stdin.write_all(effective_prompt.as_bytes()).await {
             return Err(BackendError::Exec(format!("write opencode stdin: {e}")));
         }
         drop(stdin);
@@ -659,6 +667,8 @@ mod tests {
             model: None,
             resume_session_id: None,
             timeout: None,
+            system_prompt: None,
+            mcp_config: None,
         };
         assert_eq!(
             build_args(&opts),
@@ -673,6 +683,8 @@ mod tests {
             model: Some("aliyun/glm-5.2".into()),
             resume_session_id: Some("ses_abc".into()),
             timeout: None,
+            system_prompt: None,
+            mcp_config: None,
         };
         assert_eq!(
             build_args(&opts),

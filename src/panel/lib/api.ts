@@ -39,12 +39,11 @@ export interface Conversation {
   session_id: string | null;
   title: string;
   created_at: string;
-  /** The model selected at creation (`null` = the agent's own default
-   * model — no `--model` flag). Immutable. Task 1. */
   model: string | null;
-  /** The working directory the agent CLI runs in for this conversation.
-   * Immutable. Task 1. */
   cwd: string;
+  /** The saved agent profile this conversation was created with.
+   * `null` = no agent profile (raw provider+model+cwd). Immutable. */
+  agent_id: string | null;
 }
 
 /** Mirrors `agent::conversation::StoredMessage` (the persisted shape —
@@ -123,8 +122,14 @@ export async function newConversation(
   provider: Provider,
   model: string | null,
   cwd: string,
+  agentId?: string | null,
 ): Promise<Conversation> {
-  return invoke<Conversation>("new_conversation", { provider, model, cwd });
+  return invoke<Conversation>("new_conversation", {
+    provider,
+    model,
+    cwd,
+    agentId: agentId ?? null,
+  });
 }
 
 /** `chat::load_history` — all stored messages for a conversation
@@ -155,4 +160,159 @@ export async function chatSend(convId: string, prompt: string): Promise<void> {
  * name (design: 兜底). */
 export async function listModels(provider: Provider): Promise<string[]> {
   return invoke<string[]>("list_models", { provider });
+}
+
+/** `get_exe_path` — returns the absolute path to the running swd-pet.exe.
+ * Used by AgentsView to auto-fill the MCP config's `command` field. */
+export async function getExePath(): Promise<string> {
+  return invoke<string>("get_exe_path");
+}
+
+// ---------------------------------------------------------------------------
+// Agent management (agents + skills + agent_skills + agent_generate)
+// ---------------------------------------------------------------------------
+
+/** Mirrors `db::Agent`. A saved agent profile = provider + model +
+ * system_prompt + mcp_config + cwd, named and reusable. */
+export interface Agent {
+  id: string;
+  name: string;
+  description: string | null;
+  provider: string;
+  model: string | null;
+  system_prompt: string | null;
+  mcp_config: string | null;
+  cwd: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Mirrors `db::Skill`. A reusable skill (SKILL.md body + metadata). */
+export interface Skill {
+  id: string;
+  name: string;
+  description: string | null;
+  content: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+// -- Agent CRUD --
+
+export async function listAgents(): Promise<Agent[]> {
+  return invoke<Agent[]>("agent_list");
+}
+
+export async function getAgent(id: string): Promise<Agent | null> {
+  return invoke<Agent | null>("agent_get", { id });
+}
+
+export async function createAgent(params: {
+  name: string;
+  description?: string | null;
+  provider: string;
+  model?: string | null;
+  systemPrompt?: string | null;
+  mcpConfig?: string | null;
+  cwd?: string | null;
+}): Promise<string> {
+  return invoke<string>("agent_create", {
+    name: params.name,
+    description: params.description ?? null,
+    provider: params.provider,
+    model: params.model ?? null,
+    systemPrompt: params.systemPrompt ?? null,
+    mcpConfig: params.mcpConfig ?? null,
+    cwd: params.cwd ?? null,
+  });
+}
+
+export async function updateAgent(params: {
+  id: string;
+  name: string;
+  description?: string | null;
+  provider: string;
+  model?: string | null;
+  systemPrompt?: string | null;
+  mcpConfig?: string | null;
+  cwd?: string | null;
+}): Promise<void> {
+  await invoke("agent_update", {
+    id: params.id,
+    name: params.name,
+    description: params.description ?? null,
+    provider: params.provider,
+    model: params.model ?? null,
+    systemPrompt: params.systemPrompt ?? null,
+    mcpConfig: params.mcpConfig ?? null,
+    cwd: params.cwd ?? null,
+  });
+}
+
+export async function deleteAgent(id: string): Promise<void> {
+  await invoke("agent_delete", { id });
+}
+
+// -- Skill CRUD --
+
+export async function listSkills(): Promise<Skill[]> {
+  return invoke<Skill[]>("skill_list");
+}
+
+export async function createSkill(params: {
+  name: string;
+  description?: string | null;
+  content?: string | null;
+}): Promise<string> {
+  return invoke<string>("skill_create", {
+    name: params.name,
+    description: params.description ?? null,
+    content: params.content ?? null,
+  });
+}
+
+export async function updateSkill(params: {
+  id: string;
+  name: string;
+  description?: string | null;
+  content?: string | null;
+}): Promise<void> {
+  await invoke("skill_update", {
+    id: params.id,
+    name: params.name,
+    description: params.description ?? null,
+    content: params.content ?? null,
+  });
+}
+
+export async function deleteSkill(id: string): Promise<void> {
+  await invoke("skill_delete", { id });
+}
+
+// -- Agent-Skill assignment --
+
+export async function listAgentSkills(agentId: string): Promise<Array<[Skill, boolean]>> {
+  return invoke<Array<[Skill, boolean]>>("agent_skills_list", { agentId });
+}
+
+export async function addAgentSkill(agentId: string, skillId: string): Promise<void> {
+  await invoke("agent_skill_add", { agentId, skillId });
+}
+
+export async function removeAgentSkill(agentId: string, skillId: string): Promise<void> {
+  await invoke("agent_skill_remove", { agentId, skillId });
+}
+
+export async function setAgentSkillEnabled(agentId: string, skillId: string, enabled: boolean): Promise<void> {
+  await invoke("agent_skill_set_enabled", { agentId, skillId, enabled });
+}
+
+// -- AI-powered agent creation --
+
+/** `agent_generate` — one-shot LLM call that takes a natural-language
+ * description and returns the LLM's text response (which should contain
+ * an `<agent_draft>` JSON block the frontend parses to populate the
+ * create form). Uses the default provider + model from config. */
+export async function generateAgent(description: string, provider?: string): Promise<string> {
+  return invoke<string>("agent_generate", { description, provider: provider ?? null });
 }

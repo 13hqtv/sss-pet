@@ -33,7 +33,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::Connection;
+pub use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::conversation::{Conversation, StoredMessage, TurnRecord};
@@ -267,6 +267,34 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             state TEXT NOT NULL,
             at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS agents (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT,
+            provider TEXT NOT NULL,
+            model TEXT,
+            system_prompt TEXT,
+            mcp_config TEXT,
+            cwd TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS skills (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT,
+            content TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS agent_skills (
+            agent_id TEXT NOT NULL,
+            skill_id TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (agent_id, skill_id),
+            FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
+            FOREIGN KEY (skill_id) REFERENCES skills(id) ON DELETE CASCADE
         );",
     )?;
     // Task 1: idempotent column adds. SQLite's `ALTER TABLE … ADD COLUMN`
@@ -303,6 +331,10 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "UPDATE todos SET status = 'completed' WHERE done = 1 AND status = 'pending';",
     )?;
+    // Agent management: link a conversation to a saved agent profile.
+    // null = no agent (raw provider+model+cwd, the original behavior).
+    // Immutable once set at conversation creation time.
+    add_column_if_missing(conn, "conversations", "agent_id", "TEXT")?;
     Ok(())
 }
 
@@ -362,8 +394,8 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<
 /// 改" ruling — so the UPSERT's `DO UPDATE` arm does NOT touch them).
 pub fn save_conversation(conn: &Connection, conv: &Conversation) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO conversations (id, provider, session_id, title, created_at, model, cwd)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "INSERT INTO conversations (id, provider, session_id, title, created_at, model, cwd, agent_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(id) DO UPDATE SET
             provider = excluded.provider,
             session_id = excluded.session_id,
@@ -377,6 +409,7 @@ pub fn save_conversation(conn: &Connection, conv: &Conversation) -> rusqlite::Re
             conv.created_at.to_rfc3339(),
             conv.model,
             conv.cwd,
+            conv.agent_id,
         ],
     )?;
     Ok(())
@@ -409,6 +442,7 @@ pub fn new_conversation(
     provider: &str,
     model: Option<String>,
     cwd: &str,
+    agent_id: Option<String>,
 ) -> rusqlite::Result<Conversation> {
     let conv = Conversation {
         id: uuid::Uuid::new_v4().to_string(),
@@ -418,6 +452,7 @@ pub fn new_conversation(
         created_at: chrono::Utc::now(),
         model,
         cwd: cwd.to_string(),
+        agent_id,
     };
     save_conversation(conn, &conv)?;
     Ok(conv)
@@ -427,7 +462,7 @@ pub fn new_conversation(
 /// reads the immutable `model` + `cwd` columns.
 pub fn load_conversation(conn: &Connection, id: &str) -> rusqlite::Result<Option<Conversation>> {
     let row = conn.query_row(
-        "SELECT id, provider, session_id, title, created_at, model, cwd \
+        "SELECT id, provider, session_id, title, created_at, model, cwd, agent_id \
          FROM conversations WHERE id = ?1",
         [id],
         |row| {
@@ -439,11 +474,12 @@ pub fn load_conversation(conn: &Connection, id: &str) -> rusqlite::Result<Option
                 row.get::<_, String>(4)?,
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
             ))
         },
     );
     match row {
-        Ok((id, provider, session_id, title, created_at_str, model, cwd)) => {
+        Ok((id, provider, session_id, title, created_at_str, model, cwd, agent_id)) => {
             let created_at = parse_dt(&created_at_str)?;
             Ok(Some(Conversation {
                 id,
@@ -453,6 +489,7 @@ pub fn load_conversation(conn: &Connection, id: &str) -> rusqlite::Result<Option
                 created_at,
                 model,
                 cwd,
+                agent_id,
             }))
         }
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -465,7 +502,7 @@ pub fn load_conversation(conn: &Connection, id: &str) -> rusqlite::Result<Option
 /// sidebar labels threads by project dir + model).
 pub fn list_conversations(conn: &Connection) -> rusqlite::Result<Vec<Conversation>> {
     let mut stmt = conn.prepare(
-        "SELECT id, provider, session_id, title, created_at, model, cwd \
+        "SELECT id, provider, session_id, title, created_at, model, cwd, agent_id \
          FROM conversations ORDER BY created_at",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -477,11 +514,12 @@ pub fn list_conversations(conn: &Connection) -> rusqlite::Result<Vec<Conversatio
             row.get::<_, String>(4)?,
             row.get::<_, Option<String>>(5)?,
             row.get::<_, String>(6)?,
+            row.get::<_, Option<String>>(7)?,
         ))
     })?;
     let mut out = Vec::new();
     for r in rows {
-        let (id, provider, session_id, title, created_at_str, model, cwd) = r?;
+        let (id, provider, session_id, title, created_at_str, model, cwd, agent_id) = r?;
         out.push(Conversation {
             id,
             provider,
@@ -490,6 +528,7 @@ pub fn list_conversations(conn: &Connection) -> rusqlite::Result<Vec<Conversatio
             created_at: parse_dt(&created_at_str)?,
             model,
             cwd,
+            agent_id,
         });
     }
     Ok(out)
@@ -884,6 +923,311 @@ pub fn log_pet_state(conn: &Connection, state: &str) -> rusqlite::Result<()> {
 }
 
 // ===========================================================================
+// Agents + Skills + AgentSkills (agent management feature)
+// ===========================================================================
+
+/// A saved agent profile. `provider` is one of the SUPPORTED whitelist
+/// (claude/codex/opencode). `model` is `None` = use the provider's default.
+/// `system_prompt` is the agent's persona/role definition, threaded into
+/// `ExecOptions.system_prompt` on each turn. `mcp_config` is a JSON string
+/// (the `mcpServers` object). `cwd` is `None` = use the global working dir.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Agent {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub provider: String,
+    pub model: Option<String>,
+    pub system_prompt: Option<String>,
+    pub mcp_config: Option<String>,
+    pub cwd: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A reusable skill (SKILL.md body + metadata). Skills are assigned to
+/// agents via the `agent_skills` junction table; at execution time their
+/// content is concatenated into the agent's effective system prompt.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Skill {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub content: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A skill assignment row — links an agent to a skill with an enabled flag.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentSkill {
+    pub agent_id: String,
+    pub skill_id: String,
+    pub enabled: bool,
+}
+
+/// List all agents, most-recently-updated first.
+pub fn agent_list(conn: &Connection) -> rusqlite::Result<Vec<Agent>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, description, provider, model, system_prompt, \
+         mcp_config, cwd, created_at, updated_at \
+         FROM agents ORDER BY updated_at DESC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(Agent {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            description: row.get(2)?,
+            provider: row.get(3)?,
+            model: row.get(4)?,
+            system_prompt: row.get(5)?,
+            mcp_config: row.get(6)?,
+            cwd: row.get(7)?,
+            created_at: row.get(8)?,
+            updated_at: row.get(9)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Load one agent by id, or `None` if no such row.
+pub fn agent_get(conn: &Connection, id: &str) -> rusqlite::Result<Option<Agent>> {
+    let row = conn.query_row(
+        "SELECT id, name, description, provider, model, system_prompt, \
+         mcp_config, cwd, created_at, updated_at \
+         FROM agents WHERE id = ?1",
+        [id],
+        |row| {
+            Ok(Agent {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                provider: row.get(3)?,
+                model: row.get(4)?,
+                system_prompt: row.get(5)?,
+                mcp_config: row.get(6)?,
+                cwd: row.get(7)?,
+                created_at: row.get(8)?,
+                updated_at: row.get(9)?,
+            })
+        },
+    );
+    match row {
+        Ok(a) => Ok(Some(a)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Create a new agent. Returns the new uuid id.
+pub fn agent_create(
+    conn: &Connection,
+    name: &str,
+    description: Option<&str>,
+    provider: &str,
+    model: Option<&str>,
+    system_prompt: Option<&str>,
+    mcp_config: Option<&str>,
+    cwd: Option<&str>,
+) -> rusqlite::Result<String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO agents (id, name, description, provider, model, \
+         system_prompt, mcp_config, cwd, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        rusqlite::params![id, name, description, provider, model, system_prompt, mcp_config, cwd, now, now],
+    )?;
+    Ok(id)
+}
+
+/// Update all fields of an agent (except id, created_at).
+pub fn agent_update(
+    conn: &Connection,
+    id: &str,
+    name: &str,
+    description: Option<&str>,
+    provider: &str,
+    model: Option<&str>,
+    system_prompt: Option<&str>,
+    mcp_config: Option<&str>,
+    cwd: Option<&str>,
+) -> rusqlite::Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE agents SET name = ?2, description = ?3, provider = ?4, \
+         model = ?5, system_prompt = ?6, mcp_config = ?7, cwd = ?8, \
+         updated_at = ?9 WHERE id = ?1",
+        rusqlite::params![id, name, description, provider, model, system_prompt, mcp_config, cwd, now],
+    )?;
+    Ok(())
+}
+
+/// Delete an agent by id. The `agent_skills` junction rows are deleted
+/// automatically via the ON DELETE CASCADE foreign key.
+pub fn agent_delete(conn: &Connection, id: &str) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM agents WHERE id = ?1", rusqlite::params![id])?;
+    Ok(())
+}
+
+/// List all skills, most-recently-updated first.
+pub fn skill_list(conn: &Connection) -> rusqlite::Result<Vec<Skill>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, description, content, created_at, updated_at \
+         FROM skills ORDER BY updated_at DESC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(Skill {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            description: row.get(2)?,
+            content: row.get(3)?,
+            created_at: row.get(4)?,
+            updated_at: row.get(5)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Create a new skill. Returns the new uuid id.
+pub fn skill_create(
+    conn: &Connection,
+    name: &str,
+    description: Option<&str>,
+    content: Option<&str>,
+) -> rusqlite::Result<String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO skills (id, name, description, content, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![id, name, description, content, now, now],
+    )?;
+    Ok(id)
+}
+
+/// Update all fields of a skill (except id, created_at).
+pub fn skill_update(
+    conn: &Connection,
+    id: &str,
+    name: &str,
+    description: Option<&str>,
+    content: Option<&str>,
+) -> rusqlite::Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE skills SET name = ?2, description = ?3, content = ?4, updated_at = ?5 \
+         WHERE id = ?1",
+        rusqlite::params![id, name, description, content, now],
+    )?;
+    Ok(())
+}
+
+/// Delete a skill by id. The `agent_skills` junction rows are deleted
+/// automatically via the ON DELETE CASCADE foreign key.
+pub fn skill_delete(conn: &Connection, id: &str) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM skills WHERE id = ?1", rusqlite::params![id])?;
+    Ok(())
+}
+
+/// List all skills assigned to an agent, with their enabled flag.
+/// Returns `(Skill, enabled: bool)` tuples.
+pub fn agent_skills_list(conn: &Connection, agent_id: &str) -> rusqlite::Result<Vec<(Skill, bool)>> {
+    let mut stmt = conn.prepare(
+        "SELECT s.id, s.name, s.description, s.content, s.created_at, s.updated_at, \
+         a.enabled FROM skills s \
+         JOIN agent_skills a ON a.skill_id = s.id \
+         WHERE a.agent_id = ?1 ORDER BY s.name",
+    )?;
+    let rows = stmt.query_map([agent_id], |row| {
+        Ok((
+            Skill {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                content: row.get(3)?,
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+            },
+            row.get::<_, i64>(6)? != 0,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Assign a skill to an agent (enabled by default). Idempotent — if the
+/// assignment already exists, this is a no-op.
+pub fn agent_skill_add(conn: &Connection, agent_id: &str, skill_id: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO agent_skills (agent_id, skill_id, enabled) VALUES (?1, ?2, 1)",
+        rusqlite::params![agent_id, skill_id],
+    )?;
+    Ok(())
+}
+
+/// Remove a skill assignment from an agent.
+pub fn agent_skill_remove(conn: &Connection, agent_id: &str, skill_id: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM agent_skills WHERE agent_id = ?1 AND skill_id = ?2",
+        rusqlite::params![agent_id, skill_id],
+    )?;
+    Ok(())
+}
+
+/// Toggle the enabled flag on an agent-skill assignment.
+pub fn agent_skill_set_enabled(
+    conn: &Connection,
+    agent_id: &str,
+    skill_id: &str,
+    enabled: bool,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE agent_skills SET enabled = ?3 WHERE agent_id = ?1 AND skill_id = ?2",
+        rusqlite::params![agent_id, skill_id, enabled as i64],
+    )?;
+    Ok(())
+}
+
+/// Load all enabled skills for an agent, ordered by name. Used by
+/// `chat_send` to build the effective system prompt (agent's system_prompt
+/// + concatenated skill content).
+pub fn agent_enabled_skills(conn: &Connection, agent_id: &str) -> rusqlite::Result<Vec<Skill>> {
+    let mut stmt = conn.prepare(
+        "SELECT s.id, s.name, s.description, s.content, s.created_at, s.updated_at \
+         FROM skills s \
+         JOIN agent_skills a ON a.skill_id = s.id \
+         WHERE a.agent_id = ?1 AND a.enabled = 1 ORDER BY s.name",
+    )?;
+    let rows = stmt.query_map([agent_id], |row| {
+        Ok(Skill {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            description: row.get(2)?,
+            content: row.get(3)?,
+            created_at: row.get(4)?,
+            updated_at: row.get(5)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -959,6 +1303,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             model: None,
             cwd: ".".into(),
+            agent_id: None,
         };
         save_conversation(&conn, &conv).expect("save");
         let loaded = load_conversation(&conn, &conv.id).expect("load");
@@ -988,6 +1333,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             model: None,
             cwd: ".".into(),
+            agent_id: None,
         };
         save_conversation(&conn, &conv).expect("save");
         let msgs = vec![
@@ -1022,6 +1368,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             model: None,
             cwd: ".".into(),
+            agent_id: None,
         };
         save_conversation(&conn, &conv).expect("save");
         // TurnRecord with two messages + a result that surfaces a new
@@ -1100,6 +1447,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             model: None,
             cwd: ".".into(),
+            agent_id: None,
         };
         save_conversation(&conn, &conv).expect("save");
         let record = TurnRecord {
@@ -1160,7 +1508,8 @@ mod tests {
                 title TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 model TEXT,
-                cwd TEXT NOT NULL DEFAULT '.'
+                cwd TEXT NOT NULL DEFAULT '.',
+                agent_id TEXT
              );",
         )
         .expect("rebuild conversations with CHECK");
@@ -1173,6 +1522,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             model: None,
             cwd: ".".into(),
+            agent_id: None,
         };
         save_conversation(&conn, &conv).expect("save conversation with valid session_id");
 
@@ -1499,6 +1849,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             model: None,
             cwd: ".".into(),
+            agent_id: None,
         };
         save_conversation(&conn, &conv).expect("save must succeed on the fallback path");
         let loaded = load_conversation(&conn, &conv.id).expect("load").expect("present");
@@ -1596,7 +1947,7 @@ mod tests {
     #[test]
     fn new_conversation_round_trips_model_and_cwd() {
         let (_tmp, conn) = fresh_db();
-        let conv = new_conversation(&conn, "claude", Some("sonnet".into()), "/tmp")
+        let conv = new_conversation(&conn, "claude", Some("sonnet".into()), "/tmp", None)
             .expect("new_conversation");
         assert_eq!(conv.provider, "claude");
         assert_eq!(conv.model.as_deref(), Some("sonnet"));
@@ -1623,7 +1974,7 @@ mod tests {
     #[test]
     fn new_conversation_none_model_round_trips() {
         let (_tmp, conn) = fresh_db();
-        let conv = new_conversation(&conn, "codex", None, ".").expect("new_conversation");
+        let conv = new_conversation(&conn, "codex", None, ".", None).expect("new_conversation");
         assert!(conv.model.is_none(), "None model stored as None");
         let loaded = load_conversation(&conn, &conv.id)
             .expect("load")
@@ -1647,6 +1998,7 @@ mod tests {
             provider: "claude".into(),
             model: None,
             cwd: ".".into(),
+            agent_id: None,
             session_id: None,
             title: "Kinds".into(),
             created_at: chrono::Utc::now(),
@@ -1734,6 +2086,7 @@ mod tests {
             provider: "claude".into(),
             model: None,
             cwd: ".".into(),
+            agent_id: None,
             session_id: None,
             title: "Old".into(),
             created_at: chrono::Utc::now(),
@@ -1782,7 +2135,7 @@ mod tests {
     #[test]
     fn list_conversations_returns_model_and_cwd() {
         let (_tmp, conn) = fresh_db();
-        let conv = new_conversation(&conn, "claude", Some("sonnet".into()), "/proj")
+        let conv = new_conversation(&conn, "claude", Some("sonnet".into()), "/proj", None)
             .expect("new_conversation");
         let list = list_conversations(&conn).expect("list");
         let found = list

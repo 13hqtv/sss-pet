@@ -112,6 +112,14 @@ pub struct Conversation {
     /// The working directory the agent CLI runs in for this conversation.
     /// Immutable. Task 1.
     pub cwd: String,
+    /// The saved agent profile this conversation was created with, if any.
+    /// `None` = no agent profile (raw provider+model+cwd, the original
+    /// behavior). Immutable — set at creation, never updated. When set,
+    /// `chat_send` loads the agent's live system_prompt + skills + mcp_config
+    /// on each turn (so editing the agent profile affects future turns in
+    /// existing conversations).
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 /// One turn's captured record: the streamed [`Message`]s the backend
@@ -200,26 +208,22 @@ pub fn resume_or_replay(
     conv: &Conversation,
     history: &[StoredMessage],
     new_prompt: &str,
+    system_prompt: Option<String>,
+    mcp_config: Option<String>,
 ) -> (ExecOptions, String) {
     let cwd = std::path::PathBuf::from(".");
     match &conv.session_id {
-        // Resume — the agent holds the conversation in its own session
-        // store (claude `--resume` / opencode `--session` / codex
-        // `thread/resume`). Pass the native id; the prompt is just the
-        // new turn — the history is NOT replayed (the agent has it
-        // natively).
         Some(id) => {
             let opts = ExecOptions {
                 cwd,
                 model: conv.model.clone(),
                 resume_session_id: Some(id.clone()),
                 timeout: None,
+                system_prompt,
+                mcp_config,
             };
             (opts, new_prompt.to_string())
         }
-        // Replay — no native session. Embed the history as context
-        // (`role: content` lines under a header) followed by the new
-        // prompt. `resume_session_id` is `None`.
         None => {
             let prompt = build_replay_prompt(history, new_prompt);
             let opts = ExecOptions {
@@ -227,6 +231,8 @@ pub fn resume_or_replay(
                 model: conv.model.clone(),
                 resume_session_id: None,
                 timeout: None,
+                system_prompt,
+                mcp_config,
             };
             (opts, prompt)
         }
@@ -291,9 +297,12 @@ pub async fn run_turn(
     history: &[StoredMessage],
     new_prompt: &str,
     cwd: &Path,
+    system_prompt: Option<String>,
+    mcp_config: Option<String>,
 ) -> Result<(Session, Arc<Mutex<TurnRecord>>), BackendError> {
     // 1. Decide resume vs replay; set the cwd to the caller's project dir.
-    let (mut opts, prompt) = resume_or_replay(conv, history, new_prompt);
+    let (mut opts, prompt) =
+        resume_or_replay(conv, history, new_prompt, system_prompt, mcp_config);
     opts.cwd = cwd.to_path_buf();
 
     // 2. Drive the backend with the combined (or raw) prompt + the opts.
@@ -468,6 +477,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             model: None,
             cwd: ".".into(),
+            agent_id: None,
         }
     }
 
@@ -480,6 +490,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             model: None,
             cwd: ".".into(),
+            agent_id: None,
         }
     }
 
@@ -512,7 +523,7 @@ mod tests {
         let conv = conv_with_session();
         let hist = history();
         let new_prompt = "and 3+3?";
-        let (opts, prompt) = resume_or_replay(&conv, &hist, new_prompt);
+        let (opts, prompt) = resume_or_replay(&conv, &hist, new_prompt, None, None);
         assert_eq!(opts.resume_session_id.as_deref(), Some("s1"));
         assert_eq!(prompt, new_prompt, "resume prompt must be the new turn only");
         assert!(
@@ -533,7 +544,7 @@ mod tests {
         let conv = conv_no_session();
         let hist = history();
         let new_prompt = "continue";
-        let (opts, prompt) = resume_or_replay(&conv, &hist, new_prompt);
+        let (opts, prompt) = resume_or_replay(&conv, &hist, new_prompt, None, None);
         assert!(opts.resume_session_id.is_none());
         assert!(
             prompt.contains("what is 2+2"),
@@ -569,6 +580,8 @@ mod tests {
             &hist,
             "go",
             &cwd,
+            None,
+            None,
         )
         .await
         .expect("run_turn ok");
@@ -654,7 +667,7 @@ mod tests {
         // Resume path — conv.model == Some("sonnet") → opts.model == Some("sonnet")
         let mut conv = conv_with_session();
         conv.model = Some("sonnet".into());
-        let (opts, _prompt) = resume_or_replay(&conv, &history(), "go");
+        let (opts, _prompt) = resume_or_replay(&conv, &history(), "go", None, None);
         assert_eq!(
             opts.model.as_deref(),
             Some("sonnet"),
@@ -664,7 +677,7 @@ mod tests {
 
         // Resume path — conv.model == None → opts.model == None
         let conv = conv_with_session(); // already model: None
-        let (opts, _prompt) = resume_or_replay(&conv, &history(), "go");
+        let (opts, _prompt) = resume_or_replay(&conv, &history(), "go", None, None);
         assert!(
             opts.model.is_none(),
             "resume path: conv.model == None must yield opts.model == None, got: {:?}",
@@ -674,7 +687,7 @@ mod tests {
         // Replay path — conv.model == Some("sonnet") → opts.model == Some("sonnet")
         let mut conv = conv_no_session();
         conv.model = Some("sonnet".into());
-        let (opts, _prompt) = resume_or_replay(&conv, &history(), "go");
+        let (opts, _prompt) = resume_or_replay(&conv, &history(), "go", None, None);
         assert_eq!(
             opts.model.as_deref(),
             Some("sonnet"),
@@ -684,7 +697,7 @@ mod tests {
 
         // Replay path — conv.model == None → opts.model == None
         let conv = conv_no_session(); // already model: None
-        let (opts, _prompt) = resume_or_replay(&conv, &history(), "go");
+        let (opts, _prompt) = resume_or_replay(&conv, &history(), "go", None, None);
         assert!(
             opts.model.is_none(),
             "replay path: conv.model == None must yield opts.model == None, got: {:?}",
@@ -763,6 +776,8 @@ mod tests {
             &history(),
             "go",
             &cwd,
+            None,
+            None,
         )
         .await
         .expect("run_turn ok");
@@ -818,6 +833,8 @@ mod tests {
             &hist,
             "go",
             &cwd,
+            None,
+            None,
         )
         .await
         .expect("run_turn ok");

@@ -109,6 +109,8 @@ pub async fn run_chat_turn(
     conv_id: &str,
     prompt: &str,
     cwd: &Path,
+    system_prompt: Option<String>,
+    mcp_config: Option<String>,
 ) -> Result<(), String> {
     // 1. Load conv + history; append the user's prompt as a stored
     //    "user" message BEFORE the agent runs (so history shows the
@@ -144,9 +146,11 @@ pub async fn run_chat_turn(
     //    facing channel pair) AND the Arc<Mutex<TurnRecord>> buffer
     //    (the persistent record). Even if the frontend drops its
     //    receivers, the buffer keeps capturing (Review Focus #3).
-    let (session, turn_record) = run_turn(backend, &conv, &_history, prompt, cwd)
-        .await
-        .map_err(|e| format!("run_turn: {e}"))?;
+    let (session, turn_record) = run_turn(
+        backend, &conv, &_history, prompt, cwd, system_prompt, mcp_config,
+    )
+    .await
+    .map_err(|e| format!("run_turn: {e}"))?;
 
     // 3. Spawn the stream-drain task. It owns the Session (drains
     //    messages + awaits result) + the db Arc (for save_turn_record
@@ -351,16 +355,38 @@ pub fn new_conversation(
     provider: String,
     model: Option<String>,
     cwd: String,
+    agent_id: Option<String>,
 ) -> Result<Conversation, String> {
-    let cwd_str = if cwd.trim().is_empty() {
-        crate::config::resolve_agent_cwd()
-            .to_string_lossy()
-            .to_string()
+    // If an agent profile is selected, load it and copy its provider/model/cwd
+    // into the conversation (overriding the dialog's defaults).
+    let (provider, model, cwd_str) = if let Some(ref aid) = agent_id {
+        let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+        let agent = db::agent_get(&conn, aid)
+            .map_err(|e| format!("agent_get: {e}"))?
+            .ok_or_else(|| format!("agent not found: {aid}"))?;
+        drop(conn);
+        let agent_cwd = if let Some(c) = agent.cwd.as_ref() {
+            if c.trim().is_empty() {
+                crate::config::resolve_agent_cwd().to_string_lossy().to_string()
+            } else {
+                c.clone()
+            }
+        } else {
+            crate::config::resolve_agent_cwd().to_string_lossy().to_string()
+        };
+        (agent.provider, agent.model, agent_cwd)
     } else {
-        cwd
+        let cwd_str = if cwd.trim().is_empty() {
+            crate::config::resolve_agent_cwd()
+                .to_string_lossy()
+                .to_string()
+        } else {
+            cwd
+        };
+        (provider, model, cwd_str)
     };
     let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
-    db::new_conversation(&conn, &provider, model, &cwd_str)
+    db::new_conversation(&conn, &provider, model, &cwd_str, agent_id)
         .map_err(|e| format!("new_conversation: {e}"))
 }
 
@@ -408,18 +434,61 @@ pub async fn chat_send(
     prompt: String,
 ) -> Result<(), String> {
     // Load the conversation; use conv.cwd + conv.provider (source of
-    // truth — set at creation, immutable) for run_turn + agent::new. NO
-    // more config::resolve_agent_cwd() here — the conversation's own
-    // cwd + provider are authoritative. (new_conversation still reads
-    // config::resolve_agent_cwd() as the default cwd when CREATING a
-    // conversation; this is fine — that's exactly the "new-conversation
-    // default" role the global config plays after Task 4.)
-    let (cwd, provider) = {
+    // truth — set at creation, immutable) for run_turn + agent::new. If
+    // conv.agent_id is set, also load the agent profile + enabled skills
+    // and build the effective system_prompt (agent.system_prompt +
+    // concatenated skill content) + mcp_config.
+    let (cwd, provider, system_prompt, mcp_config) = {
         let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
         let conv = db::load_conversation(&conn, &conv_id)
             .map_err(|e| format!("load_conversation: {e}"))?
             .ok_or_else(|| format!("conversation {conv_id} not found"))?;
-        (std::path::PathBuf::from(conv.cwd), conv.provider)
+        let cwd = std::path::PathBuf::from(conv.cwd);
+        let provider = conv.provider;
+        // If the conversation is linked to a saved agent profile, load
+        // its live system_prompt + skills + mcp_config. The provider/model/
+        // cwd are already pinned at conversation creation (immutable), but
+        // system_prompt/skills/mcp are read fresh each turn so editing the
+        // agent profile affects existing conversations.
+        let (sp, mc) = if let Some(ref aid) = conv.agent_id {
+            let agent = db::agent_get(&conn, aid)
+                .map_err(|e| format!("agent_get: {e}"))?
+                .ok_or_else(|| format!("agent {aid} not found"))?;
+            let skills = db::agent_enabled_skills(&conn, aid)
+                .map_err(|e| format!("agent_enabled_skills: {e}"))?;
+            // Build the effective system prompt: agent's own prompt +
+            // concatenated skill content.
+            let mut prompt_parts = Vec::new();
+            if let Some(s) = &agent.system_prompt {
+                if !s.trim().is_empty() {
+                    prompt_parts.push(s.clone());
+                }
+            }
+            for skill in &skills {
+                let mut section = format!("## Skill: {}\n", skill.name);
+                if let Some(desc) = &skill.description {
+                    if !desc.trim().is_empty() {
+                        section.push_str(desc);
+                        section.push('\n');
+                    }
+                }
+                if let Some(content) = &skill.content {
+                    if !content.trim().is_empty() {
+                        section.push_str(content);
+                    }
+                }
+                prompt_parts.push(section);
+            }
+            let effective_sp = if prompt_parts.is_empty() {
+                None
+            } else {
+                Some(prompt_parts.join("\n\n"))
+            };
+            (effective_sp, agent.mcp_config)
+        } else {
+            (None, None)
+        };
+        (cwd, provider, sp, mc)
     };
     let cfg = BackendConfig::default();
     let backend =
@@ -440,7 +509,7 @@ pub async fn chat_send(
     // as the command call; clone the Arc out so the spawn (which
     // outlives this command's IPC call) keeps a valid handle.
     let db_arc = db.inner().clone();
-    run_chat_turn(backend.as_ref(), emit, db_arc, &conv_id, &prompt, &cwd).await
+    run_chat_turn(backend.as_ref(), emit, db_arc, &conv_id, &prompt, &cwd, system_prompt, mcp_config).await
 }
 
 // ===========================================================================
@@ -548,6 +617,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             model: None,
             cwd: ".".into(),
+            agent_id: None,
         };
         {
             let conn = db_state.lock().unwrap();
@@ -595,6 +665,8 @@ mod tests {
             &conv.id,
             "go",
             &cwd,
+            None,
+            None,
         )
         .await
         .expect("run_chat_turn ok");
@@ -681,6 +753,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             model: None,
             cwd: ".".into(),
+            agent_id: None,
         };
         {
             let conn = db_state.lock().unwrap();
@@ -726,6 +799,8 @@ mod tests {
             &conv.id,
             "ping",
             &cwd,
+            None,
+            None,
         )
         .await
         .expect("run_chat_turn ok");
