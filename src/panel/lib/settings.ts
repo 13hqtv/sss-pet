@@ -149,6 +149,96 @@ export async function deleteReminder(id: number): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// KPIs (db::Kpi: id, year, kpi_type, title, details, planned_at, status,
+//        created_at, updated_at + db::KpiTarget: year+type → target_count)
+// ---------------------------------------------------------------------------
+
+export type KpiStatus = "not_started" | "in_progress" | "completed";
+
+export interface Kpi {
+  id: number;
+  year: number;
+  kpi_type: string;
+  title: string;
+  details: string | null;
+  planned_at: string | null;
+  status: KpiStatus;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface KpiTarget {
+  id: number;
+  year: number;
+  kpi_type: string;
+  target_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export async function listKpis(): Promise<Kpi[]> {
+  return invoke<Kpi[]>("kpi_list");
+}
+
+export async function addKpi(params: {
+  year: number;
+  kpiType: string;
+  title: string;
+  details?: string | null;
+  plannedAt?: string | null;
+}): Promise<number> {
+  return invoke<number>("kpi_add", {
+    year: params.year,
+    kpiType: params.kpiType,
+    title: params.title,
+    details: params.details ?? null,
+    plannedAt: params.plannedAt ?? null,
+  });
+}
+
+export async function updateKpi(params: {
+  id: number;
+  year: number;
+  kpiType: string;
+  title: string;
+  details?: string | null;
+  plannedAt?: string | null;
+}): Promise<void> {
+  await invoke("kpi_update", {
+    id: params.id,
+    year: params.year,
+    kpiType: params.kpiType,
+    title: params.title,
+    details: params.details ?? null,
+    plannedAt: params.plannedAt ?? null,
+  });
+}
+
+export async function setKpiStatus(id: number, status: KpiStatus): Promise<void> {
+  await invoke("kpi_set_status", { id, status });
+}
+
+export async function deleteKpi(id: number): Promise<void> {
+  await invoke("kpi_delete", { id });
+}
+
+export async function listKpiTargets(year: number): Promise<KpiTarget[]> {
+  return invoke<KpiTarget[]>("kpi_target_list", { year });
+}
+
+export async function upsertKpiTarget(params: {
+  year: number;
+  kpiType: string;
+  targetCount: number;
+}): Promise<void> {
+  await invoke("kpi_target_upsert", {
+    year: params.year,
+    kpiType: params.kpiType,
+    targetCount: params.targetCount,
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Settings (config::Settings: follow_activity_min_secs, theme, focus,
 //                       default_provider, working_dir)
 // ---------------------------------------------------------------------------
@@ -176,6 +266,9 @@ export interface Settings {
   /** Roster of responsible persons for the 代办 tab. Configured as
    * comma-separated text in SettingsView. */
   responsible_persons: string[];
+  /** Roster of KPI types for the KPI tab. Configured as comma-separated
+   * text in SettingsView, same pattern as responsible_persons. */
+  kpi_types: string[];
 }
 
 /** Mirrors `config::ProviderCfg` — the per-agent config (Task 5:

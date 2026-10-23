@@ -23,10 +23,11 @@
   import ChatView from "./views/ChatView.svelte";
   import TodosView from "./views/TodosView.svelte";
   import RemindersView from "./views/RemindersView.svelte";
+  import KpisView from "./views/KpisView.svelte";
   import SettingsView from "./views/SettingsView.svelte";
   import AgentsView from "./views/AgentsView.svelte";
 
-  type TabId = "chat" | "agents" | "todos" | "reminders" | "settings";
+  type TabId = "chat" | "agents" | "todos" | "reminders" | "kpi" | "settings";
 
   interface Tab {
     id: TabId;
@@ -34,18 +35,16 @@
   }
 
   const TABS: Tab[] = [
-    { id: "chat", label: "对话" },
-    { id: "agents", label: "智能体" },
     { id: "todos", label: "代办" },
     { id: "reminders", label: "提醒" },
+    { id: "kpi", label: "KPI" },
+    { id: "chat", label: "对话" },
+    { id: "agents", label: "智能体" },
     { id: "settings", label: "设置" },
   ];
 
-  // Active tab — defaults to 对话 (the main view). Svelte 5 runes:
-  // typed via the variable annotation (NOT `$state<T>(...)`, which
-  // svelte-check mis-parses — see task-15-report.md "Svelte 5 runes
-  // + svelte-check" concern).
-  let activeTab: TabId = $state("chat");
+  // Active tab — defaults to 代办.
+  let activeTab: TabId = $state("todos");
 
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -135,6 +134,7 @@
             tab === "agents" ||
             tab === "todos" ||
             tab === "reminders" ||
+            tab === "kpi" ||
             tab === "settings"
           ) {
             activeTab = tab;
@@ -177,6 +177,8 @@
       <TodosView />
     {:else if activeTab === "reminders"}
       <RemindersView />
+    {:else if activeTab === "kpi"}
+      <KpisView />
     {:else if activeTab === "settings"}
       <SettingsView />
     {/if}

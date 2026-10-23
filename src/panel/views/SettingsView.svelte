@@ -50,6 +50,8 @@
   let autostart: boolean = $state(false);
   // Responsible persons roster for the 代办 tab — comma-separated text.
   let responsiblePersons: string = $state("");
+  // KPI types roster for the KPI tab — comma-separated text.
+  let kpiTypes: string = $state("");
   // Task 5: per-agent default model local-edit copies. The user probes
   // + picks; the global 保存 button persists all three to
   // Config.providers.<agent>.default_model.
@@ -93,6 +95,7 @@
       defaultProvider = (s.default_provider as Provider) || "claude";
       workingDir = s.working_dir ?? "";
       responsiblePersons = (s.responsible_persons ?? []).join(", ");
+      kpiTypes = (s.kpi_types ?? []).join(", ");
       providerModels = {
         claude: s.providers.claude.default_model ?? null,
         codex: s.providers.codex.default_model ?? null,
@@ -199,6 +202,10 @@
         opencode: buildCfg("opencode"),
       },
       responsible_persons: responsiblePersons
+        .split(",")
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0),
+      kpi_types: kpiTypes
         .split(",")
         .map((s) => s.trim())
         .filter((s) => s.length > 0),
@@ -335,6 +342,17 @@
           placeholder="用英文逗号分隔，如：张三,李四,王五"
         />
         <small>代办页的责任人下拉列表从这里的配置读取。</small>
+      </div>
+
+      <div class="field">
+        <label for="kpi-types">KPI类型</label>
+        <input
+          id="kpi-types"
+          type="text"
+          bind:value={kpiTypes}
+          placeholder="用英文逗号分隔，如：需求开发,Bug修复,技术分享"
+        />
+        <small>KPI页的类型下拉列表和进度条从这里的配置读取。每类型的年度目标数在KPI页面内单独设置。</small>
       </div>
 
       <!-- Task 5: per-agent default model. Each agent has a row with a

@@ -544,6 +544,98 @@ fn reminder_delete(db: State<'_, Arc<Mutex<Connection>>>, id: i64) -> Result<(),
     db::reminder_delete(&conn, id).map_err(|e| format!("reminder_delete: {e}"))
 }
 
+// ===========================================================================
+// KPI management commands (team KPI tracking). Thin wrappers around
+// `db::kpi_*` / `db::kpi_target_*`, same pattern as todo_/reminder_.
+// ===========================================================================
+
+#[tauri::command]
+fn kpi_list(db: State<'_, Arc<Mutex<Connection>>>) -> Result<Vec<db::Kpi>, String> {
+    let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+    db::kpi_list(&conn).map_err(|e| format!("kpi_list: {e}"))
+}
+
+#[tauri::command]
+fn kpi_add(
+    db: State<'_, Arc<Mutex<Connection>>>,
+    year: i64,
+    kpi_type: String,
+    title: String,
+    details: Option<String>,
+    planned_at: Option<String>,
+) -> Result<i64, String> {
+    let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+    db::kpi_add(
+        &conn,
+        year,
+        &kpi_type,
+        &title,
+        details.as_deref(),
+        planned_at.as_deref(),
+    )
+    .map_err(|e| format!("kpi_add: {e}"))
+}
+
+#[tauri::command]
+fn kpi_update(
+    db: State<'_, Arc<Mutex<Connection>>>,
+    id: i64,
+    year: i64,
+    kpi_type: String,
+    title: String,
+    details: Option<String>,
+    planned_at: Option<String>,
+) -> Result<(), String> {
+    let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+    db::kpi_update(
+        &conn,
+        id,
+        year,
+        &kpi_type,
+        &title,
+        details.as_deref(),
+        planned_at.as_deref(),
+    )
+    .map_err(|e| format!("kpi_update: {e}"))
+}
+
+#[tauri::command]
+fn kpi_set_status(
+    db: State<'_, Arc<Mutex<Connection>>>,
+    id: i64,
+    status: String,
+) -> Result<(), String> {
+    let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+    db::kpi_set_status(&conn, id, &status).map_err(|e| format!("kpi_set_status: {e}"))
+}
+
+#[tauri::command]
+fn kpi_delete(db: State<'_, Arc<Mutex<Connection>>>, id: i64) -> Result<(), String> {
+    let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+    db::kpi_delete(&conn, id).map_err(|e| format!("kpi_delete: {e}"))
+}
+
+#[tauri::command]
+fn kpi_target_list(
+    db: State<'_, Arc<Mutex<Connection>>>,
+    year: i64,
+) -> Result<Vec<db::KpiTarget>, String> {
+    let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+    db::kpi_target_list(&conn, year).map_err(|e| format!("kpi_target_list: {e}"))
+}
+
+#[tauri::command]
+fn kpi_target_upsert(
+    db: State<'_, Arc<Mutex<Connection>>>,
+    year: i64,
+    kpi_type: String,
+    target_count: i64,
+) -> Result<(), String> {
+    let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+    db::kpi_target_upsert(&conn, year, &kpi_type, target_count)
+        .map_err(|e| format!("kpi_target_upsert: {e}"))
+}
+
 /// Dismiss the pet's current `?` (NeedsYou) alert. Applies
 /// `Signal::Dismissed` to the brain + emits the resulting state
 /// immediately so the frontend's `?` clears on the same click (no
@@ -740,6 +832,14 @@ pub fn run() {
             reminder_set_status,
             reminder_snooze,
             reminder_delete,
+            // KPI management: kpi CRUD + kpi_target upsert.
+            kpi_list,
+            kpi_add,
+            kpi_update,
+            kpi_set_status,
+            kpi_delete,
+            kpi_target_list,
+            kpi_target_upsert,
             // Agent management: agent CRUD + skill CRUD + agent-skill
             // assignment + AI-powered agent creation.
             agent_list,

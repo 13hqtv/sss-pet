@@ -2,13 +2,13 @@
 
 Windows 11 桌面宠物 + AI 智能体助手。基于 Tauri v2 + Rust + Svelte 5 构建。
 
-悬浮在桌面上的小机器人，可以拖动、点击打开面板。面板包含五个页签：对话、智能体、代办、提醒、设置。
+悬浮在桌面上的小机器人，可以拖动、点击打开面板。面板包含六个页签：代办、提醒、KPI、对话、智能体、设置。
 
 ## 功能特性
 
 ### 桌面宠物
 
-- **悬浮机器人**：120×120 透明窗口，始终置顶，不显示在任务栏
+- **悬浮机器人**：260×160 透明窗口，始终置顶，不显示在任务栏（窗口尺寸容纳提醒气泡弹窗）
 - **拖动**：按住机器人拖动到任意位置，自动保存位置
 - **点击切换面板**：点击机器人打开/关闭面板窗口，面板自动定位在机器人附近
 - **穿透点击**：机器人周围的透明区域可穿透鼠标点击到下层窗口；光标进入机器人中心区域时自动变为可交互
@@ -60,9 +60,31 @@ Windows 11 桌面宠物 + AI 智能体助手。基于 Tauri v2 + Rust + Svelte 5
 
 ### 提醒（Reminders）
 
-- **定时提醒**：设置文本 + 到期时间，到点弹出 Windows toast 通知 + 宠物显示「!」状态
-- **提醒列表**：已触发的提醒灰显
-- **后台调度**：独立 tokio 任务每秒检查到期提醒
+- **一次性/周期性**：支持 once（一次性，到指定时间点触发）和 recurring（周期性，按间隔重复触发）
+- **周期配置**：周期性提醒可设置间隔值 + 单位（分钟/小时/天/周）
+- **3 种状态**：pending（待触发）、active（已触发待处理）、done（已完成）
+- **推迟操作**：支持推迟 10 分钟 / 1 小时 / 1 天
+- **气泡弹窗**：提醒触发时在宠物窗口显示气泡弹窗，包含提醒内容 + 4 个操作按钮（不再提醒/推迟 10min/推迟 1hour/推迟 1day）
+- **多行内容**：提醒内容支持多行文本
+- **代办截止提醒**：代办任务在结束时间前 24 小时自动触发提醒气泡，复用提醒弹窗能力
+- **后台调度**：独立 tokio 任务定期检查到期提醒，一次性触发后转 active 待处理，周期性计算下次触发时间
+- **多维筛选**：状态 chips + 搜索 + 内联编辑表单
+- **MCP 接口**：通过 MCP 协议暴露提醒 CRUD 操作（见下方 MCP 服务器）
+
+### KPI 管理（KPIs）
+
+- **团队 KPI 跟踪**：按年度管理 KPI 事项，字段包含年度、KPI类型、事项标题、事项详情、计划完成时间、状态
+- **3 种状态**：未进行（not_started）、进行中（in_progress）、已完成（completed）
+- **进度条概览**：按 KPI 类型显示该类型的年度完成率（已完成数/目标数×100%），进度可超过 100%
+  - 颜色分级：≥100% 绿色、50-99% 蓝色、<50% 琥珀
+  - 超过 100% 时显示「超额」徽章 + 真实百分比
+- **年度目标数**：每个类型的年度目标数在 KPI 页面内直接编辑（进度条旁边的小输入框），按年度独立配置，存储在数据库
+- **KPI 类型配置**：在设置页配置 KPI 类型列表（逗号分隔文本），KPI 页的类型下拉和进度条从配置读取
+- **年度选择器**：顶部下拉框切换查看不同年份的 KPI 数据
+- **多维筛选**：搜索 + 状态 chips + 类型下拉
+- **卡片列表**：状态圆点 + 标题 + 类型徽章 + 计划日期，状态底色区分（进行中琥珀、已完成绿+删除线）
+- **内联表单**：新增/编辑就地展开，含年度输入、类型选择、日期选择器
+- **两步删除确认**：同代办模式
 
 ### 设置（Settings）
 
@@ -73,11 +95,12 @@ Windows 11 桌面宠物 + AI 智能体助手。基于 Tauri v2 + Rust + Svelte 5
 - **开机自启动**：Windows 注册表（HKCU\…\Run），即时生效
 - **工作目录**：agent CLI 运行目录，新建对话时作为默认预填值
 - **代办责任人**：逗号分隔的责任人花名册
+- **KPI类型**：逗号分隔的 KPI 类型列表（如：需求开发,Bug修复,技术分享）
 - **Agent 默认模型**：每个 Provider 探测并选择默认模型，新建对话时预填
 
-### 代办 MCP 服务器
+### MCP 服务器
 
-swd-pet.exe 可作为 MCP（Model Context Protocol）服务器运行，让本地 agent CLI（Claude Code、Codex 等）通过 MCP 协议直接操作代办数据。
+swd-pet.exe 可作为 MCP（Model Context Protocol）服务器运行，让本地 agent CLI（Claude Code、Codex 等）通过 MCP 协议直接操作代办和提醒数据。
 
 **启动方式**：
 ```bash
@@ -96,17 +119,22 @@ swd-pet.exe mcp-server
 }
 ```
 
-**暴露的 5 个 MCP Tools**：
+**暴露的 10 个 MCP Tools**：
 
 | Tool | 参数 | 功能 |
 |------|------|------|
 | `todo_list` | status?, priority?, assignee? | 查询代办列表，支持筛选 |
 | `todo_add` | text(必填), priority?, assignee?, start_at?, end_at?, notes? | 新增代办 |
 | `todo_update` | id(必填), text(必填), priority?, assignee?, start_at?, end_at?, notes? | 修改代办 |
-| `todo_set_status` | id(必填), status(必填) | 设置状态 |
+| `todo_set_status` | id(必填), status(必填) | 设置代办状态 |
 | `todo_delete` | id(必填) | 删除代办 |
+| `reminder_list` | status? | 查询提醒列表，支持筛选 |
+| `reminder_add` | text(必填), reminder_type?, interval_value?, interval_unit?, fire_at? | 新增提醒 |
+| `reminder_update` | id(必填), text(必填), reminder_type?, interval_value?, interval_unit?, fire_at? | 修改提醒 |
+| `reminder_set_status` | id(必填), status(必填) | 设置提醒状态 |
+| `reminder_delete` | id(必填) | 删除提醒 |
 
-MCP 服务器打开与 GUI 应用相同的 SQLite 数据库，agent 看到的代办数据与用户在面板中看到的完全同步。
+MCP 服务器打开与 GUI 应用相同的 SQLite 数据库，agent 看到的代办/提醒数据与用户在面板中看到的完全同步。
 
 ## 技术栈
 
@@ -127,6 +155,7 @@ MCP 服务器打开与 GUI 应用相同的 SQLite 数据库，agent 看到的代
 - `tokio` (async runtime, subprocess 管理)
 - `serde` / `serde_json` / `toml` (序列化)
 - `chrono` (时间戳)
+- `log` (日志门面，自定义 FileLogger 按天轮转)
 - `uuid` (对话 ID)
 - `which` (CLI 路径查找)
 - `device_query` + `windows-sys` (Win32 光标/空闲检测)
@@ -143,6 +172,7 @@ swd-pet/
 │   │   │   ├── AgentsView.svelte  # 智能体管理页
 │   │   │   ├── TodosView.svelte   # 代办页
 │   │   │   ├── RemindersView.svelte # 提醒页
+│   │   │   ├── KpisView.svelte     # KPI管理页
 │   │   │   └── SettingsView.svelte # 设置页
 │   │   ├── lib/
 │   │   │   ├── api.ts            # IPC 封装 (对话/智能体/技能/MCP)
@@ -160,7 +190,7 @@ swd-pet/
 │   │   ├── db.rs                  # SQLite: 迁移 + 全部 CRUD
 │   │   ├── config.rs              # TOML 配置 + Settings 投影
 │   │   ├── chat.rs                # 对话流程 (chat_send → run_chat_turn)
-│   │   ├── mcp_server.rs          # MCP JSON-RPC 服务器 (代办 tools)
+│   │   ├── mcp_server.rs          # MCP JSON-RPC 服务器 (代办+提醒 tools)
 │   │   ├── window.rs              # 窗口管理 (穿透/拖动/面板定位)
 │   │   ├── tray.rs                # 系统托盘菜单
 │   │   ├── brain.rs               # 宠物状态机 (1Hz tick)
@@ -168,7 +198,8 @@ swd-pet/
 │   │   ├── timers.rs              # 跟随活动节流
 │   │   ├── state.rs               # 宠物状态枚举
 │   │   ├── notify.rs              # Windows toast 通知
-│   │   ├── reminders.rs           # 提醒调度器
+│   │   ├── reminders.rs           # 提醒调度器 (一次性/周期性/推迟/弹窗)
+│   │   ├── logger.rs              # 文件日志 (按天轮转)
 │   │   └── agent/                 # AI 后端
 │   │       ├── mod.rs             # Backend trait + ExecOptions + 工厂
 │   │       ├── claude.rs          # Claude CLI 后端
@@ -218,7 +249,7 @@ pnpm svelte-check
 cd src-tauri && cargo test
 ```
 
-167 个单元测试覆盖：数据库 CRUD、迁移幂等性、对话流程、配置往返、提醒调度等。
+176 个单元测试覆盖：数据库 CRUD、迁移幂等性、对话流程、配置往返、提醒调度、KPI 管理等。
 
 ## 打包构建
 
@@ -248,23 +279,28 @@ pnpm tauri build
 swd-pet.exe mcp-server
 ```
 
-从 stdin 读取 JSON-RPC 请求，向 stdout 写入响应。详见上方「代办 MCP 服务器」章节。
+从 stdin 读取 JSON-RPC 请求，向 stdout 写入响应。详见上方「MCP 服务器」章节。
 
 ## 数据存储
 
 所有数据存储在 exe 同目录（便携模式）或 `%APPDATA%\swd-pet\`（exe 目录只读时回退）：
 
-| 文件 | 内容 |
+| 路径 | 内容 |
 |------|------|
-| `swd-pet.db` | SQLite 数据库：conversations、messages、agents、skills、agent_skills、todos、reminders、pet_state_log |
-| `config.toml` | TOML 配置：主题、provider 默认值、工作目录、勿扰、宠物/面板位置、责任人花名册 |
+| `swd-pet.db` | SQLite 数据库：conversations、messages、agents、skills、agent_skills、todos、reminders、kpis、kpi_targets、pet_state_log |
+| `config.toml` | TOML 配置：主题、provider 默认值、工作目录、勿扰、宠物/面板位置、责任人花名册、KPI类型列表 |
+| `log/swd-pet-YYYY-MM-DD.log` | 按天轮转的日志文件，记录生命周期事件、错误、调度器状态等 |
+
+## 日志
+
+应用运行时将日志写入 `{data_dir}/log/` 目录，按天轮转（文件名含日期）。GUI 模式同时输出到 stderr，MCP 模式仅写文件。日志级别包括 INFO（生命周期事件：DB 迁移、调度器启动等）和 ERROR（异常、崩溃信息），便于定位问题。
 
 ## 窗口配置
 
 | 窗口 | 尺寸 | 特性 |
 |------|------|------|
-| pet | 120×120 | 透明、无装饰、始终置顶、不在任务栏、不可缩放 |
-| panel | 380×560 | 可缩放、默认隐藏、点击宠物显示/隐藏 |
+| pet | 260×160 | 透明、无装饰、无阴影、始终置顶、不在任务栏、不可缩放（容纳提醒气泡弹窗） |
+| panel | 760×560 | 无装饰、可缩放、默认隐藏、点击宠物显示/隐藏 |
 
 ## 设计系统
 

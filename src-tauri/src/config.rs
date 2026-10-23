@@ -78,6 +78,13 @@ pub struct Config {
     /// loading (the field is absent in pre-v2 configs).
     #[serde(default)]
     pub responsible_persons: Vec<String>,
+    /// Roster of KPI types for the KPI tab. Configured as a
+    /// comma-separated string in SettingsView (e.g.
+    /// "需求开发,Bug修复,技术分享"). The KpisView's type dropdown and
+    /// progress-bar section read from this list. Empty by default
+    /// (first run). `#[serde(default)]` keeps old config files loading.
+    #[serde(default)]
+    pub kpi_types: Vec<String>,
 }
 
 /// Default for `Config::default_provider`. Kept as a function so
@@ -100,6 +107,7 @@ impl Default for Config {
             default_provider: default_provider(),
             working_dir: None,
             responsible_persons: Vec::new(),
+            kpi_types: Vec::new(),
         }
     }
 }
@@ -406,6 +414,10 @@ pub struct Settings {
     /// configs loading (empty list when the field is absent).
     #[serde(default)]
     pub responsible_persons: Vec<String>,
+    /// Roster of KPI types for the KPI tab (comma-separated in
+    /// SettingsView, same pattern as `responsible_persons`).
+    #[serde(default)]
+    pub kpi_types: Vec<String>,
 }
 
 impl From<&Config> for Settings {
@@ -418,6 +430,7 @@ impl From<&Config> for Settings {
             working_dir: c.working_dir.clone(),
             providers: c.providers.clone(),
             responsible_persons: c.responsible_persons.clone(),
+            kpi_types: c.kpi_types.clone(),
         }
     }
 }
@@ -454,6 +467,7 @@ pub fn settings_set(settings: Settings) -> Result<(), String> {
     // the new-conv dialog pre-fills the model from this default).
     cfg.providers = settings.providers;
     cfg.responsible_persons = settings.responsible_persons;
+    cfg.kpi_types = settings.kpi_types;
     save(&cfg).map_err(|e| format!("settings_set save failed: {e}"))
 }
 
@@ -525,6 +539,7 @@ mod tests {
             default_provider: "codex".into(),
             working_dir: Some("C:\\code\\proj".into()),
             responsible_persons: vec!["alice".into(), "bob".into()],
+            kpi_types: vec!["需求开发".into(), "Bug修复".into()],
         };
         save(&cfg).expect("save");
         let loaded = load();
@@ -545,6 +560,7 @@ mod tests {
             default_provider: "claude".into(),
             working_dir: None,
             responsible_persons: Vec::new(),
+            kpi_types: Vec::new(),
         };
         save(&cfg).expect("save");
         assert_eq!(load(), cfg);

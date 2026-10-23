@@ -295,6 +295,26 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             PRIMARY KEY (agent_id, skill_id),
             FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
             FOREIGN KEY (skill_id) REFERENCES skills(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS kpis (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            year INTEGER NOT NULL,
+            kpi_type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            details TEXT,
+            planned_at TEXT,
+            status TEXT NOT NULL DEFAULT 'not_started',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS kpi_targets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            year INTEGER NOT NULL,
+            kpi_type TEXT NOT NULL,
+            target_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(year, kpi_type)
         );",
     )?;
     // Task 1: idempotent column adds. SQLite's `ALTER TABLE … ADD COLUMN`
@@ -1078,6 +1098,162 @@ pub fn reminder_clear_snooze(conn: &Connection, id: i64) -> rusqlite::Result<()>
     conn.execute(
         "UPDATE reminders SET snoozed_until = NULL WHERE id = ?1",
         rusqlite::params![id],
+    )?;
+    Ok(())
+}
+
+// ===========================================================================
+// KPI management (team KPI tracking)
+// ===========================================================================
+
+/// One KPI item row. `status` is not_started(未进行) / in_progress(进行中)
+/// / completed(已完成). `year` is the target year (e.g. 2026). `kpi_type`
+/// is a label from the comma-separated `kpi_types` config. `planned_at`
+/// is an RFC3339 date (planned completion time, day-granularity). `details`
+/// is an optional longer description.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Kpi {
+    pub id: i64,
+    pub year: i64,
+    pub kpi_type: String,
+    pub title: String,
+    pub details: Option<String>,
+    pub planned_at: Option<String>,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One per-year-per-type KPI target. The `target_count` is the annual goal
+/// number of completed KPIs for this type+year. Progress is computed as
+/// completed_count / target_count (can exceed 100%). UNIQUE(year, kpi_type)
+/// ensures one target per pair; `kpi_target_upsert` uses INSERT OR REPLACE.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KpiTarget {
+    pub id: i64,
+    pub year: i64,
+    pub kpi_type: String,
+    pub target_count: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// List all KPI items, newest-year-first, then planned_at ascending
+/// (nulls last), then by id.
+pub fn kpi_list(conn: &Connection) -> rusqlite::Result<Vec<Kpi>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, year, kpi_type, title, details, planned_at, status, created_at, updated_at \
+         FROM kpis ORDER BY year DESC, COALESCE(planned_at, '9999') ASC, id ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(Kpi {
+            id: row.get(0)?,
+            year: row.get(1)?,
+            kpi_type: row.get(2)?,
+            title: row.get(3)?,
+            details: row.get(4)?,
+            planned_at: row.get(5)?,
+            status: row.get(6)?,
+            created_at: row.get(7)?,
+            updated_at: row.get(8)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Add a KPI item. Returns the new row id. Status defaults to
+/// 'not_started' in the DB schema.
+pub fn kpi_add(
+    conn: &Connection,
+    year: i64,
+    kpi_type: &str,
+    title: &str,
+    details: Option<&str>,
+    planned_at: Option<&str>,
+) -> rusqlite::Result<i64> {
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO kpis (year, kpi_type, title, details, planned_at, status, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 'not_started', ?6, ?6)",
+        rusqlite::params![year, kpi_type, title, details, planned_at, now],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Update all editable fields of a KPI (everything except `status` —
+/// use [`kpi_set_status`] for that, and `created_at` which is immutable).
+pub fn kpi_update(
+    conn: &Connection,
+    id: i64,
+    year: i64,
+    kpi_type: &str,
+    title: &str,
+    details: Option<&str>,
+    planned_at: Option<&str>,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE kpis SET year = ?2, kpi_type = ?3, title = ?4, details = ?5, planned_at = ?6, \
+         updated_at = ?7 WHERE id = ?1",
+        rusqlite::params![id, year, kpi_type, title, details, planned_at, chrono::Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+/// Set the status of a KPI (not_started | in_progress | completed).
+pub fn kpi_set_status(conn: &Connection, id: i64, status: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE kpis SET status = ?2, updated_at = ?3 WHERE id = ?1",
+        rusqlite::params![id, status, chrono::Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+/// Delete a KPI by id.
+pub fn kpi_delete(conn: &Connection, id: i64) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM kpis WHERE id = ?1", rusqlite::params![id])?;
+    Ok(())
+}
+
+/// List all KPI targets for a given year.
+pub fn kpi_target_list(conn: &Connection, year: i64) -> rusqlite::Result<Vec<KpiTarget>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, year, kpi_type, target_count, created_at, updated_at \
+         FROM kpi_targets WHERE year = ?1 ORDER BY kpi_type ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![year], |row| {
+        Ok(KpiTarget {
+            id: row.get(0)?,
+            year: row.get(1)?,
+            kpi_type: row.get(2)?,
+            target_count: row.get(3)?,
+            created_at: row.get(4)?,
+            updated_at: row.get(5)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Upsert a KPI target for a given year+type. Uses INSERT OR REPLACE
+/// so the UNIQUE(year, kpi_type) constraint replaces an existing row.
+pub fn kpi_target_upsert(
+    conn: &Connection,
+    year: i64,
+    kpi_type: &str,
+    target_count: i64,
+) -> rusqlite::Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT OR REPLACE INTO kpi_targets (year, kpi_type, target_count, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?4)",
+        rusqlite::params![year, kpi_type, target_count, now],
     )?;
     Ok(())
 }
@@ -2362,5 +2538,87 @@ mod tests {
             .expect("new conv appears in list");
         assert_eq!(found.model.as_deref(), Some("sonnet"));
         assert_eq!(found.cwd, "/proj");
+    }
+
+    // -- KPI CRUD --
+
+    #[test]
+    fn kpi_add_and_list() {
+        let (_tmp, conn) = fresh_db();
+        let id = kpi_add(&conn, 2026, "需求开发", "用户登录", Some("实现登录页面"), Some("2026-03-01T00:00:00Z"))
+            .expect("kpi_add");
+        assert!(id > 0);
+        let list = kpi_list(&conn).expect("kpi_list");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].year, 2026);
+        assert_eq!(list[0].kpi_type, "需求开发");
+        assert_eq!(list[0].title, "用户登录");
+        assert_eq!(list[0].status, "not_started");
+        assert_eq!(list[0].details.as_deref(), Some("实现登录页面"));
+        assert_eq!(list[0].planned_at.as_deref(), Some("2026-03-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn kpi_update_fields() {
+        let (_tmp, conn) = fresh_db();
+        let id = kpi_add(&conn, 2026, "Bug修复", "修复崩溃", None, None)
+            .expect("kpi_add");
+        kpi_update(&conn, id, 2025, "需求开发", "修复登录崩溃", Some("详情更新"), Some("2026-01-15T00:00:00Z"))
+            .expect("kpi_update");
+        let list = kpi_list(&conn).expect("kpi_list");
+        assert_eq!(list.len(), 1);
+        let k = &list[0];
+        assert_eq!(k.year, 2025);
+        assert_eq!(k.kpi_type, "需求开发");
+        assert_eq!(k.title, "修复登录崩溃");
+        assert_eq!(k.details.as_deref(), Some("详情更新"));
+        assert_eq!(k.planned_at.as_deref(), Some("2026-01-15T00:00:00Z"));
+    }
+
+    #[test]
+    fn kpi_set_status_updates() {
+        let (_tmp, conn) = fresh_db();
+        let id = kpi_add(&conn, 2026, "技术分享", "Rust分享", None, None)
+            .expect("kpi_add");
+        kpi_set_status(&conn, id, "in_progress").expect("kpi_set_status");
+        let list = kpi_list(&conn).expect("kpi_list");
+        assert_eq!(list[0].status, "in_progress");
+        kpi_set_status(&conn, id, "completed").expect("kpi_set_status");
+        let list = kpi_list(&conn).expect("kpi_list");
+        assert_eq!(list[0].status, "completed");
+    }
+
+    #[test]
+    fn kpi_delete_removes() {
+        let (_tmp, conn) = fresh_db();
+        let id = kpi_add(&conn, 2026, "Bug修复", "修复崩溃", None, None)
+            .expect("kpi_add");
+        assert_eq!(kpi_list(&conn).expect("list").len(), 1);
+        kpi_delete(&conn, id).expect("kpi_delete");
+        assert_eq!(kpi_list(&conn).expect("list").len(), 0);
+    }
+
+    #[test]
+    fn kpi_target_upsert_and_list() {
+        let (_tmp, conn) = fresh_db();
+        // Insert a new target.
+        kpi_target_upsert(&conn, 2026, "需求开发", 10).expect("upsert");
+        let targets = kpi_target_list(&conn, 2026).expect("target_list");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].kpi_type, "需求开发");
+        assert_eq!(targets[0].target_count, 10);
+        // Upsert replaces (same year+type → UPDATE via INSERT OR REPLACE).
+        kpi_target_upsert(&conn, 2026, "需求开发", 15).expect("upsert2");
+        let targets = kpi_target_list(&conn, 2026).expect("target_list2");
+        assert_eq!(targets.len(), 1, "UNIQUE(year, kpi_type) → still 1 row");
+        assert_eq!(targets[0].target_count, 15, "target_count updated");
+        // A different type is a new row.
+        kpi_target_upsert(&conn, 2026, "Bug修复", 20).expect("upsert3");
+        let targets = kpi_target_list(&conn, 2026).expect("target_list3");
+        assert_eq!(targets.len(), 2);
+        // A different year is a new row.
+        kpi_target_upsert(&conn, 2025, "需求开发", 5).expect("upsert4");
+        assert_eq!(kpi_target_list(&conn, 2026).expect("list2026").len(), 2);
+        assert_eq!(kpi_target_list(&conn, 2025).expect("list2025").len(), 1);
     }
 }
