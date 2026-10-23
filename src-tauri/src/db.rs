@@ -8,20 +8,20 @@
 //! moves to [`crate::config`] (TOML).
 //!
 //! Design ref: `docs/superpowers/specs/2026-10-21-desktop-pet-design.md`
-//! ("数据与持久化" + "便携回退"). Single `swd-pet.db` SQLite file
+//! ("数据与持久化" + "便携回退"). Single `sss-pet.db` SQLite file
 //! via `rusqlite` (with `bundled` so no system SQLite install is needed
 //! — the single `.exe` is self-contained).
 //!
 //! ## Path resolution (Review Focus #5 — portable + fallback)
 //!
-//! 1. Try `<exe_dir>/swd-pet.db` (the exe's directory via
+//! 1. Try `<exe_dir>/sss-pet.db` (the exe's directory via
 //!    [`std::env::current_exe`]). If writable → use it (portable:
 //!    data sits next to the `.exe`, matching the design spec).
 //! 2. If the exe dir is not writable (Program Files on Windows is
 //!    ACL-protected; `/usr` on Unix; a read-only mount) → fall back to
-//!    `%APPDATA%\swd-pet\swd-pet.db` (Windows),
-//!    `~/.local/share/swd-pet/swd-pet.db` (Unix),
-//!    `~/Library/Application Support/swd-pet/swd-pet.db` (macOS) —
+//!    `%APPDATA%\sss-pet\sss-pet.db` (Windows),
+//!    `~/.local/share/sss-pet/sss-pet.db` (Unix),
+//!    `~/Library/Application Support/sss-pet/sss-pet.db` (macOS) —
 //!    via [`dirs::data_dir`]. Created if missing.
 //! 3. If both are unavailable, [`open`] returns an error.
 //!
@@ -42,7 +42,7 @@ use crate::agent::conversation::{Conversation, StoredMessage, TurnRecord};
 // Path resolution (portable + %APPDATA% fallback) — Review Focus #5.
 // ===========================================================================
 
-/// Resolve the directory that should hold `swd-pet.db` AND `config.toml`
+/// Resolve the directory that should hold `sss-pet.db` AND `config.toml`
 /// (shared with [`crate::config`] so the two files always live together).
 ///
 /// See the module docs for the resolution order (exe dir → appdata
@@ -83,7 +83,7 @@ fn exe_dir() -> Option<PathBuf> {
     std::env::current_exe().ok()?.parent().map(PathBuf::from)
 }
 
-/// The `%APPDATA%\swd-pet`-style fallback, or a test override.
+/// The `%APPDATA%\sss-pet`-style fallback, or a test override.
 fn appdata_dir() -> Option<PathBuf> {
     #[cfg(test)]
     {
@@ -91,7 +91,7 @@ fn appdata_dir() -> Option<PathBuf> {
             return Some(d);
         }
     }
-    Some(dirs::data_dir()?.join("swd-pet"))
+    Some(dirs::data_dir()?.join("sss-pet"))
 }
 
 /// True iff `dir` exists AND we can write a probe file to it.
@@ -104,7 +104,7 @@ fn appdata_dir() -> Option<PathBuf> {
 ///    NOT actually prevent file creation inside — but treating the bit
 ///    as authoritative respects the user's explicit "I marked this
 ///    read-only" intent.
-/// 2. Create + delete a `.swd-pet-probe-<pid>-<seq>` file — catches the
+/// 2. Create + delete a `.sss-pet-probe-<pid>-<seq>` file — catches the
 ///    ACL-protected-but-not-flagged case (Program Files on Windows: the
 ///    dir isn't `readonly`-flagged, but writes still fail). The probe
 ///    filename is PID + a per-process monotonic counter so two threads
@@ -127,7 +127,7 @@ fn is_writable(dir: &Path) -> bool {
     // fail spuriously, reporting a writable dir as read-only).
     static PROBE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = PROBE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let probe = dir.join(format!(".swd-pet-probe-{}-{}", std::process::id(), seq));
+    let probe = dir.join(format!(".sss-pet-probe-{}-{}", std::process::id(), seq));
     match std::fs::File::create(&probe) {
         Ok(_) => {
             let _ = std::fs::remove_file(&probe);
@@ -216,14 +216,14 @@ impl Drop for TestOverrideGuard {
 // Open + migrate
 // ===========================================================================
 
-/// Open a connection to `swd-pet.db`, creating the file if missing. Path
+/// Open a connection to `sss-pet.db`, creating the file if missing. Path
 /// resolution per [`resolve_data_dir`]. The caller MUST call [`migrate`]
 /// once after opening a fresh db (idempotent for existing dbs).
 pub fn open() -> rusqlite::Result<Connection> {
     let dir = resolve_data_dir().ok_or_else(|| {
         rusqlite::Error::InvalidPath(PathBuf::from("<no writable data dir>"))
     })?;
-    let path = dir.join("swd-pet.db");
+    let path = dir.join("sss-pet.db");
     Connection::open(path)
 }
 
@@ -2221,8 +2221,8 @@ mod tests {
         migrate(&conn).expect("migrate");
 
         // The db file is in the appdata fallback, NOT in the read-only exe dir.
-        let db_in_appdata = appdata_dir.path().join("swd-pet.db");
-        let db_in_exe = exe_dir.path().join("swd-pet.db");
+        let db_in_appdata = appdata_dir.path().join("sss-pet.db");
+        let db_in_exe = exe_dir.path().join("sss-pet.db");
         assert!(
             db_in_appdata.exists(),
             "db file should be at appdata fallback: {}",
@@ -2263,7 +2263,7 @@ mod tests {
         let _g = set_test_overrides(None, Some(exe_dir.path().to_path_buf()), None);
         let conn = open().expect("open");
         migrate(&conn).expect("migrate");
-        let db_in_exe = exe_dir.path().join("swd-pet.db");
+        let db_in_exe = exe_dir.path().join("sss-pet.db");
         assert!(db_in_exe.exists(), "db file should be in the exe dir (portable case)");
     }
 

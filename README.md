@@ -1,4 +1,4 @@
-# swd-pet
+# sss-pet
 
 Windows 11 桌面宠物 + AI 智能体助手。基于 Tauri v2 + Rust + Svelte 5 构建。
 
@@ -100,19 +100,19 @@ Windows 11 桌面宠物 + AI 智能体助手。基于 Tauri v2 + Rust + Svelte 5
 
 ### MCP 服务器
 
-swd-pet.exe 可作为 MCP（Model Context Protocol）服务器运行，让本地 agent CLI（Claude Code、Codex 等）通过 MCP 协议直接操作代办和提醒数据。
+sss-pet.exe 可作为 MCP（Model Context Protocol）服务器运行，让本地 agent CLI（Claude Code、Codex 等）通过 MCP 协议直接操作代办和提醒数据。
 
 **启动方式**：
 ```bash
-swd-pet.exe mcp-server
+sss-pet.exe mcp-server
 ```
 
 **MCP 配置**（在智能体管理的 MCP 配置中添加，或点击「+ 代办 MCP」按钮自动生成）：
 ```json
 {
   "mcpServers": {
-    "swd-pet-todos": {
-      "command": "C:\\path\\to\\swd-pet.exe",
+    "sss-pet-todos": {
+      "command": "C:\\path\\to\\sss-pet.exe",
       "args": ["mcp-server"]
     }
   }
@@ -163,7 +163,7 @@ MCP 服务器打开与 GUI 应用相同的 SQLite 数据库，agent 看到的代
 ## 项目结构
 
 ```
-swd-pet/
+sss-pet/
 ├── src/                          # 前端 (Svelte 5)
 │   ├── panel/                    # 面板窗口
 │   │   ├── App.svelte            # 面板壳：拖拽栏 + 页签 + 视图
@@ -261,7 +261,7 @@ pnpm tauri build --no-bundle
 
 > **重要**：必须用 `pnpm tauri build` 而非 `cargo build --release`。Tauri CLI 会先运行 `pnpm build`（前端构建），然后用正确的环境变量编译 Rust 二进制，确保前端资源嵌入 exe。直接用 `cargo build --release` 不会嵌入前端，exe 会尝试连接 dev server 导致 "localhost 拒绝连接"。
 
-构建产物：`src-tauri/target/release/swd-pet.exe`（约 7.3MB，自包含 SQLite + 前端资源）。
+构建产物：`src-tauri/target/release/sss-pet.exe`（约 7.3MB，自包含 SQLite + 前端资源）。
 
 ### 构建安装包
 
@@ -276,20 +276,20 @@ pnpm tauri build
 构建出的 exe 可直接作为 MCP 服务器使用：
 
 ```bash
-swd-pet.exe mcp-server
+sss-pet.exe mcp-server
 ```
 
 从 stdin 读取 JSON-RPC 请求，向 stdout 写入响应。详见上方「MCP 服务器」章节。
 
 ## 数据存储
 
-所有数据存储在 exe 同目录（便携模式）或 `%APPDATA%\swd-pet\`（exe 目录只读时回退）：
+所有数据存储在 exe 同目录（便携模式）或 `%APPDATA%\sss-pet\`（exe 目录只读时回退）：
 
 | 路径 | 内容 |
 |------|------|
-| `swd-pet.db` | SQLite 数据库：conversations、messages、agents、skills、agent_skills、todos、reminders、kpis、kpi_targets、pet_state_log |
+| `sss-pet.db` | SQLite 数据库：conversations、messages、agents、skills、agent_skills、todos、reminders、kpis、kpi_targets、pet_state_log |
 | `config.toml` | TOML 配置：主题、provider 默认值、工作目录、勿扰、宠物/面板位置、责任人花名册、KPI类型列表 |
-| `log/swd-pet-YYYY-MM-DD.log` | 按天轮转的日志文件，记录生命周期事件、错误、调度器状态等 |
+| `log/sss-pet-YYYY-MM-DD.log` | 按天轮转的日志文件，记录生命周期事件、错误、调度器状态等 |
 
 ## 日志
 

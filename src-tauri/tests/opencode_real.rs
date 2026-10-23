@@ -23,7 +23,7 @@
 
 use std::time::Duration;
 
-use swd_pet_lib::agent::{new, BackendConfig, ExecOptions, MessageKind};
+use sss_pet_lib::agent::{new, BackendConfig, ExecOptions, MessageKind};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "real-opencode validation — consumes quota; run explicitly"]

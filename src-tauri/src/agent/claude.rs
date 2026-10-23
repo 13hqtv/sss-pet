@@ -74,7 +74,7 @@ pub(crate) fn build_args(opts: &ExecOptions) -> Vec<String> {
 /// Write the MCP config JSON to a temporary file and return its path.
 /// The claude CLI's `--mcp-config` flag expects a file path, not inline JSON.
 fn write_mcp_temp_file(mcp_json: &str) -> std::io::Result<std::path::PathBuf> {
-    let dir = std::env::temp_dir().join("swd-pet-mcp");
+    let dir = std::env::temp_dir().join("sss-pet-mcp");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("mcp-{}.json", std::process::id()));
     std::fs::write(&path, mcp_json)?;

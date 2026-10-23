@@ -270,7 +270,7 @@
     void probeModels(formProvider);
   }
 
-  /** Auto-inject the swd-pet-todos MCP server into the mcp_config JSON.
+  /** Auto-inject the sss-pet-todos MCP server into the mcp_config JSON.
    *  Gets the current exe path and builds the server config. Merges
    *  into existing mcp_config if present, or creates a new one. */
   async function addTodoMcp() {
@@ -290,7 +290,7 @@
       if (!config.mcpServers || typeof config.mcpServers !== "object") {
         config.mcpServers = {};
       }
-      (config.mcpServers as Record<string, unknown>)["swd-pet-todos"] = serverConfig;
+      (config.mcpServers as Record<string, unknown>)["sss-pet-todos"] = serverConfig;
       formMcpConfig = JSON.stringify(config, null, 2);
     } catch (e) {
       errorMsg = `获取 exe 路径失败: ${e}`;

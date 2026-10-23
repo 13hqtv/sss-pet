@@ -162,7 +162,7 @@ export async function listModels(provider: Provider): Promise<string[]> {
   return invoke<string[]>("list_models", { provider });
 }
 
-/** `get_exe_path` — returns the absolute path to the running swd-pet.exe.
+/** `get_exe_path` — returns the absolute path to the running sss-pet.exe.
  * Used by AgentsView to auto-fill the MCP config's `command` field. */
 export async function getExePath(): Promise<string> {
   return invoke<string>("get_exe_path");

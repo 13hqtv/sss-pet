@@ -1,6 +1,6 @@
 //! MCP (Model Context Protocol) server for the 代办 (todos) feature.
 //!
-//! When swd-pet.exe is launched with the `mcp-server` argument, it runs
+//! When sss-pet.exe is launched with the `mcp-server` argument, it runs
 //! this module instead of the Tauri GUI app. The server implements the
 //! MCP JSON-RPC 2.0 protocol over stdio, exposing the todo CRUD
 //! operations as MCP tools that local agent CLIs (Claude, Codex, etc.)
@@ -21,8 +21,8 @@
 //! ```json
 //! {
 //!   "mcpServers": {
-//!     "swd-pet-todos": {
-//!       "command": "C:\\path\\to\\swd-pet.exe",
+//!     "sss-pet-todos": {
+//!       "command": "C:\\path\\to\\sss-pet.exe",
 //!       "args": ["mcp-server"]
 //!     }
 //!   }
@@ -131,7 +131,7 @@ fn dispatch(conn: &db::Connection, method: &str, params: &Value) -> Result<Value
         "initialize" => Ok(json!({
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "swd-pet-todos", "version": "0.1.0"}
+            "serverInfo": {"name": "sss-pet-todos", "version": "0.1.0"}
         })),
         "notifications/initialized" => Ok(Value::Null), // no-op
         "tools/list" => Ok(json!({"tools": tool_definitions()})),

@@ -743,7 +743,7 @@ fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
 }
 
 /// Returns the path to the current exe. Used by the AgentsView to
-/// auto-fill the MCP config's `command` field for the swd-pet-todos
+/// auto-fill the MCP config's `command` field for the sss-pet-todos
 /// MCP server.
 #[tauri::command]
 fn get_exe_path() -> Result<String, String> {
@@ -755,7 +755,7 @@ fn get_exe_path() -> Result<String, String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     logger::init(true);
-    log::info!("starting swd-pet GUI");
+    log::info!("starting sss-pet GUI");
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         // Task 16: register the notification plugin so the reminder

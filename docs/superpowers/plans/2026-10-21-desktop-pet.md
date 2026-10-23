@@ -14,7 +14,7 @@
 
 - Windows 11；WebView2 系统自带（打包仍附引导程序）。
 - 工具链：Rust stable + Node 20+ + pnpm；集成任务需本机有 `claude`/`codex`/`opencode` CLI。
-- 便携：数据目录 = exe 目录；只读则回退 `%APPDATA%\swd-pet`。
+- 便携：数据目录 = exe 目录；只读则回退 `%APPDATA%\sss-pet`。
 - API key 不进二进制、不进 webview；agent 只走本地 CLI 子进程。
 - 睡觉态 = 静态帧，不开动画循环（空闲 CPU ≈ 0）。
 - 界面文案用中文。
@@ -33,7 +33,7 @@ spec 隐含、但单个任务的测试未必覆盖、最容易坑到真实用户
 ## File Structure
 
 ```
-swd-pet/
+sss-pet/
 ├── package.json / pnpm-workspace.yaml / vite.config.ts / svelte.config.js / tsconfig.json
 ├── index.html                      # 面板入口
 ├── .gitignore
@@ -72,7 +72,7 @@ swd-pet/
 
 **Interfaces:** Produces a runnable `cargo tauri dev` with two configured windows (`pet` 透明置顶无框、`panel` 普通可缩放），定义 `tauri.conf.json` 里两个 window label：`"pet"` 与 `"panel"`（panel 默认 hidden）。
 
-- [ ] **Step 1: 用 `pnpm create tauri-app` 起架（模板 Svelte + TypeScript），命名为 swd-pet。**
+- [ ] **Step 1: 用 `pnpm create tauri-app` 起架（模板 Svelte + TypeScript），命名为 sss-pet。**
 - [ ] **Step 2: 在 `src-tauri/tauri.conf.json` 配两个窗口**：`pet`（`transparent:true, decorations:false, alwaysOnTop:true, skipTaskbar:true, resizable:false, width:120, height:120, x:屏右下`）；`panel`（`visible:false, resizable:true, width:380, height:560`）。`app.withGlobalTauri:true`。
 - [ ] **Step 3: `src/panel/main.ts`、`src/pet/main.ts` 各挂一个占位 Svelte 组件**（"panel"/"pet" 文字）。
 - [ ] **Step 4: 跑 `cargo tauri dev`，确认两个窗口都出现（panel 不可见）。** Expected: dev 启动、无报错、pet 小窗透明置顶。
@@ -141,7 +141,7 @@ git add -A && git commit -m "chore: scaffold tauri+svelte app with pet+panel win
 #[test] fn needs_you_persists_until_dismissed() { let mut m = StateMachine::new(); m.apply(Signal::NeedsInput); assert_eq!(m.current(), PetState::NeedsYou); m.apply(Signal::PanelOpened); assert_eq!(m.current(), PetState::NeedsYou); assert_eq!(m.apply(Signal::Dismissed), PetState::Standby); }
 #[test] fn has_something_clears_on_panel_open() { let mut m = StateMachine::new(); m.apply(Signal::ReminderDue); assert_eq!(m.current(), PetState::HasSomething); assert_eq!(m.apply(Signal::PanelOpened), PetState::Standby); }
 ```
-- [ ] **Step 2: `cargo test -p swd-pet state::machine` → FAIL（类型未定义）。**
+- [ ] **Step 2: `cargo test -p sss-pet state::machine` → FAIL（类型未定义）。**
 - [ ] **Step 3: 实现 `PetState`、`Signal`、`StateMachine`**，按上面规则。`apply` 返回新 `current()`。
 - [ ] **Step 4: `cargo test state::machine` → PASS。**
 - [ ] **Step 5: 提交。** `git commit -m "feat: pet state machine with focus/clearance rules"`
@@ -276,7 +276,7 @@ git add -A && git commit -m "chore: scaffold tauri+svelte app with pet+panel win
 **Files:** Create `src-tauri/src/db.rs`, `src-tauri/src/config.rs`。
 
 **Interfaces:**
-- `db::open() -> rusqlite::Connection`：路径 = `exe_dir/swd-pet.db`；若 exe 目录只读 → `%APPDATA%\swd-pet\swd-pet.db`（Review Focus #5）。`migrate()` 建表：`conversations(id,text pk, provider, session_id, title, created_at)`、`messages(id, conv_id, role, content, created_at)`、`todos`、`reminders`、`pet_state_log`。
+- `db::open() -> rusqlite::Connection`：路径 = `exe_dir/sss-pet.db`；若 exe 目录只读 → `%APPDATA%\sss-pet\sss-pet.db`（Review Focus #5）。`migrate()` 建表：`conversations(id,text pk, provider, session_id, title, created_at)`、`messages(id, conv_id, role, content, created_at)`、`todos`、`reminders`、`pet_state_log`。
 - `config::Config { follow_activity_min_secs, providers, theme, focus:{enabled, window}, pet_pos, panel_rect }`；`load()/save()` 读写 exe 同级 `config.toml`（同 db 的回退规则）。接通 Task 4 的 `save_pet_pos/load_window_state`。
 
 - [ ] **Step 1: 写失败测试**：`open()` 在可写临时目录建库 + `migrate` 后表存在；用 `std::env` 临时把 exe 目录指到只读目录（或 mock `is_writable`）→ 路径落到 `%APPDATA%` 且 `execute` 写入成功（Review Focus #5）。`Config` round-trip：`save(c)` 后 `load()` 等于 `c`。

@@ -1,4 +1,4 @@
-//! File-based logger. Writes to `{data_dir}/log/swd-pet-YYYY-MM-DD.log`
+//! File-based logger. Writes to `{data_dir}/log/sss-pet-YYYY-MM-DD.log`
 //! with daily rotation (one file per day, named by date). Also mirrors
 //! to stderr when `to_stderr=true` (GUI mode); in MCP server mode stderr
 //! is suppressed because stdout is the JSON-RPC transport.
@@ -77,10 +77,10 @@ pub fn init(to_stderr: bool) {
         return;
     }
 
-    // Daily log file: swd-pet-YYYY-MM-DD.log (append mode — multiple
+    // Daily log file: sss-pet-YYYY-MM-DD.log (append mode — multiple
     // launches on the same day append to the same file).
     let today = chrono::Local::now().format("%Y-%m-%d");
-    let log_path = log_dir.join(format!("swd-pet-{today}.log"));
+    let log_path = log_dir.join(format!("sss-pet-{today}.log"));
 
     let file = match OpenOptions::new()
         .create(true)
@@ -110,7 +110,7 @@ pub fn init(to_stderr: bool) {
     let boxed = Box::leak(Box::new(logger));
     let _ = log::set_logger(boxed).map(|_| log::set_max_level(level));
 
-    log::info!("=== swd-pet started ===");
+    log::info!("=== sss-pet started ===");
     log::info!("log file: {}", log_path.display());
 }
 

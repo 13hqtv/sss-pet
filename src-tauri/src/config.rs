@@ -2,7 +2,7 @@
 //!
 //! Replaces Task 4's in-memory `Mutex<HashMap<...>>` placeholder with
 //! a real `config.toml` next to the exe (portable), falling back to
-//! `%APPDATA%\swd-pet\config.toml` when the exe dir is read-only.
+//! `%APPDATA%\sss-pet\config.toml` when the exe dir is read-only.
 //! Path resolution is shared with [`crate::db`] — both files always
 //! live in the same dir.
 //!
@@ -29,7 +29,7 @@ use crate::db;
 // ===========================================================================
 
 /// Top-level app config. Serialized as `config.toml` next to the exe
-/// (or in `%APPDATA%\swd-pet\config.toml` on fallback). Defaults are
+/// (or in `%APPDATA%\sss-pet\config.toml` on fallback). Defaults are
 /// sensible for a first run with no file — `Config::default()` is what
 /// `load()` returns when the file is missing / unreadable.
 ///
@@ -217,7 +217,7 @@ impl Default for FocusCfg {
 // load / save (portable + fallback path)
 // ===========================================================================
 
-/// Resolved path to `config.toml` — same dir as `swd-pet.db` (shared
+/// Resolved path to `config.toml` — same dir as `sss-pet.db` (shared
 /// with [`crate::db::resolve_data_dir`]). `None` if neither exe dir
 /// nor appdata is writable.
 fn resolve_config_path() -> Option<PathBuf> {

@@ -105,7 +105,7 @@
 **Files:** Modify `src-tauri/src/tray.rs`(icon 占位,临时用现有);重建 exe。
 
 - [ ] **Step 1: tray icon** — 临时用现有 app icon(spec 允许占位);若易做精致睡眠机器人 icon 可换,否则留占位记 follow-up。
-- [ ] **Step 2: 重建 exe** — `pnpm tauri build` → `src-tauri/target/release/swd-pet.exe`。
+- [ ] **Step 2: 重建 exe** — `pnpm tauri build` → `src-tauri/target/release/sss-pet.exe`。
 - [ ] **Step 3: 全验证 Review Focus #1/#2/#3/#5** — `cargo check`+`pnpm build`+`pnpm check`(0 错)+`cargo test`(全套绿,不破坏 v0.1.0+model/cwd 逻辑)+ exe 跑:浅/深切换、markdown 对话渲染、机器人 5 态、拖动/穿透/托盘/对话/代办/提醒 都正常。
 - [ ] **Step 4: 提交** `git commit -m "build: refined UI — tray icon placeholder + rebuild exe"`。
 

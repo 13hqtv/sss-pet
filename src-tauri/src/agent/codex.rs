@@ -368,7 +368,7 @@ fn handle_error_notification(params: &Value) -> EventOutcome {
 
 /// Build the `initialize` JSON-RPC request (id=`id`). Mirrors multica
 /// codex.go:1497-1506:
-/// `{"jsonrpc":"2.0","id":<id>,"method":"initialize","params":{"clientInfo":{"name":"swd-pet","version":"0.1.0"},"capabilities":{"experimentalApi":true}}}`.
+/// `{"jsonrpc":"2.0","id":<id>,"method":"initialize","params":{"clientInfo":{"name":"sss-pet","version":"0.1.0"},"capabilities":{"experimentalApi":true}}}`.
 ///
 /// `clientInfo.name`/`version` identify this client to the app-server (any
 /// string works; multica uses "multica-agent-sdk" / "0.2.0"). The
@@ -382,7 +382,7 @@ pub(crate) fn build_initialize_request(id: u64) -> Value {
         "method": "initialize",
         "params": {
             "clientInfo": {
-                "name": "swd-pet",
+                "name": "sss-pet",
                 "version": env!("CARGO_PKG_VERSION")
             },
             "capabilities": {
@@ -1160,7 +1160,7 @@ mod tests {
         assert_eq!(req["jsonrpc"], "2.0");
         assert_eq!(req["id"], 1);
         assert_eq!(req["method"], "initialize");
-        assert_eq!(req["params"]["clientInfo"]["name"], "swd-pet");
+        assert_eq!(req["params"]["clientInfo"]["name"], "sss-pet");
         assert!(req["params"]["clientInfo"]["version"].is_string());
         assert_eq!(req["params"]["capabilities"]["experimentalApi"], true);
     }

@@ -3524,6 +3524,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "sss-pet"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "device_query",
+ "dirs 5.0.1",
+ "log",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-autostart",
+ "tauri-plugin-notification",
+ "tauri-plugin-opener",
+ "tempfile",
+ "tokio",
+ "toml 0.8.2",
+ "uuid",
+ "which",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3564,31 +3589,6 @@ name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
-
-[[package]]
-name = "swd-pet"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "device_query",
- "dirs 5.0.1",
- "log",
- "rusqlite",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-autostart",
- "tauri-plugin-notification",
- "tauri-plugin-opener",
- "tempfile",
- "tokio",
- "toml 0.8.2",
- "uuid",
- "which",
- "windows-sys 0.61.2",
-]
 
 [[package]]
 name = "swift-rs"
