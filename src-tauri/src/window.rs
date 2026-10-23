@@ -74,11 +74,14 @@ const PAUSE_INTERVAL: Duration = Duration::from_millis(200);
 const HYSTERESIS_PX: i32 = 2;
 
 /// The robot SVG is a 96×96 logical region centered inside the pet window's
-/// 120×120 logical surface, so it occupies the central 80% — a 10% margin on
-/// every side. Expressed as a ratio of the window's *physical* outer size so
-/// it stays correct under any DPI scale (outer_size is physical pixels, and
-/// `GetCursorPos` returns physical pixels too, so no DPI conversion is needed).
-const ROBOT_MARGIN_RATIO: i32 = 10; // margin = outer_size / 10 (parts per hundred)
+/// 120×120 logical surface. The robot's actual drawn shape (head + body +
+/// antenna) spans roughly 56×73 px within that 96×96 area. We use a ratio
+/// of 5 (margin = outer_size / 5 = 24px) to define the interactive rect as
+/// the central 72×72 — tight enough that transparent corners pass clicks
+/// through to windows behind, but large enough to cover the robot's head
+/// (the main click/drag target). Expressed as a ratio of the window's
+/// *physical* outer size so it stays correct under any DPI scale.
+const ROBOT_MARGIN_RATIO: i32 = 5;
 
 /// Vertical gap between the pet and the panel when the panel opens above or
 /// below it. Matches the brief's "~4px" — small enough that the panel reads

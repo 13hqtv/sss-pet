@@ -34,24 +34,44 @@ use super::{Message, MessageKind};
 /// - `{"type":"log","log":{...}}` → `Log{content=message}`.
 /// - `{"type":"result",...}` → `None` here; use [`parse_result_event`].
 /// - malformed / non-JSON / unrecognized → `None`.
+/// Parse one stream-json line into a `Message`. Returns `None` for
+/// empty/malformed/unrecognized lines. For assistant lines with
+/// multiple content blocks, returns the FIRST meaningful block
+/// (backward-compatible — use [`parse_line_all`] to get ALL blocks).
 pub fn parse_line(line: &str) -> Option<Message> {
+    parse_line_all(line).into_iter().next()
+}
+
+/// Parse one stream-json line into a `Vec<Message>`. Returns ALL
+/// meaningful content blocks from the line (e.g. an assistant line with
+/// `[thinking, text]` yields two Messages). Empty for
+/// empty/malformed/unrecognized lines.
+pub fn parse_line_all(line: &str) -> Vec<Message> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
-        return None;
+        return Vec::new();
     }
-    let value: Value = serde_json::from_str(trimmed).ok()?;
-    let obj = value.as_object()?;
-    let kind = obj.get("type")?.as_str()?;
-
+    let value: Value = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let obj = match value.as_object() {
+        Some(o) => o,
+        None => return Vec::new(),
+    };
+    let kind = match obj.get("type").and_then(|v| v.as_str()) {
+        Some(k) => k,
+        None => return Vec::new(),
+    };
     match kind {
-        "assistant" => parse_assistant(obj),
-        "user" => parse_user(obj),
-        "system" => parse_system(obj),
-        "log" => parse_log(obj),
+        "assistant" => parse_assistant_all(obj),
+        "user" => parse_user(obj).into_iter().collect(),
+        "system" => parse_system(obj).into_iter().collect(),
+        "log" => parse_log(obj).into_iter().collect(),
         // The terminal `result` event is handled by parse_result_event;
-        // surfaced here as None so a generic line-loop doesn't double-emit.
-        "result" | "control_request" | "control_response" => None,
-        _ => None,
+        // surfaced here as empty so a generic line-loop doesn't double-emit.
+        "result" | "control_request" | "control_response" => Vec::new(),
+        _ => Vec::new(),
     }
 }
 
@@ -86,23 +106,35 @@ pub fn parse_result_event(line: &str) -> Option<(String, Option<String>)> {
 
 // ── per-type helpers ──
 
-/// Parse an `assistant` line: walk `message.content[]` and return the FIRST
-/// meaningful block. Empty text / unrecognized blocks are skipped; if none
-/// of the blocks yield a `Message`, returns `None`.
-fn parse_assistant(obj: &serde_json::Map<String, Value>) -> Option<Message> {
-    let content = obj
-        .get("message")?
-        .as_object()?
-        .get("content")?
-        .as_array()?;
+/// Parse an `assistant` line: walk `message.content[]` and return ALL
+/// meaningful blocks as separate Messages. Each `thinking`, `text`, and
+/// `tool_use` block becomes its own Message. Empty text / unrecognized
+/// blocks are skipped. Returns an empty Vec if no blocks yield a Message.
+fn parse_assistant_all(obj: &serde_json::Map<String, Value>) -> Vec<Message> {
+    let content = match obj
+        .get("message")
+        .and_then(|v| v.as_object())
+        .and_then(|o| o.get("content"))
+        .and_then(|v| v.as_array())
+    {
+        Some(c) => c,
+        None => return Vec::new(),
+    };
+    let mut msgs = Vec::new();
     for block in content {
-        let block_obj = block.as_object()?;
-        let block_type = block_obj.get("type")?.as_str()?;
+        let block_obj = match block.as_object() {
+            Some(o) => o,
+            None => continue,
+        };
+        let block_type = match block_obj.get("type").and_then(|v| v.as_str()) {
+            Some(t) => t,
+            None => continue,
+        };
         match block_type {
             "text" => {
                 let text = block_obj.get("text").and_then(|v| v.as_str()).unwrap_or("");
                 if !text.is_empty() {
-                    return Some(Message {
+                    msgs.push(Message {
                         kind: MessageKind::Text,
                         content: text.to_string(),
                         tool: None,
@@ -116,7 +148,7 @@ fn parse_assistant(obj: &serde_json::Map<String, Value>) -> Option<Message> {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 if !text.is_empty() {
-                    return Some(Message {
+                    msgs.push(Message {
                         kind: MessageKind::Thinking,
                         content: text.to_string(),
                         tool: None,
@@ -135,22 +167,21 @@ fn parse_assistant(obj: &serde_json::Map<String, Value>) -> Option<Message> {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                // input serialized as a JSON string (or "" when absent/null).
                 let content = match block_obj.get("input") {
                     Some(Value::Null) | None => String::new(),
                     Some(other) => serde_json::to_string(other).unwrap_or_default(),
                 };
-                return Some(Message {
+                msgs.push(Message {
                     kind: MessageKind::ToolUse,
                     content,
                     tool: if tool.is_empty() { None } else { Some(tool) },
                     call_id: if call_id.is_empty() { None } else { Some(call_id) },
                 });
             }
-            _ => { /* unrecognized block — skip, keep scanning */ }
+            _ => { /* unrecognized block — skip */ }
         }
     }
-    None
+    msgs
 }
 
 /// Parse a `user` line: surface the FIRST `tool_result` block as

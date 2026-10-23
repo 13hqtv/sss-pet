@@ -15,9 +15,10 @@
       {
         "label": "pet",
         "url": "pet.html",
-        "title": "Pet",
+        "title": "",
         "transparent": true,
         "decorations": false,
+        "shadow": false,
         "alwaysOnTop": true,
         "skipTaskbar": true,
         "resizable": false,
@@ -29,11 +30,12 @@
       },
       {
         "label": "panel",
-        "title": "Panel",
-        "width": 380,
+        "title": "",
+        "width": 760,
         "height": 560,
         "visible": false,
-        "resizable": true
+        "resizable": true,
+        "decorations": false
       }
     ],
     "security": {

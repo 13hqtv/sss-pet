@@ -204,14 +204,17 @@ pub(crate) async fn drain_stream<R>(
             continue;
         }
 
-        // Message-bearing line? Forward to the messages channel.
-        if let Some(msg) = stream_json::parse_line(line) {
-            if msg.kind == MessageKind::Text && !msg.content.is_empty() {
-                last_text = msg.content.clone();
+        // Message-bearing line? Forward ALL blocks (a single assistant
+        // line can contain multiple content blocks — e.g. thinking +
+        // text — and we want all of them, not just the first).
+        let msgs = stream_json::parse_line_all(line);
+        if !msgs.is_empty() {
+            for msg in msgs {
+                if msg.kind == MessageKind::Text && !msg.content.is_empty() {
+                    last_text = msg.content.clone();
+                }
+                let _ = messages_tx.send(msg).await;
             }
-            // Best-effort send — a dropped receiver just stops the send,
-            // we keep draining so the terminal result event is captured.
-            let _ = messages_tx.send(msg).await;
             continue;
         }
 

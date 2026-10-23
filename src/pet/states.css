@@ -35,9 +35,6 @@
  * ------------------------------------------------------------------------- */
 .robot.state-sleep {
   opacity: 0.5;
-  filter:
-    drop-shadow(0 2px 3px rgba(0, 0, 0, 0.2))
-    drop-shadow(0 0 2px rgba(255, 255, 255, 0.25));
 }
 
 /* ---------------------------------------------------------------------------
@@ -89,20 +86,15 @@
  * drop-shadow is kept so the bot still reads on light wallpapers.
  * ------------------------------------------------------------------------- */
 .robot.state-has-something {
-  filter:
-    drop-shadow(0 2px 3px rgba(0, 0, 0, 0.35))
-    drop-shadow(0 0 3px rgba(234, 88, 12, 0.45));
+  /* No filter — the orange `!` glyph provides the visual signal. */
 }
 
 /* ---------------------------------------------------------------------------
  * NeedsYou — static. A red halo tint signals "needs attention"; the `?`
- * glyph is a fixed `<text>` (fill #DC2626). No @keyframes. The dark
- * drop-shadow is kept so the bot still reads on light wallpapers.
+ * glyph is a fixed `<text>` (fill #DC2626). No @keyframes.
  * ------------------------------------------------------------------------- */
 .robot.state-needs-you {
-  filter:
-    drop-shadow(0 2px 3px rgba(0, 0, 0, 0.35))
-    drop-shadow(0 0 3px rgba(220, 38, 38, 0.45));
+  /* No filter — the red `?` glyph provides the visual signal. */
 }
 
 /* ---------------------------------------------------------------------------

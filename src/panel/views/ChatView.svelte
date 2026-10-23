@@ -651,9 +651,9 @@
                db::save_turn_record + backfilled by load_messages).
                kind null/unknown → Text (the brief's rule). -->
           {#if m.kind === "Thinking"}
-            <!-- 🤔 思考: dimmed, default-collapsed (native <details>
-                 is collapsed until the user clicks the summary). -->
-            <details class="block thinking">
+            <!-- 🤔 思考: auto-expanded so the user sees the chain-of-thought
+                 without needing to click open each block. -->
+            <details class="block thinking" open>
               <summary>🤔 思考</summary>
               <div class="block-content">{m.content}</div>
             </details>
@@ -1219,8 +1219,8 @@
     overflow-y: auto;
   }
 
-  /* Thinking: soft accent-tinted card + dimmed muted italic content
-   * (chain-of-thought reads as secondary). */
+  /* Thinking: soft accent-tinted card + readable content (not dimmed —
+   * the user wants to see the chain-of-thought clearly). */
   .block.thinking {
     background: var(--acc-soft);
     border-color: var(--acc-soft);
@@ -1231,8 +1231,10 @@
   }
 
   .block.thinking .block-content {
-    color: var(--mut);
-    font-style: italic;
+    color: var(--ink);
+    font-family: var(--font);
+    font-style: normal;
+    font-size: 0.78rem;
     background: transparent;
     border-top-color: var(--acc-soft);
   }

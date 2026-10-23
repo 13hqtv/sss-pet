@@ -149,31 +149,11 @@
 </script>
 
 <main class="panel">
-  <!--
-    Draggable top bar. `data-tauri-drag-region` makes Tauri call
-    start_dragging on mousedown anywhere in this bar, so the user can
-    move the panel by grabbing the bar. The bar stays at the very top
-    (Task 4); the Task 15 tab strip lives below it.
-
-    Mac-style window dots (red/yellow/green) are decorative product
-    chrome — they don't close/min/max (the OS / tray owns that). Their
-    colors are intentionally NOT themed: they're fixed r/y/g in both
-    light + dark (same exception as the `#fff` accent-foreground text
-    in ChatView — product chrome, not theme-dependent). `aria-hidden`
-    keeps screen readers off the purely-decorative dots.
-  -->
-  <header class="dragbar" data-tauri-drag-region>
-    <div class="dots" aria-hidden="true">
-      <span class="dot red"></span>
-      <span class="dot yellow"></span>
-      <span class="dot green"></span>
-    </div>
-    <span class="title">桌面宠物</span>
-  </header>
-
-  <!-- Pill-style tab strip. Each pill switches the active view below.
-       The strip is NOT a drag-region so the pills are clickable. -->
-  <nav class="tabs">
+  <!-- Pill-style tab strip. Also serves as the drag region (replaces
+       the old separate dragbar header). data-tauri-drag-region makes
+       Tauri call start_dragging on mousedown in the bar area, but the
+       tab pills are still clickable because they're above the drag layer. -->
+  <nav class="tabs" data-tauri-drag-region>
     {#each TABS as tab (tab.id)}
       <button
         class="tab"
@@ -220,91 +200,26 @@
     font-family: var(--font);
     color: var(--ink);
     background: var(--bg);
-    /* OS provides the window chrome (resizable border, etc.) — this just
-       fills the client area. */
-  }
-
-  .dragbar {
-    /* A fixed-height bar that reads as a raised title strip. Tall enough
-       to grab easily (~28px); short enough not to eat the body. Surface
-       fill + bd bottom border + soft shadow = a raised strip over --bg
-       (shadow points down into the tab strip, matching ChatView's
-       elevated-surface convention). */
-    height: 28px;
-    flex: 0 0 28px;
-    display: flex;
-    align-items: center;
-    gap: var(--space-2);
-    padding: 0 var(--space-3);
-    background: var(--surface);
-    border-bottom: 1px solid var(--bd);
-    box-shadow: var(--shadow);
-    /* Grab cursor hints the bar is draggable. Tauri's start_dragging is
-       triggered by `data-tauri-drag-region`, not by this cursor, but the
-       visual affordance matters. */
-    cursor: grab;
-    user-select: none;
-    /* Drag-region must not have descendant pointer-events intercepting the
-       mousedown — dots + title both set `pointer-events: none` so the
-       mousedown lands on the bar (the drag-region). */
-  }
-
-  .dragbar:active {
-    cursor: grabbing;
-  }
-
-  /* Mac-style window dots — decorative product chrome. Fixed r/y/g
-   * in both themes (NOT themed — they're chrome, like the `#fff`
-   * accent-foreground text in ChatView). `pointer-events: none` so
-   * the mousedown goes through to the drag-region. */
-  .dots {
-    display: flex;
-    gap: 6px;
-    pointer-events: none;
-  }
-
-  .dot {
-    width: 11px;
-    height: 11px;
-    border-radius: 50%;
-    pointer-events: none;
-  }
-
-  .dot.red {
-    background: #ff5f57;
-  }
-
-  .dot.yellow {
-    background: #febc2e;
-  }
-
-  .dot.green {
-    background: #28c840;
-  }
-
-  .title {
-    font-size: 0.78rem;
-    font-weight: 500;
-    color: var(--mut);
-    /* `pointer-events: none` so the mousedown lands on the bar (the
-       drag-region) and not on the text label. */
-    pointer-events: none;
   }
 
   /* Pill-style tab strip. Active pill = acc-soft fill + acc text;
    * inactive = mut text; hover = acc-soft fill (subtle). Full pill
-   * radius (--r-chip = 999px) — "药丸 tab" per the brief. The strip
-   * is NOT a drag-region so the pills are clickable. No border-bottom:
-   * the strip shares --surface fill with the dragbar above, and the
-   * dragbar's border + shadow already separate the two; a second rule
-   * here would read as a double divider (the pill row separates itself
-   * from the body by its own surface + gap). */
+   * radius (--r-chip = 999px). The strip is also the drag region
+   * (data-tauri-drag-region) — the tab pills are still clickable
+   * because they sit above the drag layer. */
   .tabs {
     flex: 0 0 auto;
     display: flex;
     gap: var(--space-1);
     padding: var(--space-2) var(--space-3);
     background: var(--surface);
+    border-bottom: 1px solid var(--bd);
+    cursor: grab;
+    user-select: none;
+  }
+
+  .tabs:active {
+    cursor: grabbing;
   }
 
   .tab {

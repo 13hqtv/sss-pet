@@ -628,21 +628,6 @@
     /* Only the robot itself is a DOM click/drag target. */
     pointer-events: auto;
     cursor: pointer;
-    /* FIXED palette — no theme tokens, no data-theme. The robot must read
-       on ANY desktop backdrop (light or dark wallpaper). A dual halo
-       achieves this without theme switching:
-         - dark drop-shadow (rgba(0,0,0,.35)): gives contrast on LIGHT
-           wallpapers (the bot casts a soft shadow).
-         - soft light glow (rgba(255,255,255,.4)): gives contrast on DARK
-           wallpapers (a faint light halo outlines the ink strokes + the
-           warm-white fill, which would otherwise blend into black).
-       Both layers are cheap (filter, not animation) and don't tick rAF.
-       Per-state halos (sleep dim, has-something orange, needs-you red)
-       override this base in states.css, keeping the dark shadow so the
-       bot still reads on light backdrops in those states. */
-    filter:
-      drop-shadow(0 2px 3px rgba(0, 0, 0, 0.35))
-      drop-shadow(0 0 2px rgba(255, 255, 255, 0.4));
     transition: transform 90ms ease-out;
     will-change: transform;
   }
