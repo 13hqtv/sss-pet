@@ -127,9 +127,20 @@ pub(crate) fn pet_is_visible() -> bool {
 /// that race without needing to track the cursor-vs-window offset.
 static DRAGGING: AtomicBool = AtomicBool::new(false);
 
+/// Whether the reminder popup is currently shown on the pet window.
+/// When true, the poller forces `ignore=false` so all popup buttons
+/// are clickable (the cursor-position-based pass-through would make
+/// parts of the popup click-through, blocking button clicks).
+static REMINDER_POPUP: AtomicBool = AtomicBool::new(false);
+
 /// Whether the pet is currently being dragged. Read by the poller each tick.
 fn pet_is_dragging() -> bool {
     DRAGGING.load(Ordering::Acquire)
+}
+
+/// Whether the reminder popup is active. Read by the poller each tick.
+fn reminder_popup_active() -> bool {
+    REMINDER_POPUP.load(Ordering::Acquire)
 }
 
 /// Set the [`DRAGGING`] flag. Called by the `set_pet_dragging` Tauri command
@@ -138,6 +149,12 @@ fn pet_is_dragging() -> bool {
 /// drag of the pet window.
 pub fn set_pet_dragging_state(dragging: bool) {
     DRAGGING.store(dragging, Ordering::Release);
+}
+
+/// Set the [`REMINDER_POPUP`] flag. Called by the `set_reminder_popup`
+/// Tauri command when the frontend shows/hides the reminder popup.
+pub fn set_reminder_popup_state(active: bool) {
+    REMINDER_POPUP.store(active, Ordering::Release);
 }
 
 /// Set whether the window with `label` ignores (passes through) cursor events.
@@ -203,7 +220,7 @@ pub fn spawn_click_through_poller<R: Runtime + 'static>(app: tauri::AppHandle<R>
         .name("pet-clickthrough-poll".to_string())
         .spawn(move || poll_loop(app))
     {
-        eprintln!("[pet] failed to spawn pet-clickthrough-poll thread: {e}");
+        log::error!("[pet] failed to spawn pet-clickthrough-poll thread: {e}");
     }
 }
 
@@ -242,14 +259,14 @@ fn poll_loop<R: Runtime + 'static>(app: tauri::AppHandle<R>) {
                 // Release prints nothing; dev terminal gets this one-line
                 // trace so the brief's "verify via a log line" check has a
                 // signal to look for.
-                eprintln!("[pet] click-through poll: pet hidden, pausing cursor work");
+                log::error!("[pet] click-through poll: pet hidden, pausing cursor work");
             }
             thread::sleep(PAUSE_INTERVAL);
             continue;
         }
         if paused {
             paused = false;
-            eprintln!("[pet] click-through poll: pet visible, resuming cursor work");
+            log::error!("[pet] click-through poll: pet visible, resuming cursor work");
         }
 
         // Drag gate (Task 4). While the user is dragging the pet window (the
@@ -264,6 +281,19 @@ fn poll_loop<R: Runtime + 'static>(app: tauri::AppHandle<R>) {
             if currently_pass_through {
                 // Best-effort: ignore errors so a transient set_ignore_cursor_events
                 // failure doesn't crash the drag. The next tick retries.
+                let _ = pet.set_ignore_cursor_events(false);
+                currently_pass_through = false;
+            }
+            thread::sleep(POLL_INTERVAL);
+            continue;
+        }
+
+        // Reminder popup gate. When the reminder popup is showing, force
+        // ignore=false so all popup buttons are clickable — the cursor-
+        // position-based pass-through would otherwise make transparent parts
+        // of the popup click-through, blocking button clicks.
+        if reminder_popup_active() {
+            if currently_pass_through {
                 let _ = pet.set_ignore_cursor_events(false);
                 currently_pass_through = false;
             }
@@ -316,7 +346,7 @@ fn poll_loop<R: Runtime + 'static>(app: tauri::AppHandle<R>) {
                     // Leave the flag alone so the next iteration retries.
                     // Visible only in the dev terminal (release uses the
                     // windows subsystem, which has no stderr).
-                    eprintln!(
+                    log::error!(
                         "[pet] click-through poll: set_ignore_cursor_events({want_pass_through}) failed: {e}"
                     );
                 }

@@ -1314,7 +1314,7 @@ mod tests {
             }
         }
 
-        eprintln!(
+        log::error!(
             "real-codex result: status={:?} output={:?} session_id={:?} got_text={} got_status={}",
             result.status,
             result.output,

@@ -57,7 +57,7 @@ pub fn toast<R: Runtime>(app: &AppHandle<R>, title: &str, body: &str) {
         .body(body)
         .show()
     {
-        eprintln!("[notify] toast show failed (title={title:?}): {e}");
+        log::error!("[notify] toast show failed (title={title:?}): {e}");
     }
 }
 

@@ -307,7 +307,7 @@ pub fn tick<R: Runtime>(app: &AppHandle<R>, brain: &BrainState, now: Instant) ->
     // Emit outside the lock (best-effort; errors → stderr, not panic).
     if fire_nudge {
         if let Err(e) = app.emit_to("pet", "pet_activity_nudge", ()) {
-            eprintln!("[pet] emit pet_activity_nudge failed: {e}");
+            log::error!("[pet] emit pet_activity_nudge failed: {e}");
         }
     }
     if state_changed {
@@ -326,7 +326,7 @@ pub fn tick<R: Runtime>(app: &AppHandle<R>, brain: &BrainState, now: Instant) ->
                 }
             }
             Err(e) => {
-                eprintln!("[pet] emit pet_state failed: {e}");
+                log::error!("[pet] emit pet_state failed: {e}");
             }
         }
     }
@@ -364,6 +364,6 @@ pub fn spawn_brain_tick<R: Runtime + 'static>(app: AppHandle<R>) {
             }
         })
     {
-        eprintln!("[pet] failed to spawn pet-brain-tick thread: {e}");
+        log::error!("[pet] failed to spawn pet-brain-tick thread: {e}");
     }
 }

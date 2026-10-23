@@ -51,7 +51,7 @@ pub fn run_mcp_server() {
         Err(e) => {
             // Can't proceed — send an error response on stderr (stdout
             // must stay clean for JSON-RPC).
-            eprintln!("[mcp] failed to open db: {e}");
+            log::error!("[mcp] failed to open db: {e}");
             return;
         }
     };
@@ -64,7 +64,7 @@ pub fn run_mcp_server() {
         let line = match line {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("[mcp] stdin read error: {e}");
+                log::error!("[mcp] stdin read error: {e}");
                 break;
             }
         };
@@ -211,6 +211,71 @@ fn tool_definitions() -> Vec<Value> {
                 "required": ["id"]
             }
         }),
+        // -- Reminder tools --
+        json!({
+            "name": "reminder_list",
+            "description": "查询提醒列表。可按状态筛选。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "description": "按状态筛选: pending(待触发) / active(已触发) / done(已完成)"}
+                }
+            }
+        }),
+        json!({
+            "name": "reminder_add",
+            "description": "新增提醒。支持一次性（指定具体时间）或周期性（每N分钟/小时/天/周）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "提醒内容（必填）"},
+                    "reminder_type": {"type": "string", "description": "once(一次性) 或 recurring(周期性)，默认 once"},
+                    "interval_value": {"type": "integer", "description": "周期值，如 30 表示每30分钟（recurring 时必填）"},
+                    "interval_unit": {"type": "string", "description": "周期单位: minutes / hours / days / weeks"},
+                    "next_fire_at": {"type": "string", "description": "首次触发时间 RFC3339 格式（once 时必填）"}
+                },
+                "required": ["text"]
+            }
+        }),
+        json!({
+            "name": "reminder_update",
+            "description": "修改提醒的内容、类型、周期、触发时间。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "description": "提醒 ID（必填）"},
+                    "text": {"type": "string", "description": "新内容"},
+                    "reminder_type": {"type": "string", "description": "once 或 recurring"},
+                    "interval_value": {"type": "integer", "description": "新周期值"},
+                    "interval_unit": {"type": "string", "description": "新周期单位"},
+                    "next_fire_at": {"type": "string", "description": "新触发时间 RFC3339"}
+                },
+                "required": ["id", "text"]
+            }
+        }),
+        json!({
+            "name": "reminder_set_status",
+            "description": "设置提醒状态。done=完成（不再触发）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "description": "提醒 ID（必填）"},
+                    "status": {"type": "string", "description": "新状态: pending / active / done，必填"}
+                },
+                "required": ["id", "status"]
+            }
+        }),
+        json!({
+            "name": "reminder_delete",
+            "description": "删除一条提醒。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "description": "提醒 ID（必填）"}
+                },
+                "required": ["id"]
+            }
+        }),
     ]
 }
 
@@ -233,6 +298,11 @@ fn handle_tool_call(conn: &db::Connection, params: &Value) -> Result<Value, (i64
         "todo_update" => tool_todo_update(conn, &args),
         "todo_set_status" => tool_todo_set_status(conn, &args),
         "todo_delete" => tool_todo_delete(conn, &args),
+        "reminder_list" => tool_reminder_list(conn, &args),
+        "reminder_add" => tool_reminder_add(conn, &args),
+        "reminder_update" => tool_reminder_update(conn, &args),
+        "reminder_set_status" => tool_reminder_set_status(conn, &args),
+        "reminder_delete" => tool_reminder_delete(conn, &args),
         _ => Err((-32602, format!("unknown tool: {name}"))),
     }
 }
@@ -343,4 +413,70 @@ fn tool_todo_delete(conn: &db::Connection, args: &Value) -> Result<Value, (i64, 
         .map_err(|e| (-32603, format!("todo_delete: {e}")))?;
 
     Ok(text_result(format!("已删除代办事项 {id}")))
+}
+
+// -- Reminder tools --
+
+fn tool_reminder_list(conn: &db::Connection, args: &Value) -> Result<Value, (i64, String)> {
+    let mut reminders = db::reminder_list(conn).map_err(|e| (-32603, format!("reminder_list: {e}")))?;
+    if let Some(status) = get_str(args, "status") {
+        reminders.retain(|r| r.status == status);
+    }
+    Ok(json_result(&reminders))
+}
+
+fn tool_reminder_add(conn: &db::Connection, args: &Value) -> Result<Value, (i64, String)> {
+    let text = get_str(args, "text").ok_or((-32602, "missing required field: text".to_string()))?;
+    let reminder_type = get_str(args, "reminder_type").unwrap_or_else(|| "once".to_string());
+    let interval_value = get_i64(args, "interval_value").unwrap_or(0);
+    let interval_unit = get_str(args, "interval_unit").unwrap_or_else(|| "minutes".to_string());
+    let next_fire_at = get_str(args, "next_fire_at");
+
+    let id = db::reminder_add(
+        conn, &text, &reminder_type, interval_value, &interval_unit,
+        next_fire_at.as_deref(),
+    )
+    .map_err(|e| (-32603, format!("reminder_add: {e}")))?;
+
+    Ok(text_result(format!("已创建提醒，ID = {id}")))
+}
+
+fn tool_reminder_update(conn: &db::Connection, args: &Value) -> Result<Value, (i64, String)> {
+    let id = get_i64(args, "id").ok_or((-32602, "missing required field: id".to_string()))?;
+    let text = get_str(args, "text").ok_or((-32602, "missing required field: text".to_string()))?;
+    let reminder_type = get_str(args, "reminder_type").unwrap_or_else(|| "once".to_string());
+    let interval_value = get_i64(args, "interval_value").unwrap_or(0);
+    let interval_unit = get_str(args, "interval_unit").unwrap_or_else(|| "minutes".to_string());
+    let next_fire_at = get_str(args, "next_fire_at");
+
+    db::reminder_update(
+        conn, id, &text, &reminder_type, interval_value, &interval_unit,
+        next_fire_at.as_deref(),
+    )
+    .map_err(|e| (-32603, format!("reminder_update: {e}")))?;
+
+    Ok(text_result(format!("已更新提醒 {id}")))
+}
+
+fn tool_reminder_set_status(conn: &db::Connection, args: &Value) -> Result<Value, (i64, String)> {
+    let id = get_i64(args, "id").ok_or((-32602, "missing required field: id".to_string()))?;
+    let status = get_str(args, "status").ok_or((-32602, "missing required field: status".to_string()))?;
+
+    if !["pending", "active", "done"].contains(&status.as_str()) {
+        return Err((-32602, format!("invalid status: {status}. Must be one of: pending, active, done")));
+    }
+
+    db::reminder_set_status(conn, id, &status)
+        .map_err(|e| (-32603, format!("reminder_set_status: {e}")))?;
+
+    Ok(text_result(format!("已将提醒 {id} 状态设置为 {status}")))
+}
+
+fn tool_reminder_delete(conn: &db::Connection, args: &Value) -> Result<Value, (i64, String)> {
+    let id = get_i64(args, "id").ok_or((-32602, "missing required field: id".to_string()))?;
+
+    db::reminder_delete(conn, id)
+        .map_err(|e| (-32603, format!("reminder_delete: {e}")))?;
+
+    Ok(text_result(format!("已删除提醒 {id}")))
 }

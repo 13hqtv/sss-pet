@@ -91,7 +91,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { listen } from "@tauri-apps/api/event";
-  import { dismissPetAlert } from "../panel/lib/settings";
+  import { dismissPetAlert, snoozeReminder, setReminderStatus } from "../panel/lib/settings";
   import "./states.css";
 
   // ---------------------------------------------------------------------------
@@ -172,6 +172,12 @@
   // nudges — respect quiet, Review Focus #1).
   let nudgeActivity = $state(false);
   let nudgeActivityTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // Reminder popup: when a reminder fires, the Rust scheduler emits a
+  // `reminder_fired` event to the pet window. We show a compact popup
+  // card (replacing the robot) with the reminder text + snooze/dismiss
+  // buttons. Clicking an action closes the popup.
+  let reminderBubble: { id: number; text: string } | null = $state(null);
 
   // ---------------------------------------------------------------------------
   // Drag state. The drag is started from the Rust side via `start_pet_drag`
@@ -301,6 +307,31 @@
     );
   }
 
+  // -- Reminder popup actions --
+
+  /** Dismiss the reminder (mark done = no more fires). */
+  async function dismissReminder(id: number) {
+    try {
+      await setReminderStatus(id, "done");
+    } catch (e) {
+      console.warn("[pet] dismissReminder failed:", e);
+    }
+    reminderBubble = null;
+    invoke("set_reminder_popup", { active: false }).catch(() => {});
+  }
+
+  /** Snooze the reminder by N minutes. */
+  async function snoozeReminderAction(id: number, minutes: number) {
+    try {
+      const until = new Date(Date.now() + minutes * 60_000).toISOString();
+      await snoozeReminder(id, until);
+    } catch (e) {
+      console.warn("[pet] snoozeReminder failed:", e);
+    }
+    reminderBubble = null;
+    invoke("set_reminder_popup", { active: false }).catch(() => {});
+  }
+
   // Keyboard-equivalent of the click so the robot is operable without a
   // mouse (Enter / Space), satisfying the Svelte a11y rule for the click
   // handler on a non-interactive <svg> that carries role="button".
@@ -382,10 +413,24 @@
       unlistenNudge = u;
     });
 
+    // Listen for reminder_fired events from the scheduler. Shows the
+    // reminder popup with snooze/dismiss actions.
+    let unlistenReminder: (() => void) | null = null;
+    listen<{ id: number; text: string }>("reminder_fired", (e) => {
+      reminderBubble = e.payload;
+      // Force the pet window to be fully interactive so popup buttons
+      // are clickable (the click-through poller checks this flag).
+      invoke("set_reminder_popup", { active: true }).catch(() => {});
+    }).then((u) => {
+      if (cancelled) { u(); return; }
+      unlistenReminder = u;
+    });
+
     return () => {
       cancelled = true;
       unlistenState?.();
       unlistenNudge?.();
+      unlistenReminder?.();
       // Clear all pending timers so the component can tear down without a
       // dangling setTimeout firing after destroy. (Task 2 carry: the
       // click-nudge `nudgeTimer` previously leaked here.)
@@ -402,6 +447,24 @@
 </script>
 
 <main class="pet">
+  {#if reminderBubble}
+    <!-- Reminder popup: replaces the robot when a reminder fires.
+         Clean notification card with header, multi-line text, actions. -->
+    <div class="reminder-popup">
+      <div class="popup-header">
+        <span class="popup-icon">🔔</span>
+        <span class="popup-title">提醒</span>
+        <button class="popup-close" onclick={() => { reminderBubble = null; invoke("set_reminder_popup", { active: false }).catch(() => {}); }}>×</button>
+      </div>
+      <div class="popup-text">{reminderBubble.text}</div>
+      <div class="popup-actions">
+        <button class="popup-btn primary" onclick={() => dismissReminder(reminderBubble!.id)}>不再提醒</button>
+        <button class="popup-btn" onclick={() => snoozeReminderAction(reminderBubble!.id, 10)}>推迟 10 分</button>
+        <button class="popup-btn" onclick={() => snoozeReminderAction(reminderBubble!.id, 60)}>推迟 1 时</button>
+        <button class="popup-btn" onclick={() => snoozeReminderAction(reminderBubble!.id, 1440)}>推迟 1 天</button>
+      </div>
+    </div>
+  {:else}
   <!--
     The robot SVG. Mousedown on the robot is handled by `onRobotMouseDown`
     (below), which calls `set_pet_dragging(true)` BEFORE `start_dragging()`
@@ -604,6 +667,7 @@
         fill="none" stroke-linecap="round" stroke-linejoin="round" />
     {/if}
   </svg>
+  {/if}
 </main>
 
 <style>
@@ -634,5 +698,101 @@
 
   .robot.nudge {
     transform: scale(1.08);
+  }
+
+  /* Reminder popup: clean notification card in the 260×160 window. */
+  .reminder-popup {
+    width: 100%;
+    height: 100%;
+    background: #ffffff;
+    border-radius: 14px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18), 0 1px 3px rgba(0, 0, 0, 0.1);
+    font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    pointer-events: auto;
+  }
+
+  .popup-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    background: linear-gradient(135deg, #4f46e5, #6366f1);
+    color: #fff;
+    flex-shrink: 0;
+  }
+
+  .popup-icon { font-size: 14px; }
+  .popup-title { font-size: 13px; font-weight: 600; flex: 1; }
+
+  .popup-close {
+    background: transparent;
+    border: none;
+    color: rgba(255, 255, 255, 0.85);
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0 4px;
+    border-radius: 4px;
+    transition: all 80ms ease;
+  }
+  .popup-close:hover {
+    background: rgba(255, 255, 255, 0.25);
+    color: #fff;
+  }
+
+  .popup-text {
+    flex: 1;
+    padding: 8px 12px;
+    font-size: 13px;
+    line-height: 1.5;
+    color: #1c1c1e;
+    white-space: pre-wrap;
+    word-break: break-word;
+    overflow-y: auto;
+    min-height: 0;
+  }
+
+  .popup-actions {
+    display: flex;
+    gap: 4px;
+    padding: 5px 8px 7px;
+    flex-shrink: 0;
+  }
+
+  .popup-btn {
+    flex: 1;
+    font-size: 11px;
+    padding: 5px 2px;
+    border: 1px solid #d1d5db;
+    border-radius: 7px;
+    background: #fff;
+    color: #374151;
+    cursor: pointer;
+    transition: all 80ms ease;
+    font-family: inherit;
+    white-space: nowrap;
+    text-align: center;
+    overflow: hidden;
+  }
+
+  .popup-btn:hover {
+    background: #eef2ff;
+    color: #4f46e5;
+    border-color: #4f46e5;
+  }
+
+  .popup-btn.primary {
+    background: #4f46e5;
+    color: #fff;
+    border-color: #4f46e5;
+    font-weight: 600;
+    flex: 1.2;
+  }
+
+  .popup-btn.primary:hover {
+    background: #4338ca;
   }
 </style>

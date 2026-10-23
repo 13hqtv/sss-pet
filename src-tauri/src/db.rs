@@ -325,6 +325,10 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "todos", "start_at", "TEXT")?;
     add_column_if_missing(conn, "todos", "end_at", "TEXT")?;
     add_column_if_missing(conn, "todos", "notes", "TEXT")?;
+    // Deadline notification: tracks whether the "approaching deadline"
+    // reminder (24h before end_at) has already been fired for this todo.
+    // Reset to 0 by todo_update when end_at changes.
+    add_column_if_missing(conn, "todos", "deadline_notified", "INTEGER NOT NULL DEFAULT 0")?;
     // One-time data migration: rows that were done=1 (the old boolean)
     // get status='completed'. Idempotent — only touches rows where
     // status is still the default 'pending' AND done=1.
@@ -335,6 +339,27 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     // null = no agent (raw provider+model+cwd, the original behavior).
     // Immutable once set at conversation creation time.
     add_column_if_missing(conn, "conversations", "agent_id", "TEXT")?;
+
+    // Reminders v2: extend the minimal reminders table (id, text, due_at,
+    // fired) into a full reminder system with status, recurrence, snooze,
+    // and next-fire time. Old data is migrated: due_at → next_fire_at,
+    // fired=1 → status='done'.
+    add_column_if_missing(conn, "reminders", "status", "TEXT NOT NULL DEFAULT 'pending'")?;
+    add_column_if_missing(conn, "reminders", "reminder_type", "TEXT NOT NULL DEFAULT 'once'")?;
+    add_column_if_missing(conn, "reminders", "interval_value", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "reminders", "interval_unit", "TEXT NOT NULL DEFAULT 'minutes'")?;
+    add_column_if_missing(conn, "reminders", "next_fire_at", "TEXT")?;
+    add_column_if_missing(conn, "reminders", "snoozed_until", "TEXT")?;
+    add_column_if_missing(conn, "reminders", "created_at", "TEXT")?;
+    add_column_if_missing(conn, "reminders", "updated_at", "TEXT")?;
+    // One-time data migration: old rows with fired=1 → status='done';
+    // old rows with due_at → next_fire_at = due_at (if next_fire_at is NULL).
+    conn.execute_batch(
+        "UPDATE reminders SET status = 'done' WHERE fired = 1 AND status = 'pending'; \
+         UPDATE reminders SET next_fire_at = due_at WHERE next_fire_at IS NULL AND due_at IS NOT NULL AND fired = 0; \
+         UPDATE reminders SET created_at = datetime('now') WHERE created_at IS NULL; \
+         UPDATE reminders SET updated_at = datetime('now') WHERE updated_at IS NULL;",
+    )?;
     Ok(())
 }
 
@@ -819,8 +844,8 @@ pub fn todo_update(
     notes: Option<&str>,
 ) -> rusqlite::Result<()> {
     conn.execute(
-        "UPDATE todos SET text = ?2, priority = ?3, assignee = ?4, start_at = ?5, end_at = ?6, notes = ?7 \
-         WHERE id = ?1",
+        "UPDATE todos SET text = ?2, priority = ?3, assignee = ?4, start_at = ?5, end_at = ?6, notes = ?7, \
+         deadline_notified = 0 WHERE id = ?1",
         rusqlite::params![id, text, priority, assignee, start_at, end_at, notes],
     )?;
     Ok(())
@@ -842,30 +867,30 @@ pub fn todo_delete(conn: &Connection, id: i64) -> rusqlite::Result<()> {
     Ok(())
 }
 
-// ===========================================================================
-// Reminders (Task 16 reminders tab)
-// ===========================================================================
-
-/// One persisted reminder row. `fired` is `bool` at the Rust boundary,
-/// `INTEGER` (0/1) on disk. `due_at` is stored as an RFC3339 string.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Reminder {
-    pub id: i64,
-    pub text: String,
-    pub due_at: String,
-    pub fired: bool,
-}
-
-/// List all reminders, soonest-due-first.
-pub fn reminder_list(conn: &Connection) -> rusqlite::Result<Vec<Reminder>> {
-    let mut stmt =
-        conn.prepare("SELECT id, text, due_at, fired FROM reminders ORDER BY due_at")?;
-    let rows = stmt.query_map([], |row| {
-        Ok(Reminder {
+/// Query todos whose deadline (end_at) is within 24 hours from `now`
+/// but not yet past, and whose deadline_notified flag is 0.
+/// Used by the scheduler to fire a "deadline approaching" reminder.
+pub fn todo_get_deadline_approaching(conn: &Connection, now: &str, horizon: &str) -> rusqlite::Result<Vec<Todo>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, text, status, priority, assignee, start_at, end_at, notes, created_at \
+         FROM todos \
+         WHERE status IN ('pending', 'in_progress') \
+         AND end_at IS NOT NULL \
+         AND end_at > ?1 \
+         AND end_at <= ?2 \
+         AND deadline_notified = 0",
+    )?;
+    let rows = stmt.query_map([now, horizon], |row| {
+        Ok(Todo {
             id: row.get(0)?,
             text: row.get(1)?,
-            due_at: row.get(2)?,
-            fired: row.get::<_, i64>(3)? != 0,
+            status: row.get(2)?,
+            priority: row.get(3)?,
+            assignee: row.get(4)?,
+            start_at: row.get(5)?,
+            end_at: row.get(6)?,
+            notes: row.get(7)?,
+            created_at: row.get(8)?,
         })
     })?;
     let mut out = Vec::new();
@@ -875,32 +900,183 @@ pub fn reminder_list(conn: &Connection) -> rusqlite::Result<Vec<Reminder>> {
     Ok(out)
 }
 
-/// Add a reminder. `due_at` is an RFC3339 string (caller formats — Task
-/// 16 will use `chrono::Utc::now() + Duration`). Returns the new row id.
-pub fn reminder_add(conn: &Connection, text: &str, due_at: &str) -> rusqlite::Result<i64> {
+/// Mark a todo's deadline notification as fired (so it doesn't repeat).
+pub fn todo_set_deadline_notified(conn: &Connection, id: i64, notified: bool) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO reminders (text, due_at, fired) VALUES (?1, ?2, 0)",
-        rusqlite::params![text, due_at],
+        "UPDATE todos SET deadline_notified = ?2 WHERE id = ?1",
+        rusqlite::params![id, notified as i64],
+    )?;
+    Ok(())
+}
+
+// ===========================================================================
+// Reminders (v2: status, recurrence, snooze, next-fire)
+// ===========================================================================
+
+/// One persisted reminder row. `status` is pending(待触发) / active(已触发
+/// 待处理) / done(已完成). `reminder_type` is once(一次性) / recurring(周期性).
+/// For recurring, `interval_value` + `interval_unit` define the cycle.
+/// `next_fire_at` is the next due time (RFC3339); null = no more fires.
+/// `snoozed_until` is the snooze expiry (RFC3339); null = not snoozed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Reminder {
+    pub id: i64,
+    pub text: String,
+    pub status: String,
+    pub reminder_type: String,
+    pub interval_value: i64,
+    pub interval_unit: String,
+    pub next_fire_at: Option<String>,
+    pub snoozed_until: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// List all reminders, soonest next-fire first (nulls last).
+pub fn reminder_list(conn: &Connection) -> rusqlite::Result<Vec<Reminder>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, text, status, reminder_type, interval_value, interval_unit, \
+         next_fire_at, snoozed_until, created_at, updated_at \
+         FROM reminders ORDER BY \
+         CASE WHEN next_fire_at IS NULL THEN 1 ELSE 0 END, next_fire_at",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(Reminder {
+            id: row.get(0)?,
+            text: row.get(1)?,
+            status: row.get(2)?,
+            reminder_type: row.get(3)?,
+            interval_value: row.get(4)?,
+            interval_unit: row.get(5)?,
+            next_fire_at: row.get(6)?,
+            snoozed_until: row.get(7)?,
+            created_at: row.get(8)?,
+            updated_at: row.get(9)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Add a reminder with full metadata. Returns the new row id.
+/// `next_fire_at` is the first fire time (RFC3339).
+pub fn reminder_add(
+    conn: &Connection,
+    text: &str,
+    reminder_type: &str,
+    interval_value: i64,
+    interval_unit: &str,
+    next_fire_at: Option<&str>,
+) -> rusqlite::Result<i64> {
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO reminders \
+         (text, due_at, fired, status, reminder_type, interval_value, interval_unit, \
+         next_fire_at, snoozed_until, created_at, updated_at) \
+         VALUES (?1, ?2, 0, 'pending', ?3, ?4, ?5, ?6, NULL, ?7, ?7)",
+        rusqlite::params![text, next_fire_at.unwrap_or(""), reminder_type, interval_value, interval_unit, next_fire_at, now],
     )?;
     Ok(conn.last_insert_rowid())
 }
 
-/// Delete a reminder by id. (Toggling `fired` is left to Task 16 — not
-/// needed yet.)
+/// Update all editable fields of a reminder.
+pub fn reminder_update(
+    conn: &Connection,
+    id: i64,
+    text: &str,
+    reminder_type: &str,
+    interval_value: i64,
+    interval_unit: &str,
+    next_fire_at: Option<&str>,
+) -> rusqlite::Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE reminders SET text = ?2, reminder_type = ?3, interval_value = ?4, \
+         interval_unit = ?5, next_fire_at = ?6, updated_at = ?7 WHERE id = ?1",
+        rusqlite::params![id, text, reminder_type, interval_value, interval_unit, next_fire_at, now],
+    )?;
+    Ok(())
+}
+
+/// Set the status of a reminder (pending / active / done).
+pub fn reminder_set_status(conn: &Connection, id: i64, status: &str) -> rusqlite::Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE reminders SET status = ?2, updated_at = ?3 WHERE id = ?1",
+        rusqlite::params![id, status, now],
+    )?;
+    Ok(())
+}
+
+/// Snooze a reminder until `snoozed_until` (RFC3339). Clears any previous
+/// snooze and sets status back to pending.
+pub fn reminder_snooze(conn: &Connection, id: i64, snoozed_until: &str) -> rusqlite::Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE reminders SET snoozed_until = ?2, status = 'pending', updated_at = ?3 WHERE id = ?1",
+        rusqlite::params![id, snoozed_until, now],
+    )?;
+    Ok(())
+}
+
+/// Delete a reminder by id.
 pub fn reminder_delete(conn: &Connection, id: i64) -> rusqlite::Result<()> {
     conn.execute("DELETE FROM reminders WHERE id = ?1", rusqlite::params![id])?;
     Ok(())
 }
 
-/// Mark a reminder as fired (sets `fired = 1`). Called by Task 16's
-/// reminder scheduler after it has delivered the toast + applied
-/// `Signal::ReminderDue` to the brain — so the scheduler doesn't
-/// re-fire the same reminder on the next tick. Idempotent: re-marking
-/// an already-fired reminder is a no-op (the UPDATE just writes the
-/// same value).
-pub fn reminder_mark_fired(conn: &Connection, id: i64) -> rusqlite::Result<()> {
+/// Query reminders that are due now: status != 'done' AND
+/// (next_fire_at <= now AND (snoozed_until IS NULL OR snoozed_until <= now)).
+/// Returns the due reminders for the scheduler to fire.
+pub fn reminder_get_due(conn: &Connection, now: &str) -> rusqlite::Result<Vec<Reminder>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, text, status, reminder_type, interval_value, interval_unit, \
+         next_fire_at, snoozed_until, created_at, updated_at \
+         FROM reminders \
+         WHERE status != 'done' \
+         AND next_fire_at IS NOT NULL \
+         AND next_fire_at <= ?1 \
+         AND (snoozed_until IS NULL OR snoozed_until <= ?1)",
+    )?;
+    let rows = stmt.query_map([now], |row| {
+        Ok(Reminder {
+            id: row.get(0)?,
+            text: row.get(1)?,
+            status: row.get(2)?,
+            reminder_type: row.get(3)?,
+            interval_value: row.get(4)?,
+            interval_unit: row.get(5)?,
+            next_fire_at: row.get(6)?,
+            snoozed_until: row.get(7)?,
+            created_at: row.get(8)?,
+            updated_at: row.get(9)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Update the next_fire_at for a reminder (used by the scheduler after
+/// firing a recurring reminder to schedule the next cycle).
+pub fn reminder_set_next_fire(conn: &Connection, id: i64, next_fire_at: Option<&str>) -> rusqlite::Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
     conn.execute(
-        "UPDATE reminders SET fired = 1 WHERE id = ?1",
+        "UPDATE reminders SET next_fire_at = ?2, updated_at = ?3 WHERE id = ?1",
+        rusqlite::params![id, next_fire_at, now],
+    )?;
+    Ok(())
+}
+
+/// Clear the snooze on a reminder (set snoozed_until = NULL).
+pub fn reminder_clear_snooze(conn: &Connection, id: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE reminders SET snoozed_until = NULL WHERE id = ?1",
         rusqlite::params![id],
     )?;
     Ok(())
@@ -1753,19 +1929,61 @@ mod tests {
         assert!(reminder_list(&conn).expect("list").is_empty());
         let due1 = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
         let due2 = (chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
-        let id1 = reminder_add(&conn, "take out trash", &due1).expect("add1");
-        let id2 = reminder_add(&conn, "feed cat", &due2).expect("add2");
+        let id1 = reminder_add(&conn, "take out trash", "once", 0, "minutes", Some(&due1))
+            .expect("add1");
+        let id2 = reminder_add(&conn, "feed cat", "recurring", 30, "minutes", Some(&due2))
+            .expect("add2");
         let list = reminder_list(&conn).expect("list");
         assert_eq!(list.len(), 2);
-        // Ordered by due_at ascending.
+        // Ordered by next_fire_at ascending.
         assert_eq!(list[0].id, id1);
         assert_eq!(list[1].id, id2);
-        assert!(!list[0].fired);
+        assert_eq!(list[0].status, "pending");
+        assert_eq!(list[0].reminder_type, "once");
+        assert_eq!(list[1].reminder_type, "recurring");
+        assert_eq!(list[1].interval_value, 30);
+        assert_eq!(list[1].interval_unit, "minutes");
+        assert!(list[0].snoozed_until.is_none());
+        // Set status.
+        reminder_set_status(&conn, id1, "done").expect("set done");
+        let list = reminder_list(&conn).expect("list2");
+        let r1 = list.iter().find(|r| r.id == id1).expect("found1");
+        assert_eq!(r1.status, "done");
+        // Snooze.
+        let snooze = (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339();
+        reminder_snooze(&conn, id2, &snooze).expect("snooze");
+        let list = reminder_list(&conn).expect("list3");
+        let r2 = list.iter().find(|r| r.id == id2).expect("found2");
+        assert!(r2.snoozed_until.is_some());
+        assert_eq!(r2.status, "pending"); // snooze resets to pending
         // Delete.
         reminder_delete(&conn, id1).expect("delete");
-        let list = reminder_list(&conn).expect("list2");
+        let list = reminder_list(&conn).expect("list4");
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].id, id2);
+    }
+
+    #[test]
+    fn reminder_get_due_finds_due_reminders() {
+        let (_tmp, conn) = fresh_db();
+        let now = chrono::Utc::now();
+        let past = (now - chrono::Duration::hours(1)).to_rfc3339();
+        let future = (now + chrono::Duration::hours(1)).to_rfc3339();
+        // Due (past time, pending).
+        reminder_add(&conn, "overdue task", "once", 0, "minutes", Some(&past)).expect("add1");
+        // Not yet due (future time).
+        reminder_add(&conn, "future task", "once", 0, "minutes", Some(&future)).expect("add2");
+        // Done (should not be returned).
+        let id_done = reminder_add(&conn, "done task", "once", 0, "minutes", Some(&past)).expect("add3");
+        reminder_set_status(&conn, id_done, "done").expect("set done");
+        // Snoozed (should not be returned — snooze is in the future).
+        let id_snoozed = reminder_add(&conn, "snoozed task", "once", 0, "minutes", Some(&past)).expect("add4");
+        let snooze_future = (now + chrono::Duration::minutes(30)).to_rfc3339();
+        reminder_snooze(&conn, id_snoozed, &snooze_future).expect("snooze");
+
+        let due = reminder_get_due(&conn, &now.to_rfc3339()).expect("get_due");
+        assert_eq!(due.len(), 1, "only the overdue pending non-snoozed reminder is due");
+        assert_eq!(due[0].text, "overdue task");
     }
 
     // -- pet state log --

@@ -53,6 +53,7 @@ use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 // FakeBackend + no-op emit).
 pub mod chat;
 pub mod mcp_server;
+pub mod logger;
 
 /// Toggle click-through on the pet overlay window from the frontend.
 ///
@@ -75,6 +76,15 @@ fn set_pet_click_through(app: tauri::AppHandle, ignore: bool) -> Result<(), Stri
 #[tauri::command]
 fn set_pet_dragging(dragging: bool) -> Result<(), String> {
     window::set_pet_dragging_state(dragging);
+    Ok(())
+}
+
+/// Set the reminder popup active flag. When active, the click-through
+/// poller forces the pet window to be fully interactive so popup
+/// buttons are clickable.
+#[tauri::command]
+fn set_reminder_popup(active: bool) -> Result<(), String> {
+    window::set_reminder_popup_state(active);
     Ok(())
 }
 
@@ -468,10 +478,64 @@ fn reminder_list(db: State<'_, Arc<Mutex<Connection>>>) -> Result<Vec<Reminder>,
 fn reminder_add(
     db: State<'_, Arc<Mutex<Connection>>>,
     text: String,
-    due_at: String,
+    reminder_type: Option<String>,
+    interval_value: Option<i64>,
+    interval_unit: Option<String>,
+    next_fire_at: Option<String>,
 ) -> Result<i64, String> {
     let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
-    db::reminder_add(&conn, &text, &due_at).map_err(|e| format!("reminder_add: {e}"))
+    db::reminder_add(
+        &conn,
+        &text,
+        reminder_type.as_deref().unwrap_or("once"),
+        interval_value.unwrap_or(0),
+        interval_unit.as_deref().unwrap_or("minutes"),
+        next_fire_at.as_deref(),
+    )
+    .map_err(|e| format!("reminder_add: {e}"))
+}
+
+#[tauri::command]
+fn reminder_update(
+    db: State<'_, Arc<Mutex<Connection>>>,
+    id: i64,
+    text: String,
+    reminder_type: Option<String>,
+    interval_value: Option<i64>,
+    interval_unit: Option<String>,
+    next_fire_at: Option<String>,
+) -> Result<(), String> {
+    let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+    db::reminder_update(
+        &conn,
+        id,
+        &text,
+        reminder_type.as_deref().unwrap_or("once"),
+        interval_value.unwrap_or(0),
+        interval_unit.as_deref().unwrap_or("minutes"),
+        next_fire_at.as_deref(),
+    )
+    .map_err(|e| format!("reminder_update: {e}"))
+}
+
+#[tauri::command]
+fn reminder_set_status(
+    db: State<'_, Arc<Mutex<Connection>>>,
+    id: i64,
+    status: String,
+) -> Result<(), String> {
+    let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+    db::reminder_set_status(&conn, id, &status).map_err(|e| format!("reminder_set_status: {e}"))
+}
+
+#[tauri::command]
+fn reminder_snooze(
+    db: State<'_, Arc<Mutex<Connection>>>,
+    id: i64,
+    snoozed_until: String,
+) -> Result<(), String> {
+    let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+    db::reminder_snooze(&conn, id, &snoozed_until).map_err(|e| format!("reminder_snooze: {e}"))
 }
 
 #[tauri::command]
@@ -513,13 +577,13 @@ fn apply_focus_to_brain<R: tauri::Runtime>(app: &AppHandle<R>, enabled: bool) {
     let brain = &*app.state::<BrainState>();
     let new_state = {
         let Ok(mut guard) = brain.lock() else {
-            eprintln!("[focus] PetBrain mutex poisoned");
+            log::error!("[focus] PetBrain mutex poisoned");
             return;
         };
         guard.apply_and_stage_emit(Signal::FocusMode(enabled))
     };
     if let Err(e) = app.emit_to("pet", "pet_state", new_state) {
-        eprintln!("[focus] emit pet_state failed: {e}");
+        log::error!("[focus] emit pet_state failed: {e}");
     }
 }
 
@@ -598,6 +662,8 @@ fn get_exe_path() -> Result<String, String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    logger::init(true);
+    log::info!("starting swd-pet GUI");
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         // Task 16: register the notification plugin so the reminder
@@ -617,6 +683,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             set_pet_click_through,
             set_pet_dragging,
+            set_reminder_popup,
             start_pet_drag,
             open_panel_above_pet,
             // config.rs commands (Task 4 in-session window-state
@@ -669,6 +736,9 @@ pub fn run() {
             todo_delete,
             reminder_list,
             reminder_add,
+            reminder_update,
+            reminder_set_status,
+            reminder_snooze,
             reminder_delete,
             // Agent management: agent CRUD + skill CRUD + agent-skill
             // assignment + AI-powered agent creation.
@@ -772,11 +842,12 @@ pub fn run() {
             // `save_turn_record` on completion).
             let conn = {
                 let mut c = db::open().map_err(|e| {
-                    format!("Task 15 db::open failed at setup: {e}")
+                    format!("db::open failed at setup: {e}")
                 })?;
                 db::migrate(&mut c).map_err(|e| {
-                    format!("Task 15 db::migrate failed at setup: {e}")
+                    format!("db::migrate failed at setup: {e}")
                 })?;
+                log::info!("db opened + migrated");
                 c
             };
             let db_state = Arc::new(Mutex::new(conn));
@@ -788,6 +859,7 @@ pub fn run() {
             // visibility (skips while hidden). Named `pet-brain-tick` for
             // debugging.
             brain::spawn_brain_tick(app.app_handle().clone());
+            log::info!("brain tick spawned");
             // Task 16: spawn the reminder scheduler (a tokio task). Every
             // ~15s, locks the db + brain + runs `run_reminder_tick`:
             // scans `reminder_list` for due-but-not-fired rows + fires
@@ -804,6 +876,7 @@ pub fn run() {
                 Arc::clone(&db_state),
                 Arc::clone(&brain_state),
             );
+            log::info!("reminder scheduler spawned");
             // Task 16: apply the persisted FocusMode (勿扰) to the brain
             // at startup so the pet starts asleep if the user had 勿扰
             // on when they last quit. `apply_focus_to_brain` emits the
@@ -822,7 +895,8 @@ pub fn run() {
             // `pet-clickthrough-poll`. Task 4 added a DRAGGING gate that
             // pins `ignore=false` mid-drag (see window.rs::DRAGGING).
             window::spawn_click_through_poller(app.app_handle().clone());
-            // Build the system tray (icon + 显示/隐藏 / 设置 / 退出 menu +
+            log::info!("click-through poller spawned");
+            // Build the system tray
             // left-click → show_panel_or_toggle_pet). Errors propagate to
             // the setup hook and fail the launch if the tray can't be built.
             tray::build_tray(app.app_handle())?;

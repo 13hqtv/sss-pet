@@ -91,14 +91,14 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: MenuEvent) {
             // logged to stderr (dev terminal) rather than panicking — a
             // missing window mid-launch is recoverable on the next click.
             if let Err(e) = window::toggle_pet_visibility(app) {
-                eprintln!("[tray] 显示/隐藏 failed: {e}");
+                log::error!("[tray] 显示/隐藏 failed: {e}");
             }
         }
         MENU_ID_SETTINGS => {
             // 设置 → show the panel. The settings tab itself is wired in
             // Task 15/16; for Task 3 showing the panel is the whole behavior.
             if let Err(e) = window::show_panel(app) {
-                eprintln!("[tray] 设置 failed: {e}");
+                log::error!("[tray] 设置 failed: {e}");
             }
             // Switch the panel to the 设置 tab so the user sees the
             // settings view immediately (not whatever tab was last active).
@@ -128,7 +128,7 @@ fn handle_tray_icon_event<R: Runtime>(
     {
         let app = tray.app_handle();
         if let Err(e) = window::show_panel_or_toggle_pet(app) {
-            eprintln!("[tray] left-click (show_panel_or_toggle_pet) failed: {e}");
+            log::error!("[tray] left-click (show_panel_or_toggle_pet) failed: {e}");
         }
     }
     // Right-click is handled by the OS opening the context menu; we don't

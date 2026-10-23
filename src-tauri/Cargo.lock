@@ -3573,6 +3573,7 @@ dependencies = [
  "chrono",
  "device_query",
  "dirs 5.0.1",
+ "log",
  "rusqlite",
  "serde",
  "serde_json",

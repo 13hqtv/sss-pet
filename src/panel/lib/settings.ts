@@ -78,23 +78,70 @@ export async function deleteTodo(id: number): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Reminders (db::Reminder: id, text, due_at, fired)
+// Reminders (db::Reminder v2: status, recurrence, snooze, next-fire)
 // ---------------------------------------------------------------------------
+
+export type ReminderStatus = "pending" | "active" | "done";
+export type ReminderType = "once" | "recurring";
+export type IntervalUnit = "minutes" | "hours" | "days" | "weeks";
 
 export interface Reminder {
   id: number;
   text: string;
-  /** RFC3339 UTC datetime string. */
-  due_at: string;
-  fired: boolean;
+  status: ReminderStatus;
+  reminder_type: ReminderType;
+  interval_value: number;
+  interval_unit: IntervalUnit;
+  next_fire_at: string | null;
+  snoozed_until: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export async function listReminders(): Promise<Reminder[]> {
   return invoke<Reminder[]>("reminder_list");
 }
 
-export async function addReminder(text: string, dueAt: string): Promise<number> {
-  return invoke<number>("reminder_add", { text, dueAt });
+export async function addReminder(params: {
+  text: string;
+  reminderType?: ReminderType;
+  intervalValue?: number;
+  intervalUnit?: IntervalUnit;
+  nextFireAt?: string | null;
+}): Promise<number> {
+  return invoke<number>("reminder_add", {
+    text: params.text,
+    reminderType: params.reminderType ?? "once",
+    intervalValue: params.intervalValue ?? 0,
+    intervalUnit: params.intervalUnit ?? "minutes",
+    nextFireAt: params.nextFireAt ?? null,
+  });
+}
+
+export async function updateReminder(params: {
+  id: number;
+  text: string;
+  reminderType?: ReminderType;
+  intervalValue?: number;
+  intervalUnit?: IntervalUnit;
+  nextFireAt?: string | null;
+}): Promise<void> {
+  await invoke("reminder_update", {
+    id: params.id,
+    text: params.text,
+    reminderType: params.reminderType ?? "once",
+    intervalValue: params.intervalValue ?? 0,
+    intervalUnit: params.intervalUnit ?? "minutes",
+    nextFireAt: params.nextFireAt ?? null,
+  });
+}
+
+export async function setReminderStatus(id: number, status: ReminderStatus): Promise<void> {
+  await invoke("reminder_set_status", { id, status });
+}
+
+export async function snoozeReminder(id: number, snoozedUntil: string): Promise<void> {
+  await invoke("reminder_snooze", { id, snoozedUntil });
 }
 
 export async function deleteReminder(id: number): Promise<void> {

@@ -77,6 +77,11 @@ chrono = { version = "0.4", features = ["serde"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 toml = "0.8"
 dirs = "5"
+# Logging facade — `log` macros (info!, warn!, error!) are routed to a
+# custom FileLogger that writes to {data_dir}/log/ with daily file names.
+# Also mirrors to stderr in GUI mode; suppressed in MCP server mode
+# (stdout is the JSON-RPC channel).
+log = "0.4"
 # Task 15: unique conversation ids for `chat::new_conversation` (each
 # new chat thread gets a fresh uuid v4 as its PRIMARY KEY in the
 # `conversations` table). The `v4` feature pulls in `getrandom` for

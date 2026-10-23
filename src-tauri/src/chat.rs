@@ -209,7 +209,7 @@ pub async fn run_chat_turn(
                         if let Err(e) =
                             db::save_turn_record(&mut *conn, &conv_id_owned, &record)
                         {
-                            eprintln!(
+                            log::error!(
                                 "save_turn_record failed (no-result arm, conv={conv_id_owned}): {e}"
                             );
                             emit(
@@ -222,7 +222,7 @@ pub async fn run_chat_turn(
                         }
                     }
                     Err(e) => {
-                        eprintln!(
+                        log::error!(
                             "db lock poisoned (no-result arm, conv={conv_id_owned}): {e} — cannot persist"
                         );
                         emit(
@@ -275,7 +275,7 @@ pub async fn run_chat_turn(
                 // brief calls out this exact pattern for the managed
                 // `Arc<Mutex<Connection>>`.
                 if let Err(e) = db::save_turn_record(&mut *conn, &conv_id_owned, &record) {
-                    eprintln!(
+                    log::error!(
                         "save_turn_record failed (conv={conv_id_owned}): {e}"
                     );
                     emit(
@@ -288,7 +288,7 @@ pub async fn run_chat_turn(
                 }
             }
             Err(e) => {
-                eprintln!(
+                log::error!(
                     "db lock poisoned (conv={conv_id_owned}): {e} — cannot persist"
                 );
                 emit(
