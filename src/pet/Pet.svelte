@@ -27,9 +27,11 @@
   //   dragged spot. Task 15 will make this durable across restarts by
   //   swapping the in-memory store for a TOML file.
   // - A click *without* movement (mousedown+mouseup at the same screen
-  //   position) is interpreted as a click rather than a drag → invoke
-  //   `open_panel_above_pet` so the panel pops above (or below, if there's
-  //   no room) the pet.
+  //   position) plays a brief nudge animation. Two such clicks within 300ms
+  //   are treated as a double click → invoke `open_panel_above_pet` so the
+  //   panel pops above (or below, if there's no room) the pet. A single
+  //   click does nothing beyond the nudge — this prevents accidental panel
+  //   toggles when the user just taps the robot.
   //
   // ## DRAGGING-clear guarantee (fix round 1)
   //
@@ -190,6 +192,12 @@
   let dragStartWin: { x: number; y: number } | null = null;
   let dragSafetyTimer: ReturnType<typeof setTimeout> | null = null;
 
+  // Double-click detection: track the time of the last single click
+  // (no-drag mouseup). Two clicks within DOUBLE_CLICK_MS are treated as
+  // a double click → toggle panel. A single click just plays the nudge.
+  let lastClickAt: number | null = null;
+  const DOUBLE_CLICK_MS = 300;
+
   async function onRobotMouseDown(e: MouseEvent) {
     e.preventDefault();
     if (dragArmed) return;
@@ -264,15 +272,15 @@
     dragStartWin = null;
 
     if (!start || !endPos) {
-      onRobotClick();
+      handleRobotClick();
       return;
     }
 
     const dx = Math.abs(endPos.x - start.x);
     const dy = Math.abs(endPos.y - start.y);
     if (dx <= 2 && dy <= 2) {
-      // Click — toggle the panel (or dismiss alert).
-      onRobotClick();
+      // Click — play nudge + check for double click.
+      handleRobotClick();
     } else {
       // Drag — persist the new position (within-session).
       try {
@@ -283,25 +291,41 @@
     }
   }
 
-  function onRobotClick() {
-    // When the pet is in `NeedsYou` (showing `?`), clicking the robot
-    // DISMISSES the alert instead of opening the panel. Any other state:
-    // toggle the panel (open if hidden, close if visible).
+  function playNudge() {
     if (nudgeTimer) clearTimeout(nudgeTimer);
     nudge = true;
     nudgeTimer = setTimeout(() => {
       nudge = false;
       nudgeTimer = null;
     }, 100);
+  }
 
+  /** Single click without drag: play nudge + check for double click.
+   *  Two clicks within DOUBLE_CLICK_MS → toggle panel / dismiss alert. */
+  function handleRobotClick() {
+    playNudge();
+    const now = Date.now();
+    if (lastClickAt !== null && now - lastClickAt < DOUBLE_CLICK_MS) {
+      lastClickAt = null;
+      onRobotDoubleClick();
+    } else {
+      lastClickAt = now;
+    }
+  }
+
+  /** Double click (or keyboard Enter/Space): toggle panel or dismiss alert. */
+  function onRobotDoubleClick() {
+    // When the pet is in `NeedsYou` (showing `?`), double-clicking the
+    // robot DISMISSES the alert instead of opening the panel. Any other
+    // state: toggle the panel (open if hidden, close if visible).
     if (petState === "NeedsYou") {
-      console.log("[pet] robot clicked — 需要你 → dismiss");
+      console.log("[pet] robot double-clicked — 需要你 → dismiss");
       dismissPetAlert().catch((e) =>
         console.warn("[pet] dismiss_pet_alert failed:", e),
       );
       return;
     }
-    console.log("[pet] robot clicked — toggle panel");
+    console.log("[pet] robot double-clicked — toggle panel");
     invoke("open_panel_above_pet").catch((e) =>
       console.warn("[pet] open_panel_above_pet failed:", e),
     );
@@ -338,7 +362,7 @@
   function onRobotKeydown(e: KeyboardEvent) {
     if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
-      onRobotClick();
+      onRobotDoubleClick();
     }
   }
 
