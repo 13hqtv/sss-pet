@@ -658,19 +658,12 @@
               <div class="block-content">{m.content}</div>
             </details>
           {:else if m.kind === "ToolUse"}
-            <!-- 🔧 使用工具 X: X = m.tool (the streamed Message.tool
-                 field OR the persisted StoredMessage.tool — Task 6
-                 fix-round-1 added the latter so history reload shows
-                 the tool name). Falls back to "（未知）" when tool is
-                 null/empty (pre-fix rows / non-tool kinds) so the chip
-                 reads "使用工具（未知）" rather than the doubled
-                 "使用工具 工具". The tool INPUT is m.content (the
-                 backends parse the tool-call input into the ToolUse
-                 message's content). -->
-            <details class="block tool-use">
-              <summary>🔧 使用工具{m.tool ? ` ${m.tool}` : "（未知）"}</summary>
-              <pre class="block-content">{m.content}</pre>
-            </details>
+            <!-- 🔧 使用工具 X: rendered as a bubble (same base as Text) to
+                 isolate the "thin line" rendering issue. -->
+            <div class="bubble" data-role="assistant" data-kind="ToolUse">
+              <span class="role">🔧 使用工具 {m.tool ?? "（未知）"}</span>
+              <div class="content"><pre style="white-space:pre-wrap;word-break:break-word;font-size:0.72rem;">{m.content}</pre></div>
+            </div>
           {:else if m.kind === "ToolResult"}
             <!-- ✅ 工具结果: default-collapsed; m.content is the
                  tool's output (parsed by the backends). -->
@@ -1237,23 +1230,6 @@
     font-size: 0.78rem;
     background: transparent;
     border-top-color: var(--acc-soft);
-  }
-
-  /* ToolUse: neutral card + indigo summary (the agent is acting) +
-   * dark code content (the tool input). */
-  .block.tool-use {
-    background: var(--surface);
-    border-color: var(--bd);
-  }
-
-  .block.tool-use > summary {
-    color: var(--acc);
-  }
-
-  .block.tool-use .block-content {
-    background: var(--code-bg);
-    color: var(--code-ink);
-    border-top-color: var(--code-bg);
   }
 
   /* ToolResult: neutral card + muted summary (the result is

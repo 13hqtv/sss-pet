@@ -89,28 +89,50 @@ pub(crate) fn build_args(opts: &ExecOptions) -> Vec<String> {
 ///   completion via the absence of a later `error` / via step bracketing at
 ///   EOF per multica).
 /// - malformed / non-JSON / unrecognized → `None`.
+/// Convenience wrapper for tests: returns the FIRST message from
+/// [`parse_line_msgs`]. Production code (`drain_stream`) calls
+/// `parse_line_msgs` directly to get ALL messages (terminal tool_use
+/// events yield ToolUse + ToolResult).
+#[cfg(test)]
 pub(crate) fn parse_line(line: &str) -> Option<Message> {
+    parse_line_msgs(line).into_iter().next()
+}
+
+/// Like [`parse_line`] but returns ALL messages for the line. For
+/// terminal `tool_use` events (status=completed/error), this emits BOTH
+/// a `ToolUse` (with `state.input`) AND a `ToolResult` (with
+/// `state.output`/`state.error`) so the tool call record is preserved
+/// in history. Without this, a terminal event produces only the
+/// `ToolResult` — the "🔧 使用工具 X" block (showing the tool input) is
+/// never emitted and is missing from the persisted history.
+pub(crate) fn parse_line_msgs(line: &str) -> Vec<Message> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
-        return None;
+        return Vec::new();
     }
-    let value: Value = serde_json::from_str(trimmed).ok()?;
-    let obj = value.as_object()?;
-    let kind = obj.get("type")?.as_str()?;
+    let value: Value = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let obj = match value.as_object() {
+        Some(o) => o,
+        None => return Vec::new(),
+    };
+    let kind = match obj.get("type").and_then(|v| v.as_str()) {
+        Some(k) => k,
+        None => return Vec::new(),
+    };
     match kind {
-        "text" => parse_text(obj),
-        "tool_use" => parse_tool_use(obj),
-        "step_start" => Some(Message {
+        "text" => parse_text(obj).into_iter().collect(),
+        "tool_use" => parse_tool_use_all(obj),
+        "step_start" => vec![Message {
             kind: MessageKind::Status,
             content: "running".into(),
             tool: None,
             call_id: None,
-        }),
-        "error" => parse_error(obj),
-        // step_finish carries usage/reason only — not user-visible. drain_stream
-        // infers completion from the absence of a subsequent `error` event
-        // (the EOF fallback), matching multica's step-bracketing approach.
-        "step_finish" | _ => None,
+        }],
+        "error" => parse_error(obj).into_iter().collect(),
+        "step_finish" | _ => Vec::new(),
     }
 }
 
@@ -196,7 +218,9 @@ pub(crate) async fn drain_stream<R>(
         }
 
         // Message-bearing line? Forward to the messages channel.
-        if let Some(msg) = parse_line(line) {
+        // parse_line_msgs returns ALL messages for the line (a terminal
+        // tool_use event yields BOTH ToolUse + ToolResult).
+        for msg in parse_line_msgs(line) {
             if msg.kind == MessageKind::Text && !msg.content.is_empty() {
                 last_text = msg.content.clone();
             }
@@ -267,22 +291,45 @@ fn parse_text(obj: &serde_json::Map<String, Value>) -> Option<Message> {
     })
 }
 
-/// Parse a `tool_use` event (multica opencode.go handleToolUseEvent:621-652).
+/// Parse a `tool_use` event → possibly multiple messages.
+///
 /// opencode bundles the call + result in one event: `part.state.status`
-/// terminal (`completed`/`error`) → `ToolResult` (content = `state.output`
-/// or `state.error`); non-terminal → `ToolUse` (content = `state.input` as a
-/// JSON string). Our `parse_line` returns a single [`Message`], so a terminal
-/// tool surfaces as the `ToolResult` (the actionable half).
-fn parse_tool_use(obj: &serde_json::Map<String, Value>) -> Option<Message> {
-    let part = obj.get("part")?.as_object()?;
+/// terminal (`completed`/`error`) carries BOTH `input` and `output`.
+/// The old [`parse_tool_use`] returned only a `ToolResult` (output) for
+/// terminal events, discarding the input — so the "🔧 使用工具 X" block
+/// was never emitted and was missing from persisted history.
+///
+/// This function always emits a `ToolUse` (with `state.input`), and for
+/// terminal events ALSO emits a `ToolResult` (with `state.output`/error).
+fn parse_tool_use_all(obj: &serde_json::Map<String, Value>) -> Vec<Message> {
+    let part = match obj.get("part").and_then(|v| v.as_object()) {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
     let tool = part.get("tool").and_then(|v| v.as_str()).unwrap_or("");
     let call_id = part.get("callID").and_then(|v| v.as_str()).unwrap_or("");
     let state = part.get("state").and_then(|v| v.as_object());
 
+    let tool_field = if tool.is_empty() { None } else { Some(tool.to_string()) };
+    let call_id_field = if call_id.is_empty() { None } else { Some(call_id.to_string()) };
+
+    // Always emit a ToolUse with the input (the tool call record).
+    let input_content = match state.and_then(|s| s.get("input")) {
+        Some(Value::Null) | None => String::new(),
+        Some(other) => serde_json::to_string(other).unwrap_or_default(),
+    };
+    let tool_use = Message {
+        kind: MessageKind::ToolUse,
+        content: input_content,
+        tool: tool_field.clone(),
+        call_id: call_id_field.clone(),
+    };
+
+    // For terminal events, also emit a ToolResult with the output.
     if let Some(state) = state {
         let status = state.get("status").and_then(|v| v.as_str()).unwrap_or("");
         if status == "completed" || status == "error" {
-            let content = if status == "error" {
+            let output_content = if status == "error" {
                 state
                     .get("error")
                     .and_then(|v| v.as_str())
@@ -291,26 +338,18 @@ fn parse_tool_use(obj: &serde_json::Map<String, Value>) -> Option<Message> {
             } else {
                 extract_output(state.get("output"))
             };
-            return Some(Message {
+            let tool_result = Message {
                 kind: MessageKind::ToolResult,
-                content,
-                tool: if tool.is_empty() { None } else { Some(tool.to_string()) },
-                call_id: if call_id.is_empty() { None } else { Some(call_id.to_string()) },
-            });
+                content: output_content,
+                tool: tool_field,
+                call_id: call_id_field,
+            };
+            return vec![tool_use, tool_result];
         }
     }
 
-    // Non-terminal → ToolUse with input serialized as a JSON string.
-    let content = match state.and_then(|s| s.get("input")) {
-        Some(Value::Null) | None => String::new(),
-        Some(other) => serde_json::to_string(other).unwrap_or_default(),
-    };
-    Some(Message {
-        kind: MessageKind::ToolUse,
-        content,
-        tool: if tool.is_empty() { None } else { Some(tool.to_string()) },
-        call_id: if call_id.is_empty() { None } else { Some(call_id.to_string()) },
-    })
+    // Non-terminal → ToolUse only.
+    vec![tool_use]
 }
 
 /// Parse an `error` event → `Error{content: message}`. The message is
@@ -549,23 +588,46 @@ mod tests {
     }
 
     #[test]
-    fn parse_line_tool_use_terminal_completed_is_tool_result() {
-        // multica opencode.go handleToolUseEvent: terminal state -> ToolResult.
+    fn parse_line_tool_use_terminal_completed_first_is_tool_use() {
+        // Terminal tool_use now emits ToolUse (input) FIRST, then ToolResult.
         let line = r#"{"type":"tool_use","part":{"tool":"Read","callID":"call-1","state":{"status":"completed","input":{"file_path":"/tmp/x"},"output":"file body"}}}"#;
         let m = parse_line(line).expect("terminal tool_use -> Some");
-        assert_eq!(m.kind, MessageKind::ToolResult);
+        assert_eq!(m.kind, MessageKind::ToolUse);
         assert_eq!(m.tool.as_deref(), Some("Read"));
         assert_eq!(m.call_id.as_deref(), Some("call-1"));
-        assert_eq!(m.content, "file body");
+        assert!(m.content.contains("file_path"));
     }
 
     #[test]
-    fn parse_line_tool_use_terminal_error_is_tool_result_with_error() {
+    fn parse_line_msgs_terminal_completed_emits_both() {
+        let line = r#"{"type":"tool_use","part":{"tool":"Read","callID":"call-1","state":{"status":"completed","input":{"file_path":"/tmp/x"},"output":"file body"}}}"#;
+        let msgs = parse_line_msgs(line);
+        assert_eq!(msgs.len(), 2, "terminal tool_use -> ToolUse + ToolResult");
+        assert_eq!(msgs[0].kind, MessageKind::ToolUse);
+        assert!(msgs[0].content.contains("file_path"));
+        assert_eq!(msgs[0].tool.as_deref(), Some("Read"));
+        assert_eq!(msgs[1].kind, MessageKind::ToolResult);
+        assert_eq!(msgs[1].content, "file body");
+        assert_eq!(msgs[1].tool.as_deref(), Some("Read"));
+    }
+
+    #[test]
+    fn parse_line_tool_use_terminal_error_first_is_tool_use() {
         let line = r#"{"type":"tool_use","part":{"tool":"Bash","callID":"call-2","state":{"status":"error","input":{},"output":null,"error":"boom"}}}"#;
         let m = parse_line(line).expect("error tool_use -> Some");
-        assert_eq!(m.kind, MessageKind::ToolResult);
+        assert_eq!(m.kind, MessageKind::ToolUse);
         assert_eq!(m.call_id.as_deref(), Some("call-2"));
-        assert_eq!(m.content, "boom");
+        assert_eq!(m.tool.as_deref(), Some("Bash"));
+    }
+
+    #[test]
+    fn parse_line_msgs_terminal_error_emits_both() {
+        let line = r#"{"type":"tool_use","part":{"tool":"Bash","callID":"call-2","state":{"status":"error","input":{},"output":null,"error":"boom"}}}"#;
+        let msgs = parse_line_msgs(line);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].kind, MessageKind::ToolUse);
+        assert_eq!(msgs[1].kind, MessageKind::ToolResult);
+        assert_eq!(msgs[1].content, "boom");
     }
 
     #[test]
