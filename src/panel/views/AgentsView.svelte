@@ -1,8 +1,11 @@
 <!-- 智能体管理 tab. Two sub-sections: 智能体 (agent profiles) and 技能
      (skills). Agents are named profiles = provider + model + system_prompt
      + skills + mcp_config + cwd. Skills are reusable SKILL.md bodies
-     assigned to agents. AI-powered creation calls agent_generate (one-shot
-     LLM call) and parses the <agent_draft> JSON block to fill the form. -->
+     assigned to agents. AI-powered creation is a multi-turn CONVERSATION:
+     the user picks provider + model + describes the agent; the LLM streams
+     an `<agent_draft>` JSON block back IN the conversation; the user
+     confirms (→ agent_create), continues modifying (→ another turn), or
+     cancels (→ discard). -->
 <script lang="ts">
   import {
     listAgents,
@@ -17,13 +20,19 @@
     listAgentSkills,
     addAgentSkill,
     removeAgentSkill,
-    generateAgent,
+    agentGenStart,
+    agentGenContinue,
+    agentGenHistory,
+    agentGenCancel,
     listModels,
     getExePath,
     type Agent,
     type Skill,
     type Provider,
+    type GenMessage,
+    type ExecResult,
   } from "../lib/api";
+  import { subscribeAgentGenStream } from "../lib/stream";
 
   // -- sub-section toggle --
   let subView: "agents" | "skills" = $state("agents");
@@ -50,10 +59,25 @@
   let probing: boolean = $state(false);
   let manualModel: boolean = $state(false);
 
-  // -- AI create --
-  let aiDescription: string = $state("");
-  let aiProvider: Provider = $state("claude");
-  let aiGenerating: boolean = $state(false);
+  // -- AI generation (multi-turn conversation) --
+  // genOpen = the generation panel is mounted (setup OR conversation
+  // phase). genId = null during setup (provider+model+description), set
+  // once agent_gen_start returns. genDraft = the latest parsed
+  // <agent_draft> (drives the 确认/继续修改/取消 buttons). genStreaming
+  // = a turn's drain task is still running (disables the composer).
+  let genOpen: boolean = $state(false);
+  let genId: string | null = $state(null);
+  let genProvider: Provider = $state("claude");
+  let genModel: string = $state("");
+  let genModelList: string[] = $state([]);
+  let genProbing: boolean = $state(false);
+  let genManualModel: boolean = $state(false);
+  let genDescription: string = $state("");
+  let genMessages: GenMessage[] = $state([]);
+  let genStreaming: boolean = $state(false);
+  let genDraft: Record<string, string> | null = $state(null);
+  let genModInput: string = $state("");
+  let genInputEl: HTMLTextAreaElement | null = $state(null);
 
   // -- skill form --
   let skillFormOpen: boolean = $state(false);
@@ -77,16 +101,27 @@
   // Helpers
   // ===========================================================================
 
-  /** Parse an <agent_draft>{...}</agent_draft> JSON block from the LLM
-   *  response. Returns the parsed object or null. */
-  function parseAgentDraft(text: string): Record<string, string> | null {
-    const match = text.match(/<agent_draft>\s*(\{[\s\S]*?\})\s*<\/agent_draft>/);
-    if (!match) return null;
-    try {
-      return JSON.parse(match[1]);
-    } catch {
-      return null;
+  /** Parse the LATEST `<agent_draft>{...}</agent_draft>` JSON block from
+   *  the generation conversation. The stream may split a single draft
+   *  block across multiple Text deltas, so we concatenate all assistant
+   *  Text content first; then find every block + return the LAST valid
+   *  one (a revision turn produces a fresh draft — the last wins). */
+  function parseLatestDraft(msgs: GenMessage[]): Record<string, string> | null {
+    const full = msgs
+      .filter((m) => m.role === "assistant" && m.kind === "Text")
+      .map((m) => m.content)
+      .join("");
+    const re = /<agent_draft>\s*(\{[\s\S]*?\})\s*<\/agent_draft>/g;
+    let last: Record<string, string> | null = null;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(full)) !== null) {
+      try {
+        last = JSON.parse(match[1]);
+      } catch {
+        // malformed block — skip, keep scanning for a later valid one
+      }
     }
+    return last;
   }
 
   /** Get skill names assigned to an agent (for display in the card). */
@@ -232,37 +267,187 @@
     formSkillIds = next;
   }
 
-  async function aiGenerate() {
-    const desc = aiDescription.trim();
+  // -- AI generation conversation flow --
+
+  /** Open the generation panel in the setup phase (provider + model +
+   *  description). Resets any prior generation state. */
+  function openGen() {
+    if (genId) {
+      // A generation is already in flight — just reveal the panel.
+      genOpen = true;
+      return;
+    }
+    genOpen = true;
+    genId = null;
+    genProvider = "claude";
+    genModel = "";
+    genModelList = [];
+    genManualModel = false;
+    genDescription = "";
+    genMessages = [];
+    genDraft = null;
+    genStreaming = false;
+    genModInput = "";
+    void probeGenModels("claude");
+  }
+
+  /** Probe the chosen provider for available models (reuses the same
+   *  list_models path as the create form). Empty list → manual text
+   *  entry fallback. */
+  async function probeGenModels(provider: Provider) {
+    genProbing = true;
+    genManualModel = false;
+    genModelList = [];
+    try {
+      const list = await listModels(provider);
+      genModelList = list;
+      if (list.length === 0) genManualModel = true;
+    } catch {
+      genManualModel = true;
+    } finally {
+      genProbing = false;
+    }
+  }
+
+  function onGenProviderChange() {
+    genModel = "";
+    void probeGenModels(genProvider);
+  }
+
+  /** Kick off the first turn: call agent_gen_start → genId; the user's
+   *  description is buffered server-side + the assistant's streamed
+   *  draft arrives via agent_gen_message events. We seed the optimistic
+   *  user bubble locally so the conversation renders immediately. */
+  async function beginGen() {
+    const desc = genDescription.trim();
     if (!desc) return;
-    aiGenerating = true;
+    genStreaming = true;
+    genDraft = null;
     errorMsg = null;
     try {
-      const response = await generateAgent(desc, aiProvider);
-      const draft = parseAgentDraft(response);
-      if (draft) {
-        // Populate the form with the generated values
-        formOpen = true;
-        editingId = null;
-        formName = draft.name ?? "";
-        formDescription = draft.description ?? "";
-        const provider = draft.provider ?? "claude";
-        formProvider = (PROVIDERS.includes(provider as Provider) ? provider : "claude") as Provider;
-        formModel = draft.model ?? "";
-        formSystemPrompt = draft.system_prompt ?? "";
-        formMcpConfig = "";
-        formCwd = "";
-        formSkillIds = new Set();
-        void probeModels(formProvider);
-        aiDescription = "";
-      } else {
-        errorMsg = "AI 未生成有效的配置，请手动创建或重试";
-      }
+      const id = await agentGenStart(genProvider, genModel || null, desc);
+      genId = id;
+      genMessages = [{ role: "user", kind: "Text", content: desc, tool: null }];
     } catch (e) {
-      errorMsg = `AI 生成失败: ${e}`;
-    } finally {
-      aiGenerating = false;
+      errorMsg = `开始生成失败: ${e}`;
+      genStreaming = false;
     }
+  }
+
+  /** Send a modification prompt (the 继续修改 path). The backend resumes
+   *  the native session (or replays history) + streams a revised draft;
+   *  genDraft is cleared so the action buttons hide until the new draft
+   *  arrives. */
+  async function sendGenModification() {
+    if (!genId) return;
+    const p = genModInput.trim();
+    if (!p || genStreaming) return;
+    genModInput = "";
+    genStreaming = true;
+    genDraft = null;
+    errorMsg = null;
+    try {
+      await agentGenContinue(genId, p);
+      genMessages = [...genMessages, { role: "user", kind: "Text", content: p, tool: null }];
+    } catch (e) {
+      errorMsg = `发送失败: ${e}`;
+      genStreaming = false;
+    }
+  }
+
+  function onGenKeydown(e: KeyboardEvent) {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      void sendGenModification();
+    }
+  }
+
+  /** 确认: parse the latest draft + create the agent via the existing
+   *  agent_create command (provider + model from the generation
+   *  conversation's pinning; name/description/system_prompt from the
+   *  draft). Then cancel the generation session + close the panel. */
+  async function confirmGen() {
+    if (!genDraft) return;
+    const name = (genDraft.name ?? "").trim();
+    if (!name) {
+      errorMsg = "草稿缺少名称，请继续修改";
+      return;
+    }
+    try {
+      await createAgent({
+        name,
+        description: (genDraft.description ?? "").trim() || null,
+        provider: genProvider,
+        model: genModel.trim() || null,
+        systemPrompt: (genDraft.system_prompt ?? "").trim() || null,
+        mcpConfig: null,
+        cwd: null,
+      });
+      if (genId) {
+        try { await agentGenCancel(genId); } catch { /* ignore */ }
+      }
+      closeGen();
+      errorMsg = null;
+      await refresh();
+    } catch (e) {
+      errorMsg = `创建失败: ${e}`;
+    }
+  }
+
+  /** 取消: drop the in-memory generation session + close the panel. No
+   *  agent is created. */
+  async function cancelGen() {
+    if (genId) {
+      try { await agentGenCancel(genId); } catch { /* ignore */ }
+    }
+    closeGen();
+  }
+
+  function closeGen() {
+    genOpen = false;
+    genId = null;
+    genMessages = [];
+    genDraft = null;
+    genStreaming = false;
+    genDescription = "";
+    genModInput = "";
+  }
+
+  /** 继续修改: focus the composer so the user knows to type their
+   *  modification. The composer is always available while a genId is
+   *  active; this button is the explicit affordance. */
+  function focusGenInput() {
+    genInputEl?.focus();
+  }
+
+  // -- agent_gen_* event handlers (routed by gen_id) --
+
+  function handleGenMessage(recvGenId: string, message: GenMessage) {
+    if (recvGenId !== genId) return;
+    genMessages = [...genMessages, message];
+  }
+
+  async function handleGenResult(recvGenId: string, _result: ExecResult) {
+    if (recvGenId !== genId) return;
+    genStreaming = false;
+    // Reload the full history to sync (recovers any messages the live
+    // listener missed while the panel was hidden — Review Focus #3
+    // parity). Then parse the latest draft from the authoritative copy.
+    if (genId) {
+      try {
+        const full = await agentGenHistory(genId);
+        genMessages = full;
+      } catch {
+        // session gone (cancelled / lost to restart) — leave the live
+        // buffer as-is.
+      }
+    }
+    genDraft = parseLatestDraft(genMessages);
+  }
+
+  function handleGenError(recvGenId: string, message: string) {
+    if (recvGenId !== genId) return;
+    errorMsg = `生成错误: ${message}`;
   }
 
   function onProviderChange() {
@@ -375,10 +560,26 @@
     }
   }
 
-  // Initial load on mount.
+  // Initial load on mount + subscribe to the agent_gen_* event stream
+  // for the lifetime of this view (the generation panel lives here).
   $effect(() => {
     void refresh();
-    return () => { if (deleteTimer) clearTimeout(deleteTimer); };
+    // Subscribe once to agent_gen_message / agent_gen_result /
+    // agent_gen_error, routed by gen_id. The handlers read the reactive
+    // genId so they only act on the active generation. unlisten on
+    // destroy.
+    let unlisten: (() => void) | null = null;
+    void subscribeAgentGenStream({
+      onMessage: handleGenMessage,
+      onResult: handleGenResult,
+      onError: handleGenError,
+    }).then((u) => {
+      unlisten = u;
+    });
+    return () => {
+      if (deleteTimer) clearTimeout(deleteTimer);
+      if (unlisten) unlisten();
+    };
   });
 </script>
 
@@ -401,37 +602,20 @@
         placeholder="搜索智能体…"
         class="search"
       />
-      <button class="btn-primary" onclick={startAdd} disabled={formOpen}>+ 手动创建</button>
+      <button class="btn-ghost" onclick={openGen} disabled={formOpen}>✨ AI 生成</button>
+      <button class="btn-primary" onclick={startAdd} disabled={formOpen || genOpen}>+ 手动创建</button>
     </div>
 
-    <!-- AI create section -->
-    {#if !formOpen}
-      <div class="ai-create">
-        <input
-          type="text"
-          bind:value={aiDescription}
-          placeholder="描述你想要的智能体，AI 帮你生成配置…"
-          class="ai-input"
-          onkeydown={(e) => { if (e.key === "Enter" && !aiGenerating) void aiGenerate(); }}
-        />
-        <select bind:value={aiProvider} class="ai-provider" aria-label="AI 创建使用的 Provider">
-          {#each PROVIDERS as p (p)}
-            <option value={p}>{PROVIDER_LABEL[p]}</option>
-          {/each}
-        </select>
-        <button class="btn-primary" onclick={aiGenerate} disabled={aiGenerating || !aiDescription.trim()}>
-          {aiGenerating ? "生成中…" : "AI 生成"}
-        </button>
-      </div>
-    {/if}
+    {#if genOpen}
+      {@render genPanel()}
+    {:else}
+      <!-- Agent form (add) -->
+      {#if formOpen && editingId === null}
+        {@render agentForm()}
+      {/if}
 
-    <!-- Agent form (add/edit) -->
-    {#if formOpen && editingId === null}
-      {@render agentForm()}
-    {/if}
-
-    <!-- Agent list -->
-    <div class="list">
+      <!-- Agent list -->
+      <div class="list">
       {#each agents as a (a.id)}
         {#if formOpen && editingId === a.id}
           {@render agentForm()}
@@ -468,6 +652,7 @@
         </div>
       {/if}
     </div>
+    {/if}
   {:else}
     <!-- Skills section -->
     <div class="toolbar">
@@ -623,6 +808,105 @@
   </div>
 {/snippet}
 
+<!-- Snippet: the AI generation conversation panel. Two phases:
+     - Setup (genId === null): provider + model pickers + description
+       textarea + 开始生成.
+     - Conversation (genId !== null): streamed message list + draft
+       preview card (when parseLatestDraft finds a <agent_draft>) +
+       确认/继续修改/取消 buttons + a composer for sending modifications
+       (the 继续修改 path). The model picker is shared with the create
+       form's probe/listModels path. -->
+{#snippet genPanel()}
+  <div class="gen-panel">
+    <div class="gen-header">
+      <span class="gen-title">✨ AI 生成智能体</span>
+      <button class="act" onclick={cancelGen} title="取消并关闭">✕</button>
+    </div>
+
+    {#if !genId}
+      <!-- Setup phase: pick provider + model, describe the agent. -->
+      <div class="gen-setup">
+        <div class="form-row">
+          <select bind:value={genProvider} onchange={onGenProviderChange} aria-label="Provider">
+            {#each PROVIDERS as p (p)}
+              <option value={p}>{PROVIDER_LABEL[p]}</option>
+            {/each}
+          </select>
+          {#if genProbing}
+            <span class="probing">探测模型中…</span>
+          {:else if genManualModel || genModelList.length === 0}
+            <input type="text" bind:value={genModel} placeholder="模型名（留空=默认）" class="model-input" />
+          {:else}
+            <select bind:value={genModel} class="model-select">
+              <option value="">（默认模型）</option>
+              {#each genModelList as m (m)}
+                <option value={m}>{m}</option>
+              {/each}
+            </select>
+          {/if}
+        </div>
+        <textarea
+          bind:value={genDescription}
+          placeholder="描述你想要的智能体，AI 帮你在对话中生成配置…"
+          class="form-prompt gen-desc"
+          rows="4"
+        ></textarea>
+        <div class="form-actions">
+          <button class="act cancel" onclick={cancelGen}>取消</button>
+          <button class="act save" onclick={beginGen} disabled={!genDescription.trim()}>开始生成</button>
+        </div>
+      </div>
+    {:else}
+      <!-- Conversation phase: messages + draft + buttons + composer. -->
+      <div class="gen-messages">
+        {#each genMessages as m, i (i)}
+          <div class="bubble" data-role={m.role} data-kind={m.kind}>
+            {#if m.role !== "user"}<span class="role">{m.role}</span>{/if}
+            <div class="content">
+              <pre class="gen-pre">{m.content}</pre>
+            </div>
+          </div>
+        {/each}
+        {#if genStreaming}
+          <div class="gen-spinner">✦ 生成中…</div>
+        {/if}
+      </div>
+
+      <!-- Draft preview + action buttons (shown when a <agent_draft>
+           is parseable from the conversation). -->
+      {#if genDraft}
+        <div class="gen-draft">
+          <div class="draft-head">📋 草稿预览</div>
+          <div class="draft-row"><span class="draft-k">名称</span><b class="draft-v">{genDraft.name ?? "—"}</b></div>
+          {#if genDraft.description}<div class="draft-row"><span class="draft-k">描述</span><span class="draft-v">{genDraft.description}</span></div>{/if}
+          <div class="draft-row"><span class="draft-k">类型</span><span class="draft-v">{PROVIDER_LABEL[genProvider] ?? genProvider}</span></div>
+          <div class="draft-row"><span class="draft-k">模型</span><span class="draft-v">{genModel || "（默认）"}</span></div>
+        </div>
+        <div class="gen-actions">
+          <button class="act save" onclick={confirmGen} title="根据草稿创建智能体">✓ 确认创建</button>
+          <button class="act" onclick={focusGenInput} title="在下方输入修改意见">✎ 继续修改</button>
+          <button class="act del" onclick={cancelGen} title="放弃，不创建">✗ 取消</button>
+        </div>
+      {:else if !genStreaming}
+        <div class="gen-hint">AI 未生成有效草稿，可在下方继续对话调整</div>
+      {/if}
+
+      <!-- Composer (the 继续修改 mechanism). Enter sends, Shift+Enter
+           newlines. -->
+      <div class="gen-composer">
+        <textarea
+          bind:this={genInputEl}
+          bind:value={genModInput}
+          onkeydown={onGenKeydown}
+          placeholder="输入修改意见… (Enter 发送, Shift+Enter 换行)"
+          rows="2"
+        ></textarea>
+        <button class="btn-primary" onclick={sendGenModification} disabled={genStreaming || !genModInput.trim() || !genId}>发送</button>
+      </div>
+    {/if}
+  </div>
+{/snippet}
+
 <style>
   .agents-page {
     display: flex;
@@ -699,30 +983,162 @@
   .btn-primary:hover { opacity: 0.9; }
   .btn-primary:disabled { background: var(--mut); cursor: not-allowed; opacity: 1; }
 
-  .ai-create {
+  .btn-ghost {
+    padding: var(--space-1) var(--space-3);
+    font-size: 0.8rem;
+    cursor: pointer;
+    background: transparent;
+    color: var(--mut);
+    border: 1px solid var(--bd);
+    border-radius: var(--r-chip);
+    transition: all var(--t-fast);
+    white-space: nowrap;
+  }
+  .btn-ghost:hover { color: var(--acc); border-color: var(--acc); background: var(--acc-soft); }
+  .btn-ghost:disabled { color: var(--bd); border-color: var(--bd); cursor: not-allowed; }
+
+  /* -- AI generation conversation panel -- */
+  .gen-panel {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    background: var(--bg);
+  }
+
+  .gen-header {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding-bottom: var(--space-1);
+    border-bottom: 1px solid var(--bd);
+  }
+  .gen-title { font-size: 0.85rem; font-weight: 600; color: var(--acc); flex: 1; }
+
+  .gen-setup {
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-2);
+    background: var(--surface);
+    border: 1px solid var(--bd);
+    border-radius: var(--r-bubble);
+  }
+  .gen-desc { min-height: 80px; }
+
+  .gen-messages {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-2);
+    background: var(--bg);
+    border: 1px solid var(--bd);
+    border-radius: var(--r-bubble);
+  }
+
+  /* Bubble: user = accent fill + right-aligned; assistant = surface
+   * card + left-aligned. Mirrors ChatView's alignment so the
+   * conversation reads naturally. */
+  .bubble {
+    max-width: 85%;
+    padding: var(--space-1) var(--space-2);
+    border-radius: var(--r-bubble);
+    font-size: 0.78rem;
+    line-height: 1.5;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .bubble[data-role="user"] {
+    align-self: flex-end;
+    background: var(--acc);
+    color: #fff;
+  }
+  .bubble[data-role="assistant"] {
+    align-self: flex-start;
+    background: var(--surface);
+    border: 1px solid var(--bd);
+    color: var(--ink);
+  }
+  .bubble[data-role="system"],
+  .bubble[data-role="tool"] {
+    align-self: flex-start;
+    background: var(--acc-soft);
+    color: var(--mut);
+    font-size: 0.72rem;
+  }
+  .bubble .role {
+    font-size: 0.65rem;
+    color: var(--mut);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .bubble[data-role="user"] .role { color: rgba(255,255,255,0.8); }
+  .bubble .content { word-break: break-word; }
+  .gen-pre {
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: var(--mono);
+    font-size: 0.75rem;
+  }
+
+  .gen-spinner {
+    align-self: flex-start;
+    font-size: 0.72rem;
+    color: var(--acc);
+    font-style: italic;
+    padding: var(--space-1) var(--space-2);
+  }
+
+  /* Draft preview card — shown when parseLatestDraft finds a
+   * <agent_draft>. Summarizes what 确认 will create. */
+  .gen-draft {
+    flex-shrink: 0;
+    background: var(--acc-soft);
+    border: 1px solid var(--acc);
+    border-radius: var(--r-bubble);
+    padding: var(--space-2) var(--space-3);
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .draft-head { font-size: 0.75rem; font-weight: 600; color: var(--acc); margin-bottom: var(--space-1); }
+  .draft-row { display: flex; gap: var(--space-2); font-size: 0.75rem; align-items: baseline; }
+  .draft-k { flex-shrink: 0; color: var(--mut); min-width: 3rem; }
+  .draft-v { color: var(--ink); word-break: break-word; }
+
+  .gen-actions {
     flex-shrink: 0;
     display: flex;
     gap: var(--space-2);
-    padding: var(--space-2) var(--space-3);
-    border-bottom: 1px solid var(--bd);
-    background: var(--acc-soft);
+    justify-content: center;
+  }
+  .gen-actions .act { padding: var(--space-1) var(--space-3); font-size: 0.78rem; }
+
+  .gen-hint {
+    flex-shrink: 0;
+    text-align: center;
+    font-size: 0.75rem;
+    color: var(--mut);
+    padding: var(--space-1);
   }
 
-  .ai-input {
+  .gen-composer {
+    flex-shrink: 0;
+    display: flex;
+    gap: var(--space-2);
+    align-items: flex-end;
+  }
+  .gen-composer textarea {
     flex: 1;
-    font-size: 0.8rem;
-    padding: var(--space-1) var(--space-2);
-    border: 1px solid var(--bd);
-    border-radius: var(--r-code);
-    font-family: inherit;
-    background: var(--surface);
-    color: var(--ink);
-    transition: border-color var(--t-fast);
-  }
-  .ai-input:focus { border-color: var(--acc); outline: none; }
-  .ai-input::placeholder { color: var(--mut); }
-
-  .ai-provider {
     font-size: 0.78rem;
     padding: var(--space-1) var(--space-2);
     border: 1px solid var(--bd);
@@ -730,7 +1146,11 @@
     font-family: inherit;
     background: var(--surface);
     color: var(--ink);
+    resize: vertical;
+    transition: border-color var(--t-fast);
   }
+  .gen-composer textarea:focus { border-color: var(--acc); outline: none; }
+  .gen-composer textarea::placeholder { color: var(--mut); }
 
   .list {
     flex: 1;

@@ -18,7 +18,7 @@
 // frontend's listener state).
 
 import { listen } from "@tauri-apps/api/event";
-import type { ExecResult, Message } from "./api";
+import type { ExecResult, GenMessage, Message } from "./api";
 
 // ---------------------------------------------------------------------------
 // Event payload shapes (mirror the `json!({...})` payloads in chat.rs)
@@ -125,6 +125,102 @@ export async function subscribeChatStream(
         // torn down on app exit). The backend's stream-drain task
         // keeps running regardless (it doesn't depend on a
         // listener — Review Focus #3).
+      }
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Agent generation stream — `agent_gen_message` / `agent_gen_result` /
+// `agent_gen_error`, routed to the active generation conversation by
+// `gen_id`. Mirrors the chat stream router but for the in-memory
+// generation flow in AgentsView (no DB persistence — the gen session
+// lives in the backend's `GenState` map, recovered via `agent_gen_history`
+// if the panel hides mid-stream).
+// ---------------------------------------------------------------------------
+
+/** `agent_gen_message` payload — one streamed `GenMessage` (role +
+ *  kind + content + tool) from the backend's generation drain task. */
+export interface AgentGenMessageEvent {
+  gen_id: string;
+  message: GenMessage;
+}
+
+/** `agent_gen_result` payload — the terminal `ExecResult` for one
+ *  generation turn (status completed / failed + the native `session_id`
+ *  the next turn will resume). */
+export interface AgentGenResultEvent {
+  gen_id: string;
+  result: ExecResult;
+}
+
+/** `agent_gen_error` payload — reserved for future save-failure parity
+ *  with chat (the in-memory generation flow currently doesn't emit this,
+ *  but subscribing keeps the frontend resilient if a future revision adds
+ *  a persistence hook). */
+export interface AgentGenErrorEvent {
+  gen_id: string;
+  message: string;
+}
+
+/** Callbacks the AgentsView generation panel registers per-event. The
+ *  `gen_id` is already extracted by the router so the callback only
+ *  handles its own conversation's message / result / error. */
+export interface AgentGenStreamHandlers {
+  onMessage: (genId: string, message: GenMessage) => void;
+  onResult: (genId: string, result: ExecResult) => void;
+  onError: (genId: string, message: string) => void;
+}
+
+/**
+ * Subscribe to `agent_gen_message` + `agent_gen_result` +
+ * `agent_gen_error` for the lifetime of the panel, routing each event to
+ * the matching `handlers` callback by `gen_id`. Returns an `unlisten` fn
+ * (call on component destroy — Svelte 5's `$effect` cleanup is the
+ * canonical place). Mirrors `subscribeChatStream` for the generation
+ * conversation flow.
+ */
+export async function subscribeAgentGenStream(
+  handlers: AgentGenStreamHandlers,
+): Promise<() => void> {
+  const unsubs: Array<() => void> = [];
+
+  const unlistenMessage = await listen<AgentGenMessageEvent>(
+    "agent_gen_message",
+    (e) => {
+      const { gen_id, message } = e.payload;
+      handlers.onMessage(gen_id, message);
+    },
+  );
+  unsubs.push(unlistenMessage);
+
+  const unlistenResult = await listen<AgentGenResultEvent>(
+    "agent_gen_result",
+    (e) => {
+      const { gen_id, result } = e.payload;
+      handlers.onResult(gen_id, result);
+    },
+  );
+  unsubs.push(unlistenResult);
+
+  const unlistenError = await listen<AgentGenErrorEvent>(
+    "agent_gen_error",
+    (e) => {
+      const { gen_id, message } = e.payload;
+      handlers.onError(gen_id, message);
+    },
+  );
+  unsubs.push(unlistenError);
+
+  return () => {
+    for (const u of unsubs) {
+      try {
+        u();
+      } catch {
+        // Swallow — the webview may already be gone (panel hidden +
+        // torn down on app exit). The backend's generation drain task
+        // keeps running regardless (it buffers into the in-memory
+        // GenState + recovers via `agent_gen_history`).
       }
     }
   };

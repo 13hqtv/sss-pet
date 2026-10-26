@@ -54,6 +54,12 @@ use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 pub mod chat;
 pub mod mcp_server;
 pub mod logger;
+/// AI-powered agent generation as a multi-turn conversation (replaces the
+/// one-shot `agent_generate` command). Owns the in-memory `GenState` map
+/// + the four `agent_gen_*` commands + the `agent_gen_message` /
+/// `agent_gen_result` event stream the AgentsView generation panel
+/// consumes. No DB persistence (generation is short-lived + interactive).
+pub mod agent_gen;
 
 /// Toggle click-through on the pet overlay window from the frontend.
 ///
@@ -409,64 +415,10 @@ fn agent_skill_set_enabled(
         .map_err(|e| format!("agent_skill_set_enabled: {e}"))
 }
 
-/// The system prompt for the AI agent builder. Instructs the LLM to
-/// generate an agent configuration as JSON in `<agent_draft>` tags.
-const AGENT_BUILDER_PROMPT: &str = r#"你是一个智能体构建器。根据用户的描述，生成一个智能体配置。
-
-你的回复必须包含一个 <agent_draft> JSON 块，格式如下：
-<agent_draft>{"name":"","description":"","system_prompt":"","provider":"","model":""}</agent_draft>
-
-字段说明：
-- name: 简短、有辨识度的智能体名称（2-8个字）
-- description: 一句话描述智能体的用途
-- system_prompt: 详细的系统提示词，定义智能体的角色、能力、行为规范、输出格式等。要具体、可操作。
-- provider: 必须是 "claude"、"codex" 或 "opencode" 之一
-- model: 留空字符串 "" 表示使用 provider 的默认模型，或填写具体模型名
-
-规则：
-- JSON 必须是合法的紧凑格式（单行，不要换行）
-- 字符串内的换行用 \n 转义
-- 在 <agent_draft> 标签之外可以有自然语言说明
-- 根据用户的需求描述，设计合适的系统提示词"#;
-
-/// AI-powered agent creation: a one-shot LLM call that takes a natural-
-/// language description and returns the LLM's text response (which should
-/// contain an `<agent_draft>` JSON block the frontend parses). Uses the
-/// default provider + model from config.
-#[tauri::command]
-async fn agent_generate(
-    description: String,
-    provider: Option<String>,
-) -> Result<String, String> {
-    let cfg = config::load();
-    let provider = provider.unwrap_or_else(|| cfg.default_provider.clone());
-    let model = cfg.providers.default_model_for(&provider).map(|s| s.to_string());
-    let backend_cfg = agent::BackendConfig::default();
-    let backend = agent::new(&provider, backend_cfg)
-        .map_err(|e| format!("agent::new({provider}): {e}"))?;
-    let opts = agent::ExecOptions {
-        cwd: config::resolve_agent_cwd(),
-        model,
-        resume_session_id: None,
-        timeout: Some(std::time::Duration::from_secs(120)),
-        system_prompt: Some(AGENT_BUILDER_PROMPT.to_string()),
-        mcp_config: None,
-    };
-    let mut session = backend
-        .execute(&description, opts)
-        .await
-        .map_err(|e| format!("agent_generate execute: {e}"))?;
-    // Collect all text messages into a single string.
-    let mut full_text = String::new();
-    while let Some(msg) = session.messages.recv().await {
-        if msg.kind == agent::MessageKind::Text {
-            full_text.push_str(&msg.content);
-            full_text.push('\n');
-        }
-    }
-    let _ = session.result.await;
-    Ok(full_text)
-}
+/// (The agent-builder system prompt + the generation flow now live in
+/// `agent_gen.rs` — a multi-turn streaming conversation that returns the
+/// `<agent_draft>` block IN the chat + offers 确认/继续修改/取消. The
+/// old one-shot `agent_generate` command is removed.)
 
 #[tauri::command]
 fn reminder_list(db: State<'_, Arc<Mutex<Connection>>>) -> Result<Vec<Reminder>, String> {
@@ -841,7 +793,10 @@ pub fn run() {
             kpi_target_list,
             kpi_target_upsert,
             // Agent management: agent CRUD + skill CRUD + agent-skill
-            // assignment + AI-powered agent creation.
+            // assignment + AI-powered agent generation (multi-turn
+            // conversation: start / continue / history / cancel — the
+            // `<agent_draft>` is returned IN the conversation; only 确认
+            // calls `agent_create`).
             agent_list,
             agent_get,
             agent_create,
@@ -855,7 +810,10 @@ pub fn run() {
             agent_skill_add,
             agent_skill_remove,
             agent_skill_set_enabled,
-            agent_generate,
+            agent_gen::agent_gen_start,
+            agent_gen::agent_gen_continue,
+            agent_gen::agent_gen_history,
+            agent_gen::agent_gen_cancel,
             config::settings_get,
             settings_set_with_focus,
             dismiss_pet_alert,
@@ -952,6 +910,16 @@ pub fn run() {
             };
             let db_state = Arc::new(Mutex::new(conn));
             app.manage(Arc::clone(&db_state));
+            // AI agent generation: an in-memory map of active generation
+            // conversations (keyed by gen_id). No DB persistence — a
+            // generation session is short-lived + interactive (the user
+            // picks provider+model, the LLM streams an `<agent_draft>` in
+            // the conversation, 确认 calls `agent_create`, 取消 drops the
+            // session). Held as managed state so the `agent_gen_*`
+            // commands + their spawned drain tasks share one map.
+            let gen_state: agent_gen::GenState =
+                Arc::new(Mutex::new(std::collections::HashMap::new()));
+            app.manage(gen_state);
             // Task 7: spawn the brain tick loop (1Hz std::thread). Reads
             // idle time each tick, drives the state machine, fires the
             // follow-activity nudge, and emits `pet_state` /

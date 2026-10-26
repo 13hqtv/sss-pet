@@ -169,7 +169,7 @@ export async function getExePath(): Promise<string> {
 }
 
 // ---------------------------------------------------------------------------
-// Agent management (agents + skills + agent_skills + agent_generate)
+// Agent management (agents + skills + agent_skills + agent generation)
 // ---------------------------------------------------------------------------
 
 /** Mirrors `db::Agent`. A saved agent profile = provider + model +
@@ -307,12 +307,58 @@ export async function setAgentSkillEnabled(agentId: string, skillId: string, ena
   await invoke("agent_skill_set_enabled", { agentId, skillId, enabled });
 }
 
-// -- AI-powered agent creation --
+// -- AI-powered agent generation (multi-turn conversation) --
 
-/** `agent_generate` — one-shot LLM call that takes a natural-language
- * description and returns the LLM's text response (which should contain
- * an `<agent_draft>` JSON block the frontend parses to populate the
- * create form). Uses the default provider + model from config. */
-export async function generateAgent(description: string, provider?: string): Promise<string> {
-  return invoke<string>("agent_generate", { description, provider: provider ?? null });
+/** Mirrors `agent_gen::GenMessage`. One displayable message in a
+ *  generation conversation — the streamed `agent::Message` shape PLUS a
+ *  `role` (user / assistant / system / tool) so the frontend can align +
+ *  color bubbles without inferring the role from the kind. Both the live
+ *  `agent_gen_message` events AND the `agent_gen_history` snapshot
+ *  return this type. */
+export interface GenMessage {
+  role: string;
+  kind: string;
+  content: string;
+  tool: string | null;
+}
+
+/** `agent_gen::agent_gen_start` — begin a generation conversation: the
+ *  user picks provider + model + describes the agent; the backend runs
+ *  the first turn with the agent-builder system prompt + spawns a drain
+ *  task that streams `<agent_draft>` back via `agent_gen_message` /
+ *  `agent_gen_result` events. Returns the `genId` the frontend keys its
+ *  event subscription + state on. Provider + model are pinned here (the
+ *  created agent uses them too on 确认). */
+export async function agentGenStart(
+  provider: Provider,
+  model: string | null,
+  description: string,
+): Promise<string> {
+  return invoke<string>("agent_gen_start", { provider, model, description });
+}
+
+/** `agent_gen::agent_gen_continue` — send a modification prompt in an
+ *  active generation conversation (the 继续修改 path). Resumes the
+ *  backend's native session if the first turn yielded a `session_id`,
+ *  else replays the in-memory history. Returns immediately; the revised
+ *  draft arrives via the same `agent_gen_*` events. */
+export async function agentGenContinue(
+  genId: string,
+  prompt: string,
+): Promise<void> {
+  await invoke("agent_gen_continue", { genId, prompt });
+}
+
+/** `agent_gen::agent_gen_history` — reload the full in-memory message
+ *  history for a generation session (used when the panel reopens after a
+ *  hide, to recover messages the live listener missed). */
+export async function agentGenHistory(genId: string): Promise<GenMessage[]> {
+  return invoke<GenMessage[]>("agent_gen_history", { genId });
+}
+
+/** `agent_gen::agent_gen_cancel` — drop the in-memory generation session
+ *  (取消). No agent is created. Safe to call on an unknown / already-
+ *  cancelled id. */
+export async function agentGenCancel(genId: string): Promise<void> {
+  await invoke("agent_gen_cancel", { genId });
 }
