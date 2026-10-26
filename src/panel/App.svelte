@@ -111,6 +111,18 @@
     activeTab = id;
   }
 
+  // Panel drag: call startDragging() on mousedown in the tab strip's
+  // non-button area. data-tauri-drag-region is unreliable on some
+  // Windows + Tauri 2 builds, so we also wire a JS handler as the
+  // primary mechanism. Tab buttons are excluded so clicking a tab
+  // switches the view instead of dragging the window.
+  function onTabsMouseDown(e: MouseEvent) {
+    if ((e.target as HTMLElement).closest(".tab")) return;
+    getCurrentWindow().startDragging().catch((err) =>
+      console.warn("[panel] startDragging failed:", err),
+    );
+  }
+
   // Disable the browser context menu (right-click menu) — the panel is
   // a desktop app, not a web page.
   $effect(() => {
@@ -153,7 +165,8 @@
        the old separate dragbar header). data-tauri-drag-region makes
        Tauri call start_dragging on mousedown in the bar area, but the
        tab pills are still clickable because they're above the drag layer. -->
-  <nav class="tabs" data-tauri-drag-region>
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+  <nav class="tabs" data-tauri-drag-region onmousedown={onTabsMouseDown}>
     {#each TABS as tab (tab.id)}
       <button
         class="tab"

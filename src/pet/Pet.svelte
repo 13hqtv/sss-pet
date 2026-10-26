@@ -190,6 +190,7 @@
   // ---------------------------------------------------------------------------
   let dragArmed = false;
   let dragStartWin: { x: number; y: number } | null = null;
+  let dragStartMouse: { x: number; y: number } | null = null;
   let dragSafetyTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Double-click detection: track the time of the last single click
@@ -197,98 +198,109 @@
   // a double click → toggle panel. A single click just plays the nudge.
   let lastClickAt: number | null = null;
   const DOUBLE_CLICK_MS = 300;
+  const DRAG_THRESHOLD = 3; // pixels of movement before drag starts
 
-  async function onRobotMouseDown(e: MouseEvent) {
+  // Click-vs-drag disambiguation: on mousedown we DON'T immediately
+  // enter the OS modal drag loop. Instead we register mousemove + mouseup
+  // listeners and only call start_pet_drag once the mouse moves beyond
+  // DRAG_THRESHOLD. This way a simple click (mousedown + mouseup without
+  // movement) never enters the modal loop, so the mouseup fires normally
+  // and double-click detection works for left-click.
+  //
+  // Root cause this fixes: start_dragging() enters the Windows modal
+  // drag loop (DefWindowProc WM_NCLBUTTONDOWN HTCAPTION), which blocks
+  // the main thread and CONSUMES the left mouseup — the webview never
+  // sees it. So onDragMouseUp never fired for left-clicks, breaking
+  // single-click (and now double-click) panel toggling. Right-click
+  // worked because Windows only starts the modal loop for left-button.
+  function onRobotMouseDown(e: MouseEvent) {
     e.preventDefault();
     if (dragArmed) return;
     dragArmed = true;
+    dragStartMouse = { x: e.screenX, y: e.screenY };
 
-    // Record the window's start position for click-vs-drag disambiguation.
-    try {
-      const pos = await getCurrentWindow().outerPosition();
-      dragStartWin = { x: pos.x, y: pos.y };
-    } catch (err) {
-      console.warn("[pet] outerPosition at mousedown failed:", err);
-    }
+    // Record window start position (for position-save on drag end).
+    getCurrentWindow()
+      .outerPosition()
+      .then((pos) => {
+        dragStartWin = { x: pos.x, y: pos.y };
+      })
+      .catch((err) => console.warn("[pet] outerPosition failed:", err));
 
-    // Fire-and-forget: the Rust side sets DRAGGING=true + calls
-    // start_dragging(). Whether start_dragging blocks or returns
-    // immediately, we register a mouseup listener so disambiguation
-    // happens when the user actually releases the mouse — NOT right
-    // after the IPC (which could be before the drag even starts).
-    invoke("start_pet_drag").catch((err) =>
-      console.warn("[pet] start_pet_drag failed:", err),
-    );
+    // Listen for drag start (mousemove) or click (mouseup).
+    window.addEventListener("mousemove", onDragDetectMove);
+    window.addEventListener("mouseup", onDragDetectUp, { once: true });
 
-    // Register a one-time mouseup listener for drag-end disambiguation.
-    // This fires after the OS drag loop exits (if the modal loop passes
-    // WM_LBUTTONUP through to the webview) OR immediately if the drag
-    // didn't start (start_pet_drag failed).
-    window.addEventListener("mouseup", onDragMouseUp, { once: true });
-
-    // Safety timeout: if the mouseup is consumed by the OS modal drag
-    // loop and never reaches the webview, clear DRAGGING after 5s so
-    // the poller doesn't stay pinned forever.
+    // Safety timeout: if neither fires within 5s, reset state.
     if (dragSafetyTimer) clearTimeout(dragSafetyTimer);
     dragSafetyTimer = setTimeout(() => {
       if (dragArmed) {
-        console.warn("[pet] drag safety timeout — clearing DRAGGING");
+        cleanupDragDetect();
         dragArmed = false;
         dragStartWin = null;
-        void invoke("set_pet_dragging", { dragging: false }).catch(() => {});
+        dragStartMouse = null;
       }
     }, 5000);
   }
 
-  // Drag end (mouseup). Clears DRAGGING, then does click-vs-drag
-  // disambiguation: if the window moved >2px it's a drag (save position);
-  // otherwise it's a click (toggle panel / dismiss alert).
-  async function onDragMouseUp() {
-    if (!dragArmed) return;
-    dragArmed = false;
+  function cleanupDragDetect() {
+    window.removeEventListener("mousemove", onDragDetectMove);
+    window.removeEventListener("mouseup", onDragDetectUp);
+  }
 
+  // Mouse moved beyond threshold → it's a drag. Enter the OS modal drag
+  // loop via start_pet_drag. The IPC promise resolves when the drag ends
+  // (user releases the mouse + modal loop exits).
+  function onDragDetectMove(e: MouseEvent) {
+    if (!dragStartMouse) return;
+    const dx = Math.abs(e.screenX - dragStartMouse.x);
+    const dy = Math.abs(e.screenY - dragStartMouse.y);
+    if (dx <= DRAG_THRESHOLD && dy <= DRAG_THRESHOLD) return;
+
+    // Threshold exceeded → start the OS drag.
+    cleanupDragDetect();
+    invoke("start_pet_drag")
+      .then(() => {
+        // Drag loop exited — clear DRAGGING, save position, reset state.
+        dragArmed = false;
+        dragStartWin = null;
+        dragStartMouse = null;
+        if (dragSafetyTimer) {
+          clearTimeout(dragSafetyTimer);
+          dragSafetyTimer = null;
+        }
+        void invoke("set_pet_dragging", { dragging: false }).catch(() => {});
+        getCurrentWindow()
+          .outerPosition()
+          .then((pos) => {
+            invoke("save_pet_pos", { x: pos.x, y: pos.y }).catch(() => {});
+          })
+          .catch(() => {});
+      })
+      .catch((err) => {
+        console.warn("[pet] start_pet_drag failed:", err);
+        dragArmed = false;
+        dragStartWin = null;
+        dragStartMouse = null;
+        if (dragSafetyTimer) {
+          clearTimeout(dragSafetyTimer);
+          dragSafetyTimer = null;
+        }
+        void invoke("set_pet_dragging", { dragging: false }).catch(() => {});
+      });
+  }
+
+  // Mouse released without exceeding drag threshold → it's a click.
+  function onDragDetectUp() {
+    cleanupDragDetect();
     if (dragSafetyTimer) {
       clearTimeout(dragSafetyTimer);
       dragSafetyTimer = null;
     }
-
-    // Clear the DRAGGING flag so the poller resumes normal click-through.
-    try {
-      await invoke("set_pet_dragging", { dragging: false });
-    } catch (err) {
-      console.warn("[pet] set_pet_dragging(false) failed:", err);
-    }
-
-    // Click-vs-drag: compare start/end window positions.
-    let endPos: { x: number; y: number } | null = null;
-    try {
-      const pos = await getCurrentWindow().outerPosition();
-      endPos = { x: pos.x, y: pos.y };
-    } catch (err) {
-      console.warn("[pet] outerPosition at drag end failed:", err);
-    }
-
-    const start = dragStartWin;
+    dragArmed = false;
     dragStartWin = null;
-
-    if (!start || !endPos) {
-      handleRobotClick();
-      return;
-    }
-
-    const dx = Math.abs(endPos.x - start.x);
-    const dy = Math.abs(endPos.y - start.y);
-    if (dx <= 2 && dy <= 2) {
-      // Click — play nudge + check for double click.
-      handleRobotClick();
-    } else {
-      // Drag — persist the new position (within-session).
-      try {
-        await invoke("save_pet_pos", { x: endPos.x, y: endPos.y });
-      } catch (err) {
-        console.warn("[pet] save_pet_pos failed:", err);
-      }
-    }
+    dragStartMouse = null;
+    handleRobotClick();
   }
 
   function playNudge() {
