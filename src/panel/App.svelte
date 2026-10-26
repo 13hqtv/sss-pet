@@ -111,16 +111,54 @@
     activeTab = id;
   }
 
-  // Panel drag: call startDragging() on mousedown in the tab strip's
-  // non-button area. data-tauri-drag-region is unreliable on some
-  // Windows + Tauri 2 builds, so we also wire a JS handler as the
-  // primary mechanism. Tab buttons are excluded so clicking a tab
-  // switches the view instead of dragging the window.
+  // Panel drag + maximize: deferred-drag so double-click still works.
+  // On mousedown we DON'T immediately call startDragging() — that enters
+  // the Windows modal drag loop which swallows the second click of a
+  // double-click, breaking maximize/restore. Instead we register
+  // mousemove + mouseup and only start dragging after the mouse moves
+  // beyond PANEL_DRAG_THRESHOLD. A double-click (two clicks without
+  // movement) never enters the modal loop, so dblclick fires normally.
+  let panelDragStart: { x: number; y: number } | null = null;
+  const PANEL_DRAG_THRESHOLD = 3;
+
   function onTabsMouseDown(e: MouseEvent) {
     if ((e.target as HTMLElement).closest(".tab")) return;
+    panelDragStart = { x: e.screenX, y: e.screenY };
+    window.addEventListener("mousemove", onPanelDragDetectMove);
+    window.addEventListener("mouseup", onPanelDragDetectUp, { once: true });
+  }
+
+  function onPanelDragDetectMove(e: MouseEvent) {
+    if (!panelDragStart) return;
+    const dx = Math.abs(e.screenX - panelDragStart.x);
+    const dy = Math.abs(e.screenY - panelDragStart.y);
+    if (dx <= PANEL_DRAG_THRESHOLD && dy <= PANEL_DRAG_THRESHOLD) return;
+    // Threshold exceeded → start the OS drag.
+    window.removeEventListener("mousemove", onPanelDragDetectMove);
+    window.removeEventListener("mouseup", onPanelDragDetectUp);
+    panelDragStart = null;
     getCurrentWindow().startDragging().catch((err) =>
       console.warn("[panel] startDragging failed:", err),
     );
+  }
+
+  function onPanelDragDetectUp() {
+    window.removeEventListener("mousemove", onPanelDragDetectMove);
+    panelDragStart = null;
+  }
+
+  async function onTabsDblClick(e: MouseEvent) {
+    if ((e.target as HTMLElement).closest(".tab")) return;
+    const win = getCurrentWindow();
+    try {
+      if (await win.isMaximized()) {
+        await win.unmaximize();
+      } else {
+        await win.maximize();
+      }
+    } catch (err) {
+      console.warn("[panel] maximize toggle failed:", err);
+    }
   }
 
   // Disable the browser context menu (right-click menu) — the panel is
@@ -166,7 +204,7 @@
        Tauri call start_dragging on mousedown in the bar area, but the
        tab pills are still clickable because they're above the drag layer. -->
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-  <nav class="tabs" data-tauri-drag-region onmousedown={onTabsMouseDown}>
+  <nav class="tabs" data-tauri-drag-region onmousedown={onTabsMouseDown} ondblclick={onTabsDblClick}>
     {#each TABS as tab (tab.id)}
       <button
         class="tab"
