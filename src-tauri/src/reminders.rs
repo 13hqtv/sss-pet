@@ -138,8 +138,8 @@ pub fn spawn_reminder_scheduler<R: Runtime + 'static>(
     tauri::async_runtime::spawn(async move {
         loop {
             tokio::time::sleep(TICK_INTERVAL).await;
-            let fired = {
-                let conn = match db_state.lock() {
+            let (fired, dispatches) = {
+                let mut conn = match db_state.lock() {
                     Ok(c) => c,
                     Err(e) => {
                         log::error!("[reminders] db lock poisoned: {e}");
@@ -165,10 +165,23 @@ pub fn spawn_reminder_scheduler<R: Runtime + 'static>(
                         json!({ "id": id, "text": text }),
                     );
                 };
-                run_reminder_tick(&conn, now, &mut notify_fn, &mut apply_fn, &mut emit_fn)
+                let fired =
+                    run_reminder_tick(&conn, now, &mut notify_fn, &mut apply_fn, &mut emit_fn);
+                // Automation due check (sibling, same locked block): sync DB
+                // prep only — run_chat_turn + LLM happen in spawned tasks
+                // after the guard releases, so the tick stays non-blocking.
+                let dispatches = crate::automation::run_automation_tick(&mut conn, now);
+                (fired, dispatches)
             };
             if !fired.is_empty() {
                 log::error!("[reminders] fired {} reminder(s) this tick", fired.len());
+            }
+            for d in dispatches {
+                let app = app.clone();
+                let db_state = db_state.clone();
+                tauri::async_runtime::spawn(
+                    crate::automation::automation_dispatch_async(app, db_state, d),
+                );
             }
         }
     });
