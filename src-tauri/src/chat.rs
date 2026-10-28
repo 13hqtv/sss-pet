@@ -31,7 +31,7 @@
 //! persists that buffer on completion regardless of whether the frontend
 //! ever saw the live stream). The [`chat_survives_hide`] test pins this.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
@@ -111,6 +111,7 @@ pub async fn run_chat_turn(
     cwd: &Path,
     system_prompt: Option<String>,
     mcp_config: Option<String>,
+    cleanup_paths: Vec<PathBuf>,
 ) -> Result<(), String> {
     // 1. Load conv + history; append the user's prompt as a stored
     //    "user" message BEFORE the agent runs (so history shows the
@@ -314,6 +315,12 @@ pub async fn run_chat_turn(
             "result": result,
         });
         emit("chat_result", payload);
+        // Clean up the materialized skill dirs (claude `.claude/skills/<slug>/`,
+        // opencode `.opencode/skills/<slug>/`, or codex temp dirs) written before
+        // the turn — the agent no longer needs them now that the turn finished.
+        // Best-effort (a crash-left dir is harmless); only touches dirs this turn
+        // created (collision-suffixed, never user-installed skills).
+        crate::skill::cleanup_skill_dirs(&cleanup_paths);
     });
 
     // 4. Return immediately — the spawned task runs the stream.
@@ -436,59 +443,60 @@ pub async fn chat_send(
     // Load the conversation; use conv.cwd + conv.provider (source of
     // truth — set at creation, immutable) for run_turn + agent::new. If
     // conv.agent_id is set, also load the agent profile + enabled skills
-    // and build the effective system_prompt (agent.system_prompt +
-    // concatenated skill content) + mcp_config.
-    let (cwd, provider, system_prompt, mcp_config) = {
+    // (+ each skill's supporting files) + mcp_config.
+    //
+    // Skill BODIES are no longer concatenated into the system prompt —
+    // they're materialized to disk (materialize_skills below) so the
+    // agent CLI discovers them natively (claude `.claude/skills/`,
+    // opencode `.opencode/skills/`; codex fallback injects body+path
+    // into the prompt). `base_system_prompt` here is the agent's OWN
+    // prompt only; the skills prompt section is appended after
+    // materialization.
+    let (cwd, provider, base_system_prompt, mcp_config, skills_with_files) = {
         let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
         let conv = db::load_conversation(&conn, &conv_id)
             .map_err(|e| format!("load_conversation: {e}"))?
             .ok_or_else(|| format!("conversation {conv_id} not found"))?;
         let cwd = std::path::PathBuf::from(conv.cwd);
         let provider = conv.provider;
-        // If the conversation is linked to a saved agent profile, load
-        // its live system_prompt + skills + mcp_config. The provider/model/
-        // cwd are already pinned at conversation creation (immutable), but
-        // system_prompt/skills/mcp are read fresh each turn so editing the
-        // agent profile affects existing conversations.
-        let (sp, mc) = if let Some(ref aid) = conv.agent_id {
+        let (sp, mc, swf) = if let Some(ref aid) = conv.agent_id {
             let agent = db::agent_get(&conn, aid)
                 .map_err(|e| format!("agent_get: {e}"))?
                 .ok_or_else(|| format!("agent {aid} not found"))?;
             let skills = db::agent_enabled_skills(&conn, aid)
                 .map_err(|e| format!("agent_enabled_skills: {e}"))?;
-            // Build the effective system prompt: agent's own prompt +
-            // concatenated skill content.
-            let mut prompt_parts = Vec::new();
-            if let Some(s) = &agent.system_prompt {
-                if !s.trim().is_empty() {
-                    prompt_parts.push(s.clone());
-                }
-            }
+            // Load each enabled skill's supporting files (for materialization).
+            let mut swf = Vec::with_capacity(skills.len());
             for skill in &skills {
-                let mut section = format!("## Skill: {}\n", skill.name);
-                if let Some(desc) = &skill.description {
-                    if !desc.trim().is_empty() {
-                        section.push_str(desc);
-                        section.push('\n');
-                    }
-                }
-                if let Some(content) = &skill.content {
-                    if !content.trim().is_empty() {
-                        section.push_str(content);
-                    }
-                }
-                prompt_parts.push(section);
+                let files = db::skill_file_list(&conn, &skill.id)
+                    .map_err(|e| format!("skill_file_list: {e}"))?;
+                swf.push((skill.clone(), files));
             }
-            let effective_sp = if prompt_parts.is_empty() {
-                None
-            } else {
-                Some(prompt_parts.join("\n\n"))
-            };
-            (effective_sp, agent.mcp_config)
+            let base_sp = agent
+                .system_prompt
+                .as_ref()
+                .filter(|s| !s.trim().is_empty())
+                .cloned();
+            (base_sp, agent.mcp_config, swf)
         } else {
-            (None, None)
+            (None, None, Vec::new())
         };
-        (cwd, provider, sp, mc)
+        (cwd, provider, sp, mc, swf)
+    };
+    // Materialize the agent's enabled skills to disk so the CLI discovers
+    // them (claude/opencode native skills dir; codex temp-dir fallback).
+    // Done OUTSIDE the db lock — filesystem I/O must not block the db
+    // mutex. `prompt_section` is appended to the base system prompt (a
+    // name-only index for native providers; the skill bodies + script-dir
+    // paths for the codex fallback). `created_dirs` is passed to
+    // run_chat_turn for best-effort cleanup after the turn.
+    let materialized = crate::skill::materialize_skills(&cwd, &provider, &skills_with_files)
+        .map_err(|e| format!("materialize_skills: {e}"))?;
+    let system_prompt = match (base_system_prompt, materialized.prompt_section.as_str()) {
+        (Some(base), sec) if !sec.is_empty() => Some(format!("{base}\n\n{sec}")),
+        (Some(base), _) => Some(base),
+        (None, sec) if !sec.is_empty() => Some(sec.to_string()),
+        _ => None,
     };
     let cfg = BackendConfig::default();
     let backend =
@@ -509,7 +517,18 @@ pub async fn chat_send(
     // as the command call; clone the Arc out so the spawn (which
     // outlives this command's IPC call) keeps a valid handle.
     let db_arc = db.inner().clone();
-    run_chat_turn(backend.as_ref(), emit, db_arc, &conv_id, &prompt, &cwd, system_prompt, mcp_config).await
+    run_chat_turn(
+        backend.as_ref(),
+        emit,
+        db_arc,
+        &conv_id,
+        &prompt,
+        &cwd,
+        system_prompt,
+        mcp_config,
+        materialized.created_dirs,
+    )
+    .await
 }
 
 // ===========================================================================
@@ -667,6 +686,7 @@ mod tests {
             &cwd,
             None,
             None,
+            vec![],
         )
         .await
         .expect("run_chat_turn ok");
@@ -801,6 +821,7 @@ mod tests {
             &cwd,
             None,
             None,
+            vec![],
         )
         .await
         .expect("run_chat_turn ok");
@@ -843,5 +864,89 @@ mod tests {
         assert!(msgs.iter().any(|m| m.role == "assistant" && m.content == "ping"));
         let loaded = db::load_conversation(&conn, &conv.id).unwrap().unwrap();
         assert_eq!(loaded.session_id.as_deref(), Some("sess-emit-1"));
+    }
+
+    /// Task 4: run_chat_turn cleans up the materialized skill dirs after
+    /// the turn completes (the drain calls cleanup_skill_dirs after
+    /// emitting chat_result). Passes a real temp dir as cleanup_paths +
+    /// asserts it's gone once the canned reply is persisted (turn done).
+    #[tokio::test]
+    async fn run_chat_turn_cleans_up_skill_dirs_after_turn() {
+        let (_tmp, _g, db_state) = fresh_db();
+        let conv = Conversation {
+            id: unique_conv_id(),
+            provider: "claude".into(),
+            session_id: None,
+            title: "Cleanup".into(),
+            created_at: chrono::Utc::now(),
+            model: None,
+            cwd: ".".into(),
+            agent_id: None,
+        };
+        {
+            let conn = db_state.lock().unwrap();
+            db::save_conversation(&conn, &conv).expect("save_conversation");
+        }
+        // A "materialized skill dir" — mimics what materialize_skills
+        // writes before the turn (SKILL.md + a nested script).
+        let skill_parent = tempfile::tempdir().expect("skill parent");
+        let skill_dir = skill_parent.path().join("my-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "body").unwrap();
+        std::fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+        std::fs::write(skill_dir.join("scripts/a.py"), "print(1)").unwrap();
+
+        let backend = FakeBackend {
+            canned: vec![Message {
+                kind: MessageKind::Text,
+                content: "done".into(),
+                tool: None,
+                call_id: None,
+            }],
+            result: ExecResult {
+                status: "completed".into(),
+                output: "done".into(),
+                session_id: None,
+                usage: HashMap::new(),
+            },
+        };
+        let cwd = std::path::PathBuf::from(".");
+        let emit = |_: &str, _: Value| {};
+        run_chat_turn(
+            &backend as &dyn Backend,
+            emit,
+            Arc::clone(&db_state),
+            &conv.id,
+            "go",
+            &cwd,
+            None,
+            None,
+            vec![skill_dir.clone()],
+        )
+        .await
+        .expect("run_chat_turn ok");
+
+        // Poll until the turn completes (canned "done" persisted) — by
+        // then the drain has run cleanup_skill_dirs.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            {
+                let conn = db_state.lock().unwrap();
+                let msgs = db::load_messages(&conn, &conv.id).unwrap();
+                if msgs.iter().any(|m| m.role == "assistant" && m.content == "done") {
+                    break;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("run_chat_turn_cleans_up: turn did not complete within 2s");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // The skill dir was removed by the drain's cleanup.
+        assert!(
+            !skill_dir.exists(),
+            "skill dir should be cleaned up after the turn"
+        );
+        assert!(!skill_dir.join("SKILL.md").exists());
     }
 }
