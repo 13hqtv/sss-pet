@@ -345,7 +345,23 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
-        );",
+        );
+        CREATE TABLE IF NOT EXISTS automation_runs (
+            id TEXT PRIMARY KEY,
+            automation_id TEXT NOT NULL,
+            conversation_id TEXT,
+            source TEXT NOT NULL,
+            status TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            error TEXT,
+            result_summary TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (automation_id) REFERENCES automations(id) ON DELETE CASCADE,
+            FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_automation_runs_automation
+            ON automation_runs(automation_id, started_at DESC);",
     )?;
     // Task 1: idempotent column adds. SQLite's `ALTER TABLE … ADD COLUMN`
     // errors on a pre-existing column ("duplicate column name"), so guard
@@ -1865,6 +1881,120 @@ pub fn automation_get_due(conn: &Connection, now_utc: &str) -> rusqlite::Result<
 }
 
 // ===========================================================================
+// Automation runs: one row per execution of an automation.
+// conversation_id links to the first-class conversations row holding the
+// run's full message transcript (the run-detail view loads it via
+// load_messages). CASCADE on automation_id drops history with its owner;
+// SET NULL on conversation_id so deleting the chat keeps the run row.
+// ===========================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct AutomationRun {
+    pub id: String,
+    pub automation_id: String,
+    pub conversation_id: Option<String>,
+    pub source: String,
+    pub status: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub error: Option<String>,
+    pub result_summary: Option<String>,
+    pub created_at: String,
+}
+
+fn automation_run_from_row(row: &rusqlite::Row) -> rusqlite::Result<AutomationRun> {
+    Ok(AutomationRun {
+        id: row.get(0)?,
+        automation_id: row.get(1)?,
+        conversation_id: row.get(2)?,
+        source: row.get(3)?,
+        status: row.get(4)?,
+        started_at: row.get(5)?,
+        finished_at: row.get(6)?,
+        error: row.get(7)?,
+        result_summary: row.get(8)?,
+        created_at: row.get(9)?,
+    })
+}
+
+const AUTOMATION_RUN_COLS: &str = "id, automation_id, conversation_id, source, status, \
+    started_at, finished_at, error, result_summary, created_at";
+
+pub fn automation_run_list(
+    conn: &Connection,
+    automation_id: &str,
+) -> rusqlite::Result<Vec<AutomationRun>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {AUTOMATION_RUN_COLS} FROM automation_runs WHERE automation_id=?1 \
+         ORDER BY started_at DESC LIMIT 100"
+    ))?;
+    let rows = stmt.query_map([automation_id], |row| automation_run_from_row(row))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+pub fn automation_run_get(conn: &Connection, id: &str) -> rusqlite::Result<Option<AutomationRun>> {
+    let mut stmt =
+        conn.prepare(&format!("SELECT {AUTOMATION_RUN_COLS} FROM automation_runs WHERE id=?1"))?;
+    let mut rows = stmt.query_map([id], |row| automation_run_from_row(row))?;
+    if let Some(r) = rows.next() {
+        Ok(Some(r?))
+    } else {
+        Ok(None)
+    }
+}
+
+pub fn automation_run_create(
+    conn: &mut Connection,
+    automation_id: &str,
+    conversation_id: Option<&str>,
+    source: &str,
+    status: &str,
+    started_at: &str,
+) -> rusqlite::Result<AutomationRun> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO automation_runs (id, automation_id, conversation_id, source, status, \
+         started_at, finished_at, error, result_summary, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, ?7)",
+        rusqlite::params![id, automation_id, conversation_id, source, status, started_at, now],
+    )?;
+    automation_run_get(conn, &id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+}
+
+pub fn automation_run_update(
+    conn: &mut Connection,
+    id: &str,
+    status: &str,
+    finished_at: Option<String>,
+    error: Option<String>,
+    result_summary: Option<String>,
+) -> rusqlite::Result<AutomationRun> {
+    // COALESCE on finished_at/error/result_summary: None preserves the old
+    // value, so callers settle only the fields they're closing the run on.
+    conn.execute(
+        "UPDATE automation_runs SET status=?2, finished_at=COALESCE(?3, finished_at), \
+         error=COALESCE(?4, error), result_summary=COALESCE(?5, result_summary) WHERE id=?1",
+        rusqlite::params![id, status, finished_at, error, result_summary],
+    )?;
+    automation_run_get(conn, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+}
+
+pub fn automation_run_has_running(conn: &Connection, automation_id: &str) -> rusqlite::Result<bool> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM automation_runs WHERE automation_id=?1 AND status='running' LIMIT 1)",
+        [automation_id],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -1950,6 +2080,37 @@ mod tests {
         automation_set_last_run(&conn, &a.id, Some("2026-10-26T01:00:00+00:00".into())).unwrap();
         let got2 = automation_get(&conn, &a.id).unwrap().unwrap();
         assert_eq!(got2.last_run_at.as_deref(), Some("2026-10-26T01:00:00+00:00"));
+    }
+
+    // -- automation_runs CRUD (Task 2) --
+
+    #[test]
+    fn automation_run_create_list_has_running() {
+        let (_t, mut conn) = fresh_db();
+        let aid = agent_create(&conn, "A", None, "claude", None, None, None, None).unwrap();
+        let a = automation_create(&mut conn, "n", &aid, "p", "interval", "60", true, None).unwrap();
+        let r = automation_run_create(&mut conn, &a.id, None, "schedule", "running",
+            "2026-10-26T00:00:00+00:00").unwrap();
+        assert!(automation_run_has_running(&conn, &a.id).unwrap());
+        let list = automation_run_list(&conn, &a.id).unwrap();
+        assert_eq!(list.len(), 1);
+        let r2 = automation_run_update(&mut conn, &r.id, "completed",
+            Some("2026-10-26T00:01:00+00:00".into()), None, Some("ok summary".into())).unwrap();
+        assert_eq!(r2.status, "completed");
+        assert_eq!(r2.result_summary.as_deref(), Some("ok summary"));
+        assert!(!automation_run_has_running(&conn, &a.id).unwrap());
+    }
+
+    #[test]
+    fn automation_runs_cascade_on_automation_delete() {
+        let (_t, mut conn) = fresh_db();
+        let aid = agent_create(&conn, "A", None, "claude", None, None, None, None).unwrap();
+        let a = automation_create(&mut conn, "n", &aid, "p", "interval", "60", true, None).unwrap();
+        automation_run_create(&mut conn, &a.id, None, "schedule", "running",
+            "2026-10-26T00:00:00+00:00").unwrap();
+        assert_eq!(automation_run_list(&conn, &a.id).unwrap().len(), 1);
+        automation_delete(&conn, &a.id).unwrap();
+        assert!(automation_run_list(&conn, &a.id).unwrap().is_empty());
     }
 
     // -- open + migrate: tables exist --
