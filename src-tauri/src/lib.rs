@@ -374,6 +374,32 @@ fn skill_delete(db: State<'_, Arc<Mutex<Connection>>>, id: String) -> Result<(),
     db::skill_delete(&conn, &id).map_err(|e| format!("skill_delete: {e}"))
 }
 
+/// List a skill's supporting script files (path + content), ordered by
+/// path ASC. Called by the skill-form UI on edit.
+#[tauri::command]
+fn skill_file_list(
+    db: State<'_, Arc<Mutex<Connection>>>,
+    skill_id: String,
+) -> Result<Vec<db::SkillFile>, String> {
+    let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+    db::skill_file_list(&conn, &skill_id).map_err(|e| format!("skill_file_list: {e}"))
+}
+
+/// Replace the full file set of a skill (full-replace-on-save semantics:
+/// delete all existing rows then insert the new set). `files` is a Vec of
+/// `(path, content)` tuples. SKILL.md paths are silently skipped (the
+/// body lives in `skills.content`); binary/oversize files are rejected.
+#[tauri::command]
+fn skill_file_replace_all(
+    db: State<'_, Arc<Mutex<Connection>>>,
+    skill_id: String,
+    files: Vec<(String, String)>,
+) -> Result<(), String> {
+    let mut conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+    db::skill_file_replace_all(&mut conn, &skill_id, &files)
+        .map_err(|e| format!("skill_file_replace_all: {e}"))
+}
+
 #[tauri::command]
 fn agent_skills_list(
     db: State<'_, Arc<Mutex<Connection>>>,
@@ -810,6 +836,8 @@ pub fn run() {
             agent_skill_add,
             agent_skill_remove,
             agent_skill_set_enabled,
+            skill_file_list,
+            skill_file_replace_all,
             agent_gen::agent_gen_start,
             agent_gen::agent_gen_continue,
             agent_gen::agent_gen_history,

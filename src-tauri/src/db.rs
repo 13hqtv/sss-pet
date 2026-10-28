@@ -224,7 +224,13 @@ pub fn open() -> rusqlite::Result<Connection> {
         rusqlite::Error::InvalidPath(PathBuf::from("<no writable data dir>"))
     })?;
     let path = dir.join("sss-pet.db");
-    Connection::open(path)
+    let conn = Connection::open(path)?;
+    // Enable FK enforcement so the schema's `ON DELETE CASCADE`
+    // declarations (agent_skills, skill_files) actually fire. SQLite
+    // defaults foreign_keys OFF per-connection; without this, deleting
+    // an agent/skill leaves orphaned junction/file rows.
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    Ok(conn)
 }
 
 /// Create all five tables + the messages index if they don't exist, then
@@ -294,6 +300,16 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             enabled INTEGER NOT NULL DEFAULT 1,
             PRIMARY KEY (agent_id, skill_id),
             FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
+            FOREIGN KEY (skill_id) REFERENCES skills(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS skill_files (
+            id TEXT PRIMARY KEY,
+            skill_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(skill_id, path),
             FOREIGN KEY (skill_id) REFERENCES skills(id) ON DELETE CASCADE
         );
         CREATE TABLE IF NOT EXISTS kpis (
@@ -1310,6 +1326,23 @@ pub struct Skill {
     pub updated_at: String,
 }
 
+/// A supporting script file belonging to a skill (`skill_files` table).
+/// `path` is a slash-delimited relative path that may include subdirs
+/// (e.g. `scripts/analyze.py`); directories are inferred from paths, never
+/// stored as rows. `SKILL.md` is reserved (the skill's primary body lives
+/// in `skills.content`) — a file whose path cleans to `SKILL.md` is
+/// refused by `skill_file_replace_all`. Text-only (binary files rejected
+/// by extension + content check, capped at 1 MiB/file).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SkillFile {
+    pub id: String,
+    pub skill_id: String,
+    pub path: String,
+    pub content: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 /// A skill assignment row — links an agent to a skill with an enabled flag.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AgentSkill {
@@ -1483,11 +1516,135 @@ pub fn skill_update(
     Ok(())
 }
 
-/// Delete a skill by id. The `agent_skills` junction rows are deleted
-/// automatically via the ON DELETE CASCADE foreign key.
+/// Delete a skill by id. The `agent_skills` junction rows + `skill_files`
+/// rows are deleted automatically via the ON DELETE CASCADE foreign key
+/// (requires `PRAGMA foreign_keys = ON`, set in `open()`).
 pub fn skill_delete(conn: &Connection, id: &str) -> rusqlite::Result<()> {
     conn.execute("DELETE FROM skills WHERE id = ?1", rusqlite::params![id])?;
     Ok(())
+}
+
+/// List all supporting files for a skill, ordered by path ASC (so the
+/// file tree renders stably). Called by the skill-form UI on edit + by
+/// the chat-turn materializer.
+pub fn skill_file_list(conn: &Connection, skill_id: &str) -> rusqlite::Result<Vec<SkillFile>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, skill_id, path, content, created_at, updated_at \
+         FROM skill_files WHERE skill_id = ?1 ORDER BY path ASC",
+    )?;
+    let rows = stmt.query_map([skill_id], |row| {
+        Ok(SkillFile {
+            id: row.get(0)?,
+            skill_id: row.get(1)?,
+            path: row.get(2)?,
+            content: row.get(3)?,
+            created_at: row.get(4)?,
+            updated_at: row.get(5)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Replace the full file set of a skill in one transaction: delete every
+/// existing `skill_files` row for `skill_id`, then insert each `(path,
+/// content)` from `files`. Mirrors multica's full-replace-on-save
+/// semantics (simpler than per-file upsert/delete).
+///
+/// Validation (inline here until Task 2's `crate::skill::` helpers land,
+/// then swapped to call them):
+/// - skips any file whose path cleans to `SKILL.md` (case-insensitive) —
+///   the skill body lives in `skills.content`, not as a file row.
+/// - rejects binary files by extension blacklist.
+/// - rejects files > 1 MiB (single-file cap; the bundle cap is enforced
+///   by `crate::skill::check_caps` in Task 2).
+///
+/// Returns `Ok(())` on success. On any validation failure the
+/// transaction rolls back (the `Transaction` guard drops on `?`).
+pub fn skill_file_replace_all(
+    conn: &mut Connection,
+    skill_id: &str,
+    files: &[(String, String)],
+) -> rusqlite::Result<()> {
+    const MAX_FILE_BYTES: usize = 1024 * 1024; // 1 MiB
+    // Pre-validate before opening the transaction so a rejection doesn't
+    // leave the connection in a begun-transaction state.
+    for (path, content) in files {
+        if is_reserved_skill_md_path(path) {
+            continue; // silently skip — SKILL.md is the content column
+        }
+        if is_binary_extension(path) {
+            return Err(rusqlite::Error::ToSqlConversionFailure(format!(
+                "binary file not allowed: {path}"
+            ).into()));
+        }
+        if content.len() > MAX_FILE_BYTES {
+            return Err(rusqlite::Error::ToSqlConversionFailure(format!(
+                "file > 1 MiB: {path} ({} bytes)",
+                content.len()
+            ).into()));
+        }
+    }
+    let tx = conn.transaction()?;
+    tx.execute(
+        "DELETE FROM skill_files WHERE skill_id = ?1",
+        rusqlite::params![skill_id],
+    )?;
+    let now = chrono::Utc::now().to_rfc3339();
+    for (path, content) in files {
+        if is_reserved_skill_md_path(path) {
+            continue;
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        tx.execute(
+            "INSERT INTO skill_files (id, skill_id, path, content, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![id, skill_id, path, content, now, now],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// True iff `path` cleans to `SKILL.md` (case-insensitive) — the reserved
+/// primary-content filename. The skill body lives in `skills.content`, so
+/// a supporting file with this path is silently skipped on replace.
+fn is_reserved_skill_md_path(path: &str) -> bool {
+    use std::path::Path;
+    let cleaned = Path::new(path).components().last();
+    match cleaned {
+        Some(std::path::Component::Normal(name)) => {
+            name.to_string_lossy().eq_ignore_ascii_case("SKILL.md")
+        }
+        _ => false,
+    }
+}
+
+/// True iff the path's extension is in the binary blacklist (images,
+/// fonts, archives, office docs, media, executables, databases). Mirrors
+/// multica's `IsLikelyBinaryFilePath` (server/internal/skill/binary.go).
+/// Task 2's `crate::skill::is_likely_binary` adds the NUL-byte content
+/// check; this db-layer version is extension-only (the content is already
+/// a Rust `String` here, so it cannot contain NUL).
+fn is_binary_extension(path: &str) -> bool {
+    use std::path::Path;
+    let ext = match Path::new(path).extension() {
+        Some(e) => e.to_string_lossy().to_ascii_lowercase(),
+        None => return false,
+    };
+    matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "ico" | "webp" | "pdf"
+            | "zip" | "tar" | "gz" | "rar" | "7z"
+            | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx"
+            | "mp3" | "mp4" | "avi" | "mov" | "wav" | "flac"
+            | "exe" | "dll" | "so" | "dylib" | "bin"
+            | "woff" | "woff2" | "ttf" | "otf"
+            | "db" | "sqlite" | "sqlite3"
+    )
 }
 
 /// List all skills assigned to an agent, with their enabled flag.
@@ -2620,5 +2777,71 @@ mod tests {
         kpi_target_upsert(&conn, 2025, "需求开发", 5).expect("upsert4");
         assert_eq!(kpi_target_list(&conn, 2026).expect("list2026").len(), 2);
         assert_eq!(kpi_target_list(&conn, 2025).expect("list2025").len(), 1);
+    }
+
+    // -- skill_files (Task 1: script files) --
+
+    #[test]
+    fn skill_file_replace_all_inserts_lists_replaces_and_skips_skill_md() {
+        let (_tmp, mut conn) = fresh_db();
+        let sid = skill_create(&conn, "s1", None, Some("body")).unwrap();
+        // insert
+        skill_file_replace_all(&mut conn, &sid, &[
+            ("scripts/a.py".into(), "print(1)".into()),
+            ("docs/b.md".into(), "# B".into()),
+        ])
+        .unwrap();
+        let listed = skill_file_list(&conn, &sid).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].path, "docs/b.md"); // ORDER BY path ASC
+        // replace (delete old + write new)
+        skill_file_replace_all(&mut conn, &sid, &[
+            ("scripts/c.py".into(), "print(2)".into()),
+        ])
+        .unwrap();
+        assert_eq!(skill_file_list(&conn, &sid).unwrap().len(), 1);
+        // SKILL.md reserved — skipped, not stored
+        skill_file_replace_all(&mut conn, &sid, &[
+            ("SKILL.md".into(), "x".into()),
+            ("scripts/d.py".into(), "y".into()),
+        ])
+        .unwrap();
+        let listed = skill_file_list(&conn, &sid).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].path, "scripts/d.py");
+    }
+
+    #[test]
+    fn skill_file_replace_all_rejects_binary_and_oversize() {
+        let (_tmp, mut conn) = fresh_db();
+        let sid = skill_create(&conn, "s1", None, Some("body")).unwrap();
+        // binary by extension
+        let err = skill_file_replace_all(&mut conn, &sid, &[
+            ("a.png".into(), "data".into()),
+        ])
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("binary") || err.to_string().contains("二进制"),
+            "got: {err}"
+        );
+        // oversize (>1 MiB)
+        let big = "x".repeat(1024 * 1024 + 1);
+        let err = skill_file_replace_all(&mut conn, &sid, &[("a.py".into(), big)])
+            .unwrap_err();
+        assert!(
+            err.to_string().contains('1') || err.to_string().contains("MiB"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn skill_files_cascade_delete_with_skill() {
+        let (_tmp, mut conn) = fresh_db();
+        let sid = skill_create(&conn, "s1", None, Some("body")).unwrap();
+        skill_file_replace_all(&mut conn, &sid, &[("a.py".into(), "x".into())]).unwrap();
+        assert_eq!(skill_file_list(&conn, &sid).unwrap().len(), 1);
+        skill_delete(&conn, &sid).unwrap();
+        // FK ON DELETE CASCADE (foreign_keys pragma ON) → rows gone
+        assert_eq!(skill_file_list(&conn, &sid).unwrap().len(), 0);
     }
 }
