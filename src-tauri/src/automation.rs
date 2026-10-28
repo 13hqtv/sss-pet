@@ -7,6 +7,7 @@
 //! agent turn and records the run via the emit accumulator. See
 //! docs/superpowers/specs/2026-10-26-automation-design.md.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Duration, Local, TimeZone, Utc};
@@ -221,16 +222,55 @@ pub fn finalize_run_on_result(
         .find(|m| m.role == "assistant")
         .map(|m| m.content.chars().take(200).collect());
     let now = chrono::Utc::now().to_rfc3339();
-    db::automation_run_update(conn, run_id, "completed", Some(now), None, summary)?;
+    db::automation_run_finalize(conn, run_id, "completed", Some(now), None, summary)?;
     Ok(())
 }
 
 /// Close out a run on `chat_error`: status=failed, finished_at=now, error=msg.
-/// result_summary is left untouched (COALESCE preserves the prior value).
+/// Conditional (`WHERE status='running'`): a no-op if the run was already
+/// settled, so a `chat_result` arriving after can't flip failed→completed.
 pub fn finalize_run_on_error(conn: &mut Connection, run_id: &str, error: &str) -> rusqlite::Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
-    db::automation_run_update(conn, run_id, "failed", Some(now), Some(error.to_string()), None)?;
+    db::automation_run_finalize(conn, run_id, "failed", Some(now), Some(error.to_string()), None)?;
     Ok(())
+}
+
+/// Startup sweep: mark every `status='running'` run as `failed`. Spawned
+/// dispatch tasks don't survive an app restart, so any `running` row at
+/// startup is a crashed/abandoned run that would otherwise block future
+/// scheduled fires via the overlap check. Called once from `setup` after
+/// `migrate`. Preserves an existing error string; otherwise stamps
+/// "interrupted (app restart)".
+pub fn automation_sweep_stale_runs(conn: &mut Connection) -> rusqlite::Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE automation_runs SET status='failed', finished_at=?1, \
+         error=COALESCE(error, 'interrupted (app restart)') WHERE status='running'",
+        [&now],
+    )?;
+    Ok(())
+}
+
+/// Decide `next_fire_at` for an `automation_update` / `set_enabled` call:
+/// recompute (return `Some`) only when the trigger_type / trigger_config /
+/// enabled-ness changed; return `None` (preserve via COALESCE) otherwise —
+/// so editing only the prompt at 09:00:30 for a daily-09:00 automation
+/// doesn't silently skip today's slot by recomputing to tomorrow.
+pub fn next_fire_for_update(
+    old: &db::Automation,
+    new_trigger_type: &str,
+    new_trigger_config: &str,
+    new_enabled: bool,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    let trigger_changed =
+        old.trigger_type != new_trigger_type || old.trigger_config != new_trigger_config;
+    let enabling = new_enabled && !old.enabled;
+    if new_enabled && (trigger_changed || enabling) {
+        compute_initial_next_fire(new_trigger_type, new_trigger_config, true, now)
+    } else {
+        None
+    }
 }
 
 /// Initial `next_fire_at` (UTC RFC3339) for a freshly created/updated
@@ -323,9 +363,20 @@ pub async fn automation_dispatch_async<R: Runtime + 'static>(
     let db_arc = db_state.clone();
     let app_clone = app.clone();
     let automation_id_closure = automation_id.clone();
-    // The emit accumulator: Fn (called per streamed message + once on
-    // result/error). Borrows its captures in json! / finalize calls, so it
-    // is Fn, not FnOnce — matches run_chat_turn's emit bound.
+    // chat.rs's drain task emits `chat_error` WHILE HOLDING the db lock
+    // (chat.rs:271-289 — the save-failure path emits inside the
+    // `Ok(mut conn)` guard). std::sync::Mutex is non-reentrant, so this
+    // closure MUST NOT re-lock `db_arc` in the `chat_error` arm — that
+    // would deadlock the tokio worker + brick the db mutex. Instead the
+    // `chat_error` arm only records the failure into `save_failed`; the
+    // actual finalization happens in the `chat_result` arm, which chat.rs
+    // emits lock-free (chat.rs:317, after the guard drops). The
+    // conditional finalize (`WHERE status='running'`) makes this safe even
+    // if the ordering surprises: a failed run won't flip back to completed.
+    // If `chat_result` never follows (chat.rs no-result arm), the startup
+    // sweep (`automation_sweep_stale_runs`) recovers the stuck row.
+    let save_failed = Arc::new(AtomicBool::new(false));
+    let last_error: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let emit = move |event: &str, payload: Value| match event {
         "chat_message" => {
             let msg = payload.get("message").cloned().unwrap_or(Value::Null);
@@ -336,11 +387,23 @@ pub async fn automation_dispatch_async<R: Runtime + 'static>(
             );
         }
         "chat_result" => {
-            // drain task already persisted via save_turn_record; load + finalize.
-            let cid = payload.get("conv_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            // chat.rs emits this lock-free (chat.rs:317) — safe to lock here.
+            let cid = payload
+                .get("conv_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             if let Ok(mut conn) = db_arc.lock() {
-                let msgs = db::load_messages(&conn, &cid).unwrap_or_default();
-                let _ = finalize_run_on_result(&mut conn, &run_id, &msgs);
+                if save_failed.load(Ordering::SeqCst) {
+                    let err = last_error
+                        .lock()
+                        .map(|g| g.clone())
+                        .unwrap_or_default();
+                    let _ = finalize_run_on_error(&mut conn, &run_id, &err);
+                } else {
+                    let msgs = db::load_messages(&conn, &cid).unwrap_or_default();
+                    let _ = finalize_run_on_result(&mut conn, &run_id, &msgs);
+                }
             }
             let result = payload.get("result").cloned().unwrap_or(Value::Null);
             let _ = app_clone.emit_to(
@@ -355,13 +418,18 @@ pub async fn automation_dispatch_async<R: Runtime + 'static>(
             );
         }
         "chat_error" => {
+            // chat.rs emits this WHILE HOLDING the db lock — do NOT lock
+            // here (would deadlock). Record the failure; `chat_result`
+            // (which follows, lock-free) finalizes. If no `chat_result`
+            // follows, the startup sweep recovers the stuck row.
             let msg = payload
                 .get("message")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown error")
                 .to_string();
-            if let Ok(mut conn) = db_arc.lock() {
-                let _ = finalize_run_on_error(&mut conn, &run_id, &msg);
+            save_failed.store(true, Ordering::SeqCst);
+            if let Ok(mut g) = last_error.lock() {
+                *g = msg.clone();
             }
             let _ = app_clone.emit_to(
                 "panel",
@@ -434,8 +502,14 @@ pub async fn automation_update(
     enabled: bool,
 ) -> Result<db::Automation, String> {
     let now = Utc::now();
-    let next_fire = compute_initial_next_fire(&trigger_type, &trigger_config, enabled, now);
     let mut conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+    // Recompute next_fire only when trigger_type/trigger_config/enabled
+    // changed; prompt-only edits preserve the existing slot (so editing at
+    // 09:00:30 for a daily-09:00 automation doesn't skip today's fire).
+    let old = db::automation_get(&conn, &id)
+        .map_err(|e| format!("automation_get: {e}"))?
+        .ok_or_else(|| format!("automation {id} not found"))?;
+    let next_fire = next_fire_for_update(&old, &trigger_type, &trigger_config, enabled, now);
     db::automation_update(&mut conn, &id, &name, &agent_id, &prompt, &trigger_type, &trigger_config, enabled, next_fire)
         .map_err(|e| format!("automation_update: {e}"))
 }
@@ -460,13 +534,10 @@ pub async fn automation_set_enabled(
     let auto = db::automation_get(&conn, &id)
         .map_err(|e| format!("automation_get: {e}"))?
         .ok_or_else(|| format!("automation {id} not found"))?;
-    // Enabling → recompute next_fire from now. Disabling → pass None
-    // (COALESCE preserves the stale value, harmless: get_due filters enabled=1).
-    let next_fire = if enabled {
-        compute_initial_next_fire(&auto.trigger_type, &auto.trigger_config, true, now)
-    } else {
-        None
-    };
+    // Enabling → recompute next_fire from now. Disabling → None (COALESCE
+    // preserves the stale value; harmless: get_due filters enabled=1).
+    let next_fire =
+        next_fire_for_update(&auto, &auto.trigger_type, &auto.trigger_config, enabled, now);
     db::automation_update(&mut conn, &id, &auto.name, &auto.agent_id, &auto.prompt,
         &auto.trigger_type, &auto.trigger_config, enabled, next_fire)
         .map_err(|e| format!("automation_update: {e}"))
@@ -726,5 +797,64 @@ mod tests {
         let now = Utc::now();
         assert!(compute_initial_next_fire("daily", "09:00", true, now).is_some());
         assert!(compute_initial_next_fire("daily", "09:00", false, now).is_none());
+    }
+
+    // -- review fix pass --
+
+    #[test]
+    fn finalize_run_on_result_does_not_overwrite_failed() {
+        // #3: chat_error (save fail) marks failed, then chat_result (turn
+        // completed in-memory) must NOT flip the status back to completed.
+        let (_t, _g, mut conn) = fresh_db();
+        let rid = seed_running_run(&mut conn);
+        finalize_run_on_error(&mut conn, &rid, "save failed").unwrap();
+        let msgs = vec![mk_msg("assistant", "回复内容")];
+        finalize_run_on_result(&mut conn, &rid, &msgs).unwrap();
+        let got = db::automation_run_get(&conn, &rid).unwrap().unwrap();
+        assert_eq!(got.status, "failed");
+        assert_eq!(got.error.as_deref(), Some("save failed"));
+    }
+
+    #[test]
+    fn automation_sweep_stale_runs_marks_running_as_failed() {
+        // #2: a crashed/dispatch-dropped run stays 'running' forever and
+        // blocks future scheduled fires via the overlap check. The startup
+        // sweep must mark every 'running' row as 'failed'.
+        let (_t, _g, mut conn) = fresh_db();
+        let aid = seed_agent(&conn);
+        let a = db::automation_create(&mut conn, "n", &aid, "p", "interval", "60", true, None).unwrap();
+        db::automation_run_create(&mut conn, &a.id, None, "schedule", "running",
+            &Utc::now().to_rfc3339()).unwrap();
+        db::automation_run_create(&mut conn, &a.id, None, "manual", "running",
+            &Utc::now().to_rfc3339()).unwrap();
+        automation_sweep_stale_runs(&mut conn).unwrap();
+        let runs = db::automation_run_list(&conn, &a.id).unwrap();
+        assert_eq!(runs.len(), 2);
+        assert!(runs.iter().all(|r| r.status == "failed"));
+        assert!(runs.iter().all(|r| r.error.is_some()));
+    }
+
+    #[test]
+    fn next_fire_for_update_preserves_when_trigger_unchanged() {
+        // #5: editing only the prompt must NOT recompute next_fire (which
+        // could skip today's slot if edited after the scheduled time).
+        // Recompute only when trigger_type/trigger_config/enabled change.
+        let (_t, _g, mut conn) = fresh_db();
+        let aid = seed_agent(&conn);
+        let a = db::automation_create(&mut conn, "n", &aid, "p", "daily", "09:00", true,
+            Some("2026-10-27T01:00:00+00:00".into())).unwrap();
+        let now = Utc::now();
+        // unchanged → None (preserve via COALESCE)
+        assert_eq!(next_fire_for_update(&a, "daily", "09:00", true, now), None);
+        // trigger_type changed → Some (recompute)
+        assert!(next_fire_for_update(&a, "interval", "60", true, now).is_some());
+        // trigger_config changed → Some
+        assert!(next_fire_for_update(&a, "daily", "10:00", true, now).is_some());
+        // enabled false→true → Some
+        let mut a2 = a.clone();
+        a2.enabled = false;
+        assert!(next_fire_for_update(&a2, "daily", "09:00", true, now).is_some());
+        // enabled true→false → None (preserve; get_due filters enabled=1)
+        assert_eq!(next_fire_for_update(&a, "daily", "09:00", false, now), None);
     }
 }

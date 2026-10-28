@@ -1994,6 +1994,29 @@ pub fn automation_run_has_running(conn: &Connection, automation_id: &str) -> rus
     Ok(exists != 0)
 }
 
+/// Atomically settle a run ONLY if it is still `status='running'`. The
+/// `WHERE status='running'` guard means a second finalization (e.g. the
+/// `chat_result` event arriving after `chat_error` already marked the run
+/// failed on a save failure) is a no-op — the failed status sticks. Returns
+/// true if the row was updated (was running), false if it had already been
+/// settled. COALESCE preserves fields the caller passes as None.
+pub fn automation_run_finalize(
+    conn: &mut Connection,
+    id: &str,
+    status: &str,
+    finished_at: Option<String>,
+    error: Option<String>,
+    result_summary: Option<String>,
+) -> rusqlite::Result<bool> {
+    let rows = conn.execute(
+        "UPDATE automation_runs SET status=?2, finished_at=COALESCE(?3, finished_at), \
+         error=COALESCE(?4, error), result_summary=COALESCE(?5, result_summary) \
+         WHERE id=?1 AND status='running'",
+        rusqlite::params![id, status, finished_at, error, result_summary],
+    )?;
+    Ok(rows > 0)
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================

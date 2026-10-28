@@ -40,6 +40,7 @@
     type Automation,
     type AutomationRun,
     type StoredMessage,
+    type Message,
     type Skill,
     type Provider,
     type GenMessage,
@@ -87,6 +88,10 @@
   let runs: AutomationRun[] = $state([]);
   let selRunId: string | null = $state(null);
   let runMsgs: StoredMessage[] = $state([]);
+  // Live-streamed messages for the currently-running dispatch on the open
+  // history (the `automation_run_message` event). Cleared when the run
+  // settles (onResult/onError → reload runs).
+  let liveMsgs: Message[] = $state([]);
 
   // -- agent form --
   let formOpen: boolean = $state(false);
@@ -901,6 +906,7 @@
     autoHistoryId = auto.id;
     selRunId = null;
     runMsgs = [];
+    liveMsgs = [];
     runs = [];
     void loadRuns();
   }
@@ -909,6 +915,7 @@
     autoHistoryId = null;
     selRunId = null;
     runMsgs = [];
+    liveMsgs = [];
     runs = [];
   }
 
@@ -939,20 +946,29 @@
   $effect(() => {
     let unlisten: (() => void) | null = null;
     void subscribeAutomationRunStream({
+      onMessage: (_runId, automationId, message) => {
+        // Live-stream the running dispatch's messages into the open history.
+        if (automationId === autoHistoryId) {
+          liveMsgs = [...liveMsgs, message];
+        }
+      },
       onRunsChanged: (automationId) => {
         if (automationId === autoHistoryId) {
+          liveMsgs = [];
           void loadRuns();
           if (selRunId) void loadRunMsgs(selRunId);
         }
       },
       onResult: (_runId, automationId) => {
         if (automationId === autoHistoryId) {
+          liveMsgs = [];
           void loadRuns();
           if (selRunId) void loadRunMsgs(selRunId);
         }
       },
       onError: (_runId, automationId) => {
         if (automationId === autoHistoryId) {
+          liveMsgs = [];
           void loadRuns();
           if (selRunId) void loadRunMsgs(selRunId);
         }
@@ -1054,6 +1070,17 @@
           </span>
         </div>
         <div class="auto-history-body">
+          {#if liveMsgs.length > 0}
+            <div class="live-panel card">
+              <div class="live-head">运行中…（实时）</div>
+              {#each liveMsgs as msg}
+                <div class="msg live">
+                  <span class="msg-kind">{msg.kind}</span>
+                  <div class="msg-content">{msg.content}</div>
+                </div>
+              {/each}
+            </div>
+          {/if}
           <div class="runs-list">
             {#if runs.length === 0}
               <div class="empty">还没有运行记录。</div>
@@ -2332,5 +2359,29 @@
     color: var(--ink);
     white-space: pre-wrap;
     word-break: break-word;
+  }
+
+  /* -- live progress panel (Task 10 review fix #4) -- */
+  .live-panel {
+    padding: var(--space-2) var(--space-3);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    border-color: #e90;
+    max-height: 40vh;
+    overflow: auto;
+  }
+  .live-head {
+    font-size: 0.75rem;
+    color: #e90;
+    font-weight: 600;
+  }
+  .msg.live {
+    border-left-color: #e90;
+  }
+  .msg-kind {
+    font-size: 0.65rem;
+    color: var(--mut);
+    text-transform: uppercase;
   }
 </style>

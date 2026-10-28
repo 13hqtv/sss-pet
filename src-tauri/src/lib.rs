@@ -953,6 +953,14 @@ pub fn run() {
                 db::migrate(&mut c).map_err(|e| {
                     format!("db::migrate failed at setup: {e}")
                 })?;
+                // Mark any `automation_runs` rows still `status='running'`
+                // from a crashed/abandoned dispatch as `failed`. Spawned
+                // dispatch tasks don't survive restart, so every running row
+                // at startup is stale + would otherwise block future
+                // scheduled fires via the overlap check.
+                if let Err(e) = automation::automation_sweep_stale_runs(&mut c) {
+                    log::error!("[automation] startup sweep failed: {e}");
+                }
                 log::info!("db opened + migrated");
                 c
             };
