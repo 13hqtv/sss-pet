@@ -32,16 +32,20 @@
     automationDelete,
     automationSetEnabled,
     automationRunNow,
+    automationRunList,
+    automationRunMessages,
     listModels,
     getExePath,
     type Agent,
     type Automation,
+    type AutomationRun,
+    type StoredMessage,
     type Skill,
     type Provider,
     type GenMessage,
     type ExecResult,
   } from "../lib/api";
-  import { subscribeAgentGenStream } from "../lib/stream";
+  import { subscribeAgentGenStream, subscribeAutomationRunStream } from "../lib/stream";
 
   // -- sub-section toggle --
   let subView: "agents" | "skills" | "automation" = $state("agents");
@@ -77,6 +81,12 @@
     intervalUnit: "minutes",
     enabled: true,
   });
+
+  // -- automation run history + detail (Task 10) --
+  let autoHistoryId: string | null = $state(null);
+  let runs: AutomationRun[] = $state([]);
+  let selRunId: string | null = $state(null);
+  let runMsgs: StoredMessage[] = $state([]);
 
   // -- agent form --
   let formOpen: boolean = $state(false);
@@ -842,9 +852,64 @@
     try {
       await automationRunNow(auto.id);
       errorMsg = null;
+      // if the history panel is open for this automation, refresh so the
+      // new "running" row appears immediately.
+      if (autoHistoryId === auto.id) await loadRuns();
     } catch (e) {
       errorMsg = `启动失败: ${e}`;
     }
+  }
+
+  // -- run history + detail (Task 10) --
+
+  function fmtRunStatus(status: string): string {
+    if (status === "running") return "运行中";
+    if (status === "completed") return "成功";
+    if (status === "failed") return "失败";
+    return status;
+  }
+
+  async function loadRuns() {
+    if (!autoHistoryId) return;
+    try {
+      runs = await automationRunList(autoHistoryId);
+      // clear detail if the selected run disappeared (automation deleted)
+      if (selRunId && !runs.some((r) => r.id === selRunId)) {
+        selRunId = null;
+        runMsgs = [];
+      }
+    } catch (e) {
+      errorMsg = `加载历史失败: ${e}`;
+    }
+  }
+
+  async function loadRunMsgs(runId: string) {
+    try {
+      runMsgs = await automationRunMessages(runId);
+    } catch (e) {
+      errorMsg = `加载对话失败: ${e}`;
+      runMsgs = [];
+    }
+  }
+
+  function selectRun(run: AutomationRun) {
+    selRunId = run.id;
+    void loadRunMsgs(run.id);
+  }
+
+  function showHistory(auto: Automation) {
+    autoHistoryId = auto.id;
+    selRunId = null;
+    runMsgs = [];
+    runs = [];
+    void loadRuns();
+  }
+
+  function hideHistory() {
+    autoHistoryId = null;
+    selRunId = null;
+    runMsgs = [];
+    runs = [];
   }
 
   $effect(() => {
@@ -863,6 +928,39 @@
     });
     return () => {
       if (deleteTimer) clearTimeout(deleteTimer);
+      if (unlisten) unlisten();
+    };
+  });
+
+  // Subscribe once to the automation run stream: refresh the history list
+  // + the selected run's detail whenever a run settles. Handlers read
+  // autoHistoryId / selRunId live at event time (signal reads inside
+  // callbacks return current value without re-triggering this effect).
+  $effect(() => {
+    let unlisten: (() => void) | null = null;
+    void subscribeAutomationRunStream({
+      onRunsChanged: (automationId) => {
+        if (automationId === autoHistoryId) {
+          void loadRuns();
+          if (selRunId) void loadRunMsgs(selRunId);
+        }
+      },
+      onResult: (_runId, automationId) => {
+        if (automationId === autoHistoryId) {
+          void loadRuns();
+          if (selRunId) void loadRunMsgs(selRunId);
+        }
+      },
+      onError: (_runId, automationId) => {
+        if (automationId === autoHistoryId) {
+          void loadRuns();
+          if (selRunId) void loadRunMsgs(selRunId);
+        }
+      },
+    }).then((u) => {
+      unlisten = u;
+    });
+    return () => {
       if (unlisten) unlisten();
     };
   });
@@ -947,6 +1045,50 @@
     {/if}
   {:else if subView === "automation"}
     <!-- Automation section -->
+    {#if autoHistoryId}
+      <div class="auto-history">
+        <div class="toolbar">
+          <button onclick={hideHistory}>← 返回</button>
+          <span class="auto-history-title">
+            {automations.find((a) => a.id === autoHistoryId)?.name ?? "自动化"} — 运行历史
+          </span>
+        </div>
+        <div class="auto-history-body">
+          <div class="runs-list">
+            {#if runs.length === 0}
+              <div class="empty">还没有运行记录。</div>
+            {:else}
+              {#each runs as run (run.id)}
+                <button
+                  class="run-row"
+                  class:sel={selRunId === run.id}
+                  onclick={() => selectRun(run)}
+                >
+                  <span class="run-status {run.status}">{fmtRunStatus(run.status)}</span>
+                  <span class="run-src">{run.source === "schedule" ? "定时" : "手动"}</span>
+                  <span class="run-time">{fmtLocal(run.started_at)}</span>
+                  <span class="run-summary">{run.result_summary || run.error || ""}</span>
+                </button>
+              {/each}
+            {/if}
+          </div>
+          {#if selRunId}
+            <div class="run-detail card">
+              {#if runMsgs.length === 0}
+                <div class="empty">（无消息）</div>
+              {:else}
+                {#each runMsgs as msg}
+                  <div class="msg {msg.role}">
+                    <span class="msg-role">{msg.role}</span>
+                    <div class="msg-content">{msg.content}</div>
+                  </div>
+                {/each}
+              {/if}
+            </div>
+          {/if}
+        </div>
+      </div>
+    {:else}
     <div class="toolbar">
       <button class="btn-primary" onclick={startNewAuto}>+ 新建自动化</button>
       {#if errorMsg}<span class="error">{errorMsg}</span>{/if}
@@ -1070,10 +1212,12 @@
               <button class="btn-primary" onclick={() => runNow(auto)}>
                 立即运行
               </button>
+              <button onclick={() => showHistory(auto)}>历史</button>
             </div>
           </div>
         {/each}
       </div>
+    {/if}
     {/if}
   {:else}
     <!-- Skills section -->
@@ -2078,5 +2222,115 @@
     background: var(--acc);
     color: #fff;
     border: none;
+  }
+
+  /* -- automation run history + detail (Task 10) -- */
+  .auto-history {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+  }
+  .auto-history-title {
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--ink);
+  }
+  .auto-history-body {
+    flex: 1;
+    overflow: auto;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+  }
+  .runs-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+  .run-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-1) var(--space-2);
+    background: var(--surface);
+    border: 1px solid var(--bd);
+    border-radius: var(--r-code);
+    cursor: pointer;
+    text-align: left;
+    font-size: 0.78rem;
+    width: 100%;
+  }
+  .run-row:hover {
+    border-color: var(--acc);
+  }
+  .run-row.sel {
+    border-color: var(--acc);
+    background: var(--bg);
+  }
+  .run-status {
+    font-size: 0.7rem;
+    padding: 0 var(--space-1);
+    border-radius: var(--r-chip);
+    color: #fff;
+    flex-shrink: 0;
+  }
+  .run-status.running {
+    background: #e90;
+  }
+  .run-status.completed {
+    background: #3a3;
+  }
+  .run-status.failed {
+    background: var(--err);
+  }
+  .run-src {
+    color: var(--mut);
+    flex-shrink: 0;
+  }
+  .run-time {
+    color: var(--ink);
+    flex-shrink: 0;
+  }
+  .run-summary {
+    color: var(--mut);
+    flex: 1;
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .run-detail {
+    padding: var(--space-2) var(--space-3);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    max-height: 60vh;
+    overflow: auto;
+  }
+  .msg {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: var(--space-1) var(--space-2);
+    border-left: 2px solid var(--bd);
+  }
+  .msg.user {
+    border-left-color: var(--acc);
+  }
+  .msg.assistant {
+    border-left-color: #3a3;
+  }
+  .msg-role {
+    font-size: 0.65rem;
+    color: var(--mut);
+    text-transform: uppercase;
+  }
+  .msg-content {
+    font-size: 0.8rem;
+    color: var(--ink);
+    white-space: pre-wrap;
+    word-break: break-word;
   }
 </style>
