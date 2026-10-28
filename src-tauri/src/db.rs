@@ -331,6 +331,20 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             UNIQUE(year, kpi_type)
+        );
+        CREATE TABLE IF NOT EXISTS automations (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            trigger_type TEXT NOT NULL,
+            trigger_config TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            last_run_at TEXT,
+            next_fire_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
         );",
     )?;
     // Task 1: idempotent column adds. SQLite's `ALTER TABLE … ADD COLUMN`
@@ -1695,6 +1709,162 @@ pub fn agent_enabled_skills(conn: &Connection, agent_id: &str) -> rusqlite::Resu
 }
 
 // ===========================================================================
+// Automations: scheduled / manually-triggered agent tasks.
+// An automation binds a saved agent profile + a prompt + a trigger
+// (daily 'HH:MM' or every-N-minutes). Each execution creates a row in
+// `automation_runs` (Task 2) + a first-class `conversations` row tagged
+// with a 🤖 title prefix; the run's full transcript is the conversation's
+// messages. See docs/superpowers/specs/2026-10-26-automation-design.md.
+// ===========================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct Automation {
+    pub id: String,
+    pub name: String,
+    pub agent_id: String,
+    pub prompt: String,
+    pub trigger_type: String,
+    pub trigger_config: String,
+    pub enabled: bool,
+    pub last_run_at: Option<String>,
+    pub next_fire_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+fn automation_from_row(row: &rusqlite::Row) -> rusqlite::Result<Automation> {
+    Ok(Automation {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        agent_id: row.get(2)?,
+        prompt: row.get(3)?,
+        trigger_type: row.get(4)?,
+        trigger_config: row.get(5)?,
+        enabled: row.get::<_, i64>(6)? != 0,
+        last_run_at: row.get(7)?,
+        next_fire_at: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+    })
+}
+
+const AUTOMATION_COLS: &str = "id, name, agent_id, prompt, trigger_type, trigger_config, \
+    enabled, last_run_at, next_fire_at, created_at, updated_at";
+
+pub fn automation_list(conn: &Connection) -> rusqlite::Result<Vec<Automation>> {
+    let mut stmt =
+        conn.prepare(&format!("SELECT {AUTOMATION_COLS} FROM automations ORDER BY created_at ASC"))?;
+    let rows = stmt.query_map([], |row| automation_from_row(row))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+pub fn automation_get(conn: &Connection, id: &str) -> rusqlite::Result<Option<Automation>> {
+    let mut stmt =
+        conn.prepare(&format!("SELECT {AUTOMATION_COLS} FROM automations WHERE id = ?1"))?;
+    let mut rows = stmt.query_map([id], |row| automation_from_row(row))?;
+    if let Some(r) = rows.next() {
+        Ok(Some(r?))
+    } else {
+        Ok(None)
+    }
+}
+
+pub fn automation_create(
+    conn: &mut Connection,
+    name: &str,
+    agent_id: &str,
+    prompt: &str,
+    trigger_type: &str,
+    trigger_config: &str,
+    enabled: bool,
+    next_fire_at: Option<String>,
+) -> rusqlite::Result<Automation> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO automations (id, name, agent_id, prompt, trigger_type, trigger_config, \
+         enabled, last_run_at, next_fire_at, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?10)",
+        rusqlite::params![id, name, agent_id, prompt, trigger_type, trigger_config,
+            enabled as i64, next_fire_at, now, now],
+    )?;
+    automation_get(conn, &id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+}
+
+pub fn automation_update(
+    conn: &mut Connection,
+    id: &str,
+    name: &str,
+    agent_id: &str,
+    prompt: &str,
+    trigger_type: &str,
+    trigger_config: &str,
+    enabled: bool,
+    next_fire_at: Option<String>,
+) -> rusqlite::Result<Automation> {
+    let now = chrono::Utc::now().to_rfc3339();
+    // next_fire_at = COALESCE(?8, next_fire_at): passing None preserves the
+    // existing value, so callers recompute + pass Some only when the
+    // trigger/enabled actually changed.
+    conn.execute(
+        "UPDATE automations SET name=?2, agent_id=?3, prompt=?4, trigger_type=?5, \
+         trigger_config=?6, enabled=?7, next_fire_at=COALESCE(?8, next_fire_at), updated_at=?9 \
+         WHERE id=?1",
+        rusqlite::params![id, name, agent_id, prompt, trigger_type, trigger_config,
+            enabled as i64, next_fire_at, now],
+    )?;
+    automation_get(conn, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+}
+
+pub fn automation_delete(conn: &Connection, id: &str) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM automations WHERE id=?1", [id])?;
+    Ok(())
+}
+
+pub fn automation_set_next_fire(
+    conn: &Connection,
+    id: &str,
+    next_fire_at: Option<String>,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE automations SET next_fire_at=?2 WHERE id=?1",
+        rusqlite::params![id, next_fire_at],
+    )?;
+    Ok(())
+}
+
+pub fn automation_set_last_run(
+    conn: &Connection,
+    id: &str,
+    last_run_at: Option<String>,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE automations SET last_run_at=?2 WHERE id=?1",
+        rusqlite::params![id, last_run_at],
+    )?;
+    Ok(())
+}
+
+pub fn automation_get_due(conn: &Connection, now_utc: &str) -> rusqlite::Result<Vec<Automation>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {AUTOMATION_COLS} FROM automations \
+         WHERE enabled=1 AND next_fire_at IS NOT NULL AND next_fire_at <= ?1 \
+         ORDER BY next_fire_at ASC"
+    ))?;
+    let rows = stmt.query_map([now_utc], |row| automation_from_row(row))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
@@ -1724,6 +1894,62 @@ mod tests {
         let conn = open().expect("open");
         migrate(&conn).expect("migrate");
         (tmp, conn)
+    }
+
+    // -- automation CRUD (Task 1) --
+
+    #[test]
+    fn automation_create_and_list() {
+        let (_t, mut conn) = fresh_db();
+        let aid = agent_create(&conn, "A", None, "claude", None, None, None, None).unwrap();
+        let a = automation_create(&mut conn, "每日总结", &aid, "总结代办", "daily", "09:00", true,
+            Some("2026-10-26T01:00:00+00:00".into())).unwrap();
+        assert_eq!(a.name, "每日总结");
+        assert_eq!(a.trigger_type, "daily");
+        assert!(a.enabled);
+        assert_eq!(a.next_fire_at.as_deref(), Some("2026-10-26T01:00:00+00:00"));
+        let list = automation_list(&conn).unwrap();
+        assert_eq!(list.len(), 1);
+    }
+
+    #[test]
+    fn automation_get_due_skips_disabled() {
+        let (_t, mut conn) = fresh_db();
+        let aid = agent_create(&conn, "A", None, "claude", None, None, None, None).unwrap();
+        let past = "2000-01-01T00:00:00+00:00".to_string();
+        automation_create(&mut conn, "off", &aid, "p", "daily", "09:00", false, Some(past.clone())).unwrap();
+        automation_create(&mut conn, "on", &aid, "p", "daily", "09:00", true, Some(past)).unwrap();
+        let due = automation_get_due(&conn, "2026-10-26T00:00:00+00:00").unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].name, "on");
+    }
+
+    #[test]
+    fn automation_cascade_on_agent_delete() {
+        let (_t, mut conn) = fresh_db();
+        let aid = agent_create(&conn, "A", None, "claude", None, None, None, None).unwrap();
+        automation_create(&mut conn, "x", &aid, "p", "interval", "60", true, None).unwrap();
+        assert_eq!(automation_list(&conn).unwrap().len(), 1);
+        agent_delete(&conn, &aid).unwrap();
+        assert!(automation_list(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn automation_update_and_set_next_fire() {
+        let (_t, mut conn) = fresh_db();
+        let aid = agent_create(&conn, "A", None, "claude", None, None, None, None).unwrap();
+        let a = automation_create(&mut conn, "n", &aid, "p", "daily", "09:00", true, None).unwrap();
+        automation_set_next_fire(&conn, &a.id, Some("2026-11-01T01:00:00+00:00".into())).unwrap();
+        let a2 = automation_update(&mut conn, &a.id, "n2", &aid, "p2", "interval", "30", true, None).unwrap();
+        assert_eq!(a2.name, "n2");
+        assert_eq!(a2.trigger_config, "30");
+        // update 传 next_fire_at=None 时 COALESCE 保留旧值（set_next_fire 设的）
+        let got = automation_get(&conn, &a.id).unwrap().unwrap();
+        assert_eq!(got.next_fire_at.as_deref(), Some("2026-11-01T01:00:00+00:00"));
+        // last_run_at 可单独设
+        automation_set_last_run(&conn, &a.id, Some("2026-10-26T01:00:00+00:00".into())).unwrap();
+        let got2 = automation_get(&conn, &a.id).unwrap().unwrap();
+        assert_eq!(got2.last_run_at.as_deref(), Some("2026-10-26T01:00:00+00:00"));
     }
 
     // -- open + migrate: tables exist --
