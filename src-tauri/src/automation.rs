@@ -10,6 +10,7 @@
 use chrono::{DateTime, Duration, Local, NaiveDate, TimeZone, Utc};
 use rusqlite::Connection;
 
+use crate::agent::conversation::StoredMessage;
 use crate::db;
 
 /// Compute the next fire moment in local time.
@@ -201,6 +202,33 @@ pub fn run_automation_tick(conn: &mut Connection, now: DateTime<Utc>) -> Vec<Aut
     dispatches
 }
 
+/// Close out a run on `chat_result`: status=completed, finished_at=now, and
+/// result_summary = the last assistant message's content (first 200 chars).
+/// No assistant message → result_summary stays NULL (COALESCE preserves it).
+/// Called by the emit accumulator inside `automation_dispatch_async`.
+pub fn finalize_run_on_result(
+    conn: &mut Connection,
+    run_id: &str,
+    accumulated: &[StoredMessage],
+) -> rusqlite::Result<()> {
+    let summary: Option<String> = accumulated
+        .iter()
+        .rev()
+        .find(|m| m.role == "assistant")
+        .map(|m| m.content.chars().take(200).collect());
+    let now = chrono::Utc::now().to_rfc3339();
+    db::automation_run_update(conn, run_id, "completed", Some(now), None, summary)?;
+    Ok(())
+}
+
+/// Close out a run on `chat_error`: status=failed, finished_at=now, error=msg.
+/// result_summary is left untouched (COALESCE preserves the prior value).
+pub fn finalize_run_on_error(conn: &mut Connection, run_id: &str, error: &str) -> rusqlite::Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    db::automation_run_update(conn, run_id, "failed", Some(now), Some(error.to_string()), None)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,5 +361,58 @@ mod tests {
         let d = run_automation_tick(&mut conn, Utc::now());
         assert!(d.is_empty());
         let _ = a;
+    }
+
+    // -- finalize helpers (Task 5) --
+    use crate::agent::conversation::StoredMessage;
+
+    fn mk_msg(role: &str, content: &str) -> StoredMessage {
+        StoredMessage {
+            role: role.into(),
+            content: content.into(),
+            kind: None,
+            tool: None,
+            created_at: None,
+        }
+    }
+
+    fn seed_running_run(conn: &mut Connection) -> String {
+        let aid = seed_agent(conn);
+        let a = db::automation_create(conn, "n", &aid, "p", "interval", "60", true, None).unwrap();
+        db::automation_run_create(conn, &a.id, None, "schedule", "running", &Utc::now().to_rfc3339())
+            .unwrap()
+            .id
+    }
+
+    #[test]
+    fn finalize_run_on_result_summary_from_last_assistant() {
+        let (_t, _g, mut conn) = fresh_db();
+        let rid = seed_running_run(&mut conn);
+        let msgs = vec![mk_msg("user", "hi"), mk_msg("assistant", "这是回复，比较长的内容…")];
+        finalize_run_on_result(&mut conn, &rid, &msgs).unwrap();
+        let got = db::automation_run_get(&conn, &rid).unwrap().unwrap();
+        assert_eq!(got.status, "completed");
+        assert!(got.finished_at.is_some());
+        assert!(got.result_summary.as_deref().unwrap().contains("这是回复"));
+    }
+
+    #[test]
+    fn finalize_run_on_result_no_assistant_keeps_none() {
+        let (_t, _g, mut conn) = fresh_db();
+        let rid = seed_running_run(&mut conn);
+        finalize_run_on_result(&mut conn, &rid, &[mk_msg("user", "x")]).unwrap();
+        let got = db::automation_run_get(&conn, &rid).unwrap().unwrap();
+        assert_eq!(got.status, "completed");
+        assert!(got.result_summary.is_none());
+    }
+
+    #[test]
+    fn finalize_run_on_error_sets_failed() {
+        let (_t, _g, mut conn) = fresh_db();
+        let rid = seed_running_run(&mut conn);
+        finalize_run_on_error(&mut conn, &rid, "agent::new failed").unwrap();
+        let got = db::automation_run_get(&conn, &rid).unwrap().unwrap();
+        assert_eq!(got.status, "failed");
+        assert_eq!(got.error.as_deref(), Some("agent::new failed"));
     }
 }
