@@ -1747,6 +1747,10 @@ pub struct Automation {
     pub next_fire_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// Computed (not a column): true iff a `status='running'` run exists for
+    /// this automation. Surfaced so the frontend can disable "立即运行"
+    /// while a dispatch is in flight.
+    pub has_running: bool,
 }
 
 fn automation_from_row(row: &rusqlite::Row) -> rusqlite::Result<Automation> {
@@ -1762,11 +1766,14 @@ fn automation_from_row(row: &rusqlite::Row) -> rusqlite::Result<Automation> {
         next_fire_at: row.get(8)?,
         created_at: row.get(9)?,
         updated_at: row.get(10)?,
+        has_running: row.get::<_, i64>(11)? != 0,
     })
 }
 
 const AUTOMATION_COLS: &str = "id, name, agent_id, prompt, trigger_type, trigger_config, \
-    enabled, last_run_at, next_fire_at, created_at, updated_at";
+    enabled, last_run_at, next_fire_at, created_at, updated_at, \
+    (SELECT EXISTS(SELECT 1 FROM automation_runs WHERE automation_id=automations.id \
+     AND status='running')) AS has_running";
 
 pub fn automation_list(conn: &Connection) -> rusqlite::Result<Vec<Automation>> {
     let mut stmt =
@@ -2134,6 +2141,22 @@ mod tests {
         assert_eq!(automation_run_list(&conn, &a.id).unwrap().len(), 1);
         automation_delete(&conn, &a.id).unwrap();
         assert!(automation_run_list(&conn, &a.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn automation_list_includes_has_running() {
+        let (_t, mut conn) = fresh_db();
+        let aid = agent_create(&conn, "A", None, "claude", None, None, None, None).unwrap();
+        let a1 = automation_create(&mut conn, "n1", &aid, "p", "interval", "60", true, None).unwrap();
+        let a2 = automation_create(&mut conn, "n2", &aid, "p", "interval", "60", true, None).unwrap();
+        // a1 has a running run; a2 does not
+        automation_run_create(&mut conn, &a1.id, None, "schedule", "running",
+            "2026-10-26T00:00:00+00:00").unwrap();
+        let list = automation_list(&conn).unwrap();
+        let a1g = list.iter().find(|a| a.id == a1.id).unwrap();
+        let a2g = list.iter().find(|a| a.id == a2.id).unwrap();
+        assert!(a1g.has_running, "a1 should have a running run");
+        assert!(!a2g.has_running, "a2 should have no running run");
     }
 
     // -- open + migrate: tables exist --

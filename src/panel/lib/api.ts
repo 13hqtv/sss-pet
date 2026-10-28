@@ -426,6 +426,9 @@ export interface Automation {
   next_fire_at: string | null;
   created_at: string;
   updated_at: string;
+  /** Computed by the backend: true iff a `status='running'` run exists.
+   *  Drives the "立即运行" button's disabled state. */
+  has_running: boolean;
 }
 
 /** Mirrors `db::AutomationRun`. `conversation_id` links to the run's

@@ -304,6 +304,16 @@ pub fn automation_dispatch_now_prep(
     let auto = db::automation_get(conn, id)
         .map_err(|e| format!("automation_get: {e}"))?
         .ok_or_else(|| format!("automation {id} not found"))?;
+    // Guard: a run already in flight → refuse. Reverses the original
+    // "manual allows concurrency" design (the user asked for the check so
+    // repeated clicks don't stack runs). The frontend also disables the
+    // button via Automation.has_running, but this is the safety net for
+    // rapid clicks before the list reloads + for direct IPC.
+    if db::automation_run_has_running(conn, id)
+        .map_err(|e| format!("has_running: {e}"))?
+    {
+        return Err(format!("自动化「{}」正在运行中，请等它完成", auto.name));
+    }
     prepare_dispatch(conn, &auto, "manual", now)
 }
 
@@ -773,23 +783,20 @@ mod tests {
     // -- dispatch_now_prep + compute_initial_next_fire (Task 6) --
 
     #[test]
-    fn dispatch_now_prep_ignores_running_overlap() {
+    fn dispatch_now_prep_blocks_when_running() {
+        // manual "run now" must NOT trigger when a run is already in flight.
+        // (User change: the original "manual allows concurrency" design was
+        // reversed — repeated clicks should not stack runs.)
         let (_t, _g, mut conn) = fresh_db();
         let aid = seed_agent(&conn);
         let a = db::automation_create(&mut conn, "n", &aid, "p", "interval", "60", true, None).unwrap();
-        // a schedule run already in flight — manual must NOT skip
         db::automation_run_create(&mut conn, &a.id, None, "schedule", "running",
             &Utc::now().to_rfc3339()).unwrap();
-        let (run, _dispatch) = automation_dispatch_now_prep(&mut conn, &a.id, Utc::now()).unwrap();
-        assert_eq!(run.source, "manual");
-        assert_eq!(run.status, "running");
+        let res = automation_dispatch_now_prep(&mut conn, &a.id, Utc::now());
+        assert!(res.is_err());
+        // still only the pre-existing run — no new manual run created
         let runs = db::automation_run_list(&conn, &a.id).unwrap();
-        assert_eq!(runs.len(), 2); // schedule(running) + manual(running)
-        assert_eq!(runs.iter().filter(|r| r.source == "manual").count(), 1);
-        // manual touches neither next_fire nor last_run
-        let a2 = db::automation_get(&conn, &a.id).unwrap().unwrap();
-        assert!(a2.next_fire_at.is_none());
-        assert!(a2.last_run_at.is_none());
+        assert_eq!(runs.len(), 1);
     }
 
     #[test]

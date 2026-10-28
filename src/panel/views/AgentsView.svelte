@@ -857,8 +857,10 @@
     try {
       await automationRunNow(auto.id);
       errorMsg = null;
-      // if the history panel is open for this automation, refresh so the
-      // new "running" row appears immediately.
+      // reload so the list reflects has_running=true (disables the button
+      // until the run settles); the stream's onRunsChanged reloads again
+      // when the run completes, flipping has_running back to false.
+      await loadAutomations();
       if (autoHistoryId === auto.id) await loadRuns();
     } catch (e) {
       errorMsg = `启动失败: ${e}`;
@@ -1145,42 +1147,54 @@
             placeholder="总结我今天的代办并给三条建议"
           ></textarea>
         </label>
-        <fieldset class="field">
-          <legend>触发方式</legend>
-          <label class="inline">
-            <input
-              type="radio"
-              name="autotrigger"
-              bind:group={autoForm.triggerType}
-              value="daily"
-            />
-            每天
-          </label>
-          {#if autoForm.triggerType === "daily"}
-            <input type="time" bind:value={autoForm.dailyTime} />
-          {/if}
-          <label class="inline">
-            <input
-              type="radio"
-              name="autotrigger"
-              bind:group={autoForm.triggerType}
-              value="interval"
-            />
-            每
-          </label>
-          {#if autoForm.triggerType === "interval"}
-            <input
-              type="number"
-              min="1"
-              bind:value={autoForm.intervalValue}
-              style="width: 5em"
-            />
-            <select bind:value={autoForm.intervalUnit}>
-              <option value="minutes">分钟</option>
-              <option value="hours">小时</option>
-            </select>
-          {/if}
-        </fieldset>
+        <div class="field">
+          <span>触发方式</span>
+          <div class="trigger-options">
+            <label
+              class="trigger-option"
+              class:sel={autoForm.triggerType === "daily"}
+            >
+              <input
+                type="radio"
+                name="autotrigger"
+                bind:group={autoForm.triggerType}
+                value="daily"
+              />
+              <span class="trigger-label">每天</span>
+              {#if autoForm.triggerType === "daily"}
+                <input type="time" bind:value={autoForm.dailyTime} />
+              {:else}
+                <span class="trigger-placeholder">选此项后设置时间</span>
+              {/if}
+            </label>
+            <label
+              class="trigger-option"
+              class:sel={autoForm.triggerType === "interval"}
+            >
+              <input
+                type="radio"
+                name="autotrigger"
+                bind:group={autoForm.triggerType}
+                value="interval"
+              />
+              <span class="trigger-label">每</span>
+              {#if autoForm.triggerType === "interval"}
+                <input
+                  type="number"
+                  min="1"
+                  bind:value={autoForm.intervalValue}
+                  class="trigger-num"
+                />
+                <select bind:value={autoForm.intervalUnit}>
+                  <option value="minutes">分钟</option>
+                  <option value="hours">小时</option>
+                </select>
+              {:else}
+                <span class="trigger-placeholder">选此项后设置间隔</span>
+              {/if}
+            </label>
+          </div>
+        </div>
         <label class="field inline">
           <input type="checkbox" bind:checked={autoForm.enabled} />
           启用定时（关闭则只在手动"立即运行"时跑）
@@ -1236,8 +1250,12 @@
               <button onclick={() => toggleAutoEnabled(auto)}>
                 {auto.enabled ? "停用" : "启用"}
               </button>
-              <button class="btn-primary" onclick={() => runNow(auto)}>
-                立即运行
+              <button
+                class="btn-primary"
+                onclick={() => runNow(auto)}
+                disabled={auto.has_running}
+              >
+                {auto.has_running ? "运行中…" : "立即运行"}
               </button>
               <button onclick={() => showHistory(auto)}>历史</button>
             </div>
@@ -2148,6 +2166,40 @@
   .field textarea {
     resize: vertical;
   }
+  .trigger-options {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+  .trigger-option {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-1) var(--space-2);
+    border: 1px solid var(--bd);
+    border-radius: var(--r-code);
+    cursor: pointer;
+    font-size: 0.8rem;
+    transition: border-color var(--t-fast), background var(--t-fast);
+  }
+  .trigger-option:hover {
+    border-color: var(--acc);
+  }
+  .trigger-option.sel {
+    border-color: var(--acc);
+    background: var(--bg);
+  }
+  .trigger-label {
+    min-width: 2.5em;
+    color: var(--ink);
+  }
+  .trigger-num {
+    width: 5em;
+  }
+  .trigger-placeholder {
+    color: var(--mut);
+    font-size: 0.72rem;
+  }
   .badge {
     font-size: 0.65rem;
     padding: 0 var(--space-1);
@@ -2170,20 +2222,6 @@
   .auto-form h3 {
     margin: 0 0 var(--space-1);
     font-size: 0.95rem;
-  }
-  .auto-form fieldset {
-    border: 1px solid var(--bd);
-    border-radius: var(--r-code);
-    padding: var(--space-2);
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: var(--space-2);
-  }
-  .auto-form fieldset legend {
-    font-size: 0.75rem;
-    color: var(--mut);
-    padding: 0 var(--space-1);
   }
   .form-actions {
     display: flex;
