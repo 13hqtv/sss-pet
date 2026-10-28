@@ -26,9 +26,16 @@
     agentGenContinue,
     agentGenHistory,
     agentGenCancel,
+    automationList,
+    automationCreate,
+    automationUpdate,
+    automationDelete,
+    automationSetEnabled,
+    automationRunNow,
     listModels,
     getExePath,
     type Agent,
+    type Automation,
     type Skill,
     type Provider,
     type GenMessage,
@@ -37,12 +44,39 @@
   import { subscribeAgentGenStream } from "../lib/stream";
 
   // -- sub-section toggle --
-  let subView: "agents" | "skills" = $state("agents");
+  let subView: "agents" | "skills" | "automation" = $state("agents");
 
   // -- core state --
   let agents: Agent[] = $state([]);
   let skills: Skill[] = $state([]);
   let errorMsg: string | null = $state(null);
+
+  // -- automation --
+  let automations: Automation[] = $state([]);
+  let selAuto: string | null = $state(null);
+  let autoEditing: boolean = $state(false);
+  let autoSaving: boolean = $state(false);
+  let autoForm = $state<{
+    id: string | null;
+    name: string;
+    agentId: string;
+    prompt: string;
+    triggerType: "daily" | "interval";
+    dailyTime: string;
+    intervalValue: number;
+    intervalUnit: "minutes" | "hours";
+    enabled: boolean;
+  }>({
+    id: null,
+    name: "",
+    agentId: "",
+    prompt: "",
+    triggerType: "daily",
+    dailyTime: "09:00",
+    intervalValue: 60,
+    intervalUnit: "minutes",
+    enabled: true,
+  });
 
   // -- agent form --
   let formOpen: boolean = $state(false);
@@ -145,9 +179,14 @@
 
   async function refresh() {
     try {
-      const [a, s] = await Promise.all([listAgents(), listSkills()]);
+      const [a, s, au] = await Promise.all([
+        listAgents(),
+        listSkills(),
+        automationList(),
+      ]);
       agents = a;
       skills = s;
+      automations = au;
       errorMsg = null;
     } catch (e) {
       errorMsg = `加载失败: ${e}`;
@@ -664,6 +703,150 @@
 
   // Initial load on mount + subscribe to the agent_gen_* event stream
   // for the lifetime of this view (the generation panel lives here).
+  // ===========================================================================
+  // Automation actions
+  // ===========================================================================
+
+  function resetAutoForm() {
+    autoForm.id = null;
+    autoForm.name = "";
+    autoForm.agentId = "";
+    autoForm.prompt = "";
+    autoForm.triggerType = "daily";
+    autoForm.dailyTime = "09:00";
+    autoForm.intervalValue = 60;
+    autoForm.intervalUnit = "minutes";
+    autoForm.enabled = true;
+  }
+
+  function startNewAuto() {
+    resetAutoForm();
+    if (agents.length > 0) autoForm.agentId = agents[0].id;
+    autoEditing = true;
+  }
+
+  function startEditAuto(auto: Automation) {
+    autoForm.id = auto.id;
+    autoForm.name = auto.name;
+    autoForm.agentId = auto.agent_id;
+    autoForm.prompt = auto.prompt;
+    autoForm.triggerType = auto.trigger_type;
+    if (auto.trigger_type === "daily") {
+      autoForm.dailyTime = auto.trigger_config || "09:00";
+    } else {
+      const mins = parseInt(auto.trigger_config, 10) || 60;
+      if (mins >= 60 && mins % 60 === 0) {
+        autoForm.intervalValue = mins / 60;
+        autoForm.intervalUnit = "hours";
+      } else {
+        autoForm.intervalValue = mins;
+        autoForm.intervalUnit = "minutes";
+      }
+    }
+    autoForm.enabled = auto.enabled;
+    selAuto = auto.id;
+    autoEditing = true;
+  }
+
+  function triggerConfigFromForm(): string {
+    if (autoForm.triggerType === "daily") return autoForm.dailyTime;
+    const mins =
+      autoForm.intervalUnit === "hours"
+        ? autoForm.intervalValue * 60
+        : autoForm.intervalValue;
+    return String(mins);
+  }
+
+  /** "每天 09:00" / "每 60 分钟" / "每 2 小时" */
+  function fmtTrigger(auto: Automation): string {
+    if (auto.trigger_type === "daily") return `每天 ${auto.trigger_config}`;
+    const mins = parseInt(auto.trigger_config, 10);
+    if (auto.trigger_type === "interval") {
+      if (mins >= 60 && mins % 60 === 0) return `每 ${mins / 60} 小时`;
+      return `每 ${mins} 分钟`;
+    }
+    return auto.trigger_config;
+  }
+
+  function fmtLocal(rfc: string | null): string {
+    if (!rfc) return "—";
+    try {
+      return new Date(rfc).toLocaleString("zh-CN", {
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+    } catch {
+      return rfc;
+    }
+  }
+
+  async function loadAutomations() {
+    try {
+      automations = await automationList();
+    } catch (e) {
+      errorMsg = `加载自动化失败: ${e}`;
+    }
+  }
+
+  async function saveAuto() {
+    if (!autoForm.name || !autoForm.agentId) return;
+    autoSaving = true;
+    try {
+      const params = {
+        name: autoForm.name,
+        agentId: autoForm.agentId,
+        prompt: autoForm.prompt,
+        triggerType: autoForm.triggerType,
+        triggerConfig: triggerConfigFromForm(),
+        enabled: autoForm.enabled,
+      };
+      if (autoForm.id) {
+        await automationUpdate({ id: autoForm.id, ...params });
+      } else {
+        await automationCreate(params);
+      }
+      autoEditing = false;
+      await loadAutomations();
+      errorMsg = null;
+    } catch (e) {
+      errorMsg = `保存失败: ${e}`;
+    } finally {
+      autoSaving = false;
+    }
+  }
+
+  async function deleteAuto(id: string) {
+    if (!confirm("删除这个自动化任务？历史记录也会一并删除。")) return;
+    try {
+      await automationDelete(id);
+      autoEditing = false;
+      await loadAutomations();
+      errorMsg = null;
+    } catch (e) {
+      errorMsg = `删除失败: ${e}`;
+    }
+  }
+
+  async function toggleAutoEnabled(auto: Automation) {
+    try {
+      await automationSetEnabled(auto.id, !auto.enabled);
+      await loadAutomations();
+    } catch (e) {
+      errorMsg = `切换失败: ${e}`;
+    }
+  }
+
+  async function runNow(auto: Automation) {
+    try {
+      await automationRunNow(auto.id);
+      errorMsg = null;
+    } catch (e) {
+      errorMsg = `启动失败: ${e}`;
+    }
+  }
+
   $effect(() => {
     void refresh();
     // Subscribe once to agent_gen_message / agent_gen_result /
@@ -693,6 +876,13 @@
     </button>
     <button class="sub-tab" class:active={subView === "skills"} onclick={() => (subView = "skills")}>
       技能
+    </button>
+    <button
+      class="sub-tab"
+      class:active={subView === "automation"}
+      onclick={() => (subView = "automation")}
+    >
+      自动化
     </button>
   </div>
 
@@ -754,6 +944,136 @@
         </div>
       {/if}
     </div>
+    {/if}
+  {:else if subView === "automation"}
+    <!-- Automation section -->
+    <div class="toolbar">
+      <button class="btn-primary" onclick={startNewAuto}>+ 新建自动化</button>
+      {#if errorMsg}<span class="error">{errorMsg}</span>{/if}
+    </div>
+
+    {#if autoEditing}
+      <div class="auto-form card">
+        <h3>{autoForm.id ? "编辑自动化" : "新建自动化"}</h3>
+        <label class="field">
+          <span>名称</span>
+          <input type="text" bind:value={autoForm.name} placeholder="每日总结代办" />
+        </label>
+        <label class="field">
+          <span>智能体</span>
+          <select bind:value={autoForm.agentId}>
+            <option value="">（选择智能体）</option>
+            {#each agents as a}
+              <option value={a.id}>{a.name}（{a.provider}）</option>
+            {/each}
+          </select>
+        </label>
+        <label class="field">
+          <span>提示词</span>
+          <textarea
+            bind:value={autoForm.prompt}
+            rows="4"
+            placeholder="总结我今天的代办并给三条建议"
+          ></textarea>
+        </label>
+        <fieldset class="field">
+          <legend>触发方式</legend>
+          <label class="inline">
+            <input
+              type="radio"
+              name="autotrigger"
+              bind:group={autoForm.triggerType}
+              value="daily"
+            />
+            每天
+          </label>
+          {#if autoForm.triggerType === "daily"}
+            <input type="time" bind:value={autoForm.dailyTime} />
+          {/if}
+          <label class="inline">
+            <input
+              type="radio"
+              name="autotrigger"
+              bind:group={autoForm.triggerType}
+              value="interval"
+            />
+            每
+          </label>
+          {#if autoForm.triggerType === "interval"}
+            <input
+              type="number"
+              min="1"
+              bind:value={autoForm.intervalValue}
+              style="width: 5em"
+            />
+            <select bind:value={autoForm.intervalUnit}>
+              <option value="minutes">分钟</option>
+              <option value="hours">小时</option>
+            </select>
+          {/if}
+        </fieldset>
+        <label class="field inline">
+          <input type="checkbox" bind:checked={autoForm.enabled} />
+          启用定时（关闭则只在手动"立即运行"时跑）
+        </label>
+        <div class="form-actions">
+          <button
+            class="btn-primary"
+            onclick={saveAuto}
+            disabled={autoSaving || !autoForm.name || !autoForm.agentId}
+          >
+            {autoSaving ? "保存中…" : "保存"}
+          </button>
+          {#if autoForm.id}
+            <button class="btn-danger" onclick={() => deleteAuto(autoForm.id!)}>
+              删除
+            </button>
+          {/if}
+          <button onclick={() => (autoEditing = false)}>取消</button>
+        </div>
+      </div>
+    {/if}
+
+    {#if automations.length === 0 && !autoEditing}
+      <div class="empty">还没有自动化任务。点「+ 新建自动化」创建。</div>
+    {:else if automations.length > 0}
+      <div class="auto-list">
+        {#each automations as auto (auto.id)}
+          <div class="auto-row card" class:sel={selAuto === auto.id}>
+            <div
+              class="auto-row-main"
+              role="button"
+              tabindex="0"
+              onclick={() => startEditAuto(auto)}
+              onkeydown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  startEditAuto(auto);
+                }
+              }}
+            >
+              <div class="auto-name">
+                {auto.name}
+                {#if !auto.enabled}<span class="badge muted">停用</span>{/if}
+              </div>
+              <div class="auto-meta">{fmtTrigger(auto)}</div>
+              <div class="auto-sub">
+                上次: {fmtLocal(auto.last_run_at)} · 下次: {fmtLocal(
+                  auto.next_fire_at,
+                )}
+              </div>
+            </div>
+            <div class="auto-row-actions">
+              <button onclick={() => toggleAutoEnabled(auto)}>
+                {auto.enabled ? "停用" : "启用"}
+              </button>
+              <button class="btn-primary" onclick={() => runNow(auto)}>
+                立即运行
+              </button>
+            </div>
+          </div>
+        {/each}
+      </div>
     {/if}
   {:else}
     <!-- Skills section -->
@@ -1610,5 +1930,153 @@
     color: var(--err);
     font-size: 0.78rem;
     border-top: 1px solid var(--err);
+  }
+
+  /* -- automation sub-tab -- */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--bd);
+    border-radius: var(--r-code);
+  }
+  .btn-danger {
+    padding: var(--space-1) var(--space-3);
+    font-size: 0.8rem;
+    cursor: pointer;
+    background: transparent;
+    color: var(--err);
+    border: 1px solid var(--err);
+    border-radius: var(--r-chip);
+    transition: background var(--t-fast), color var(--t-fast);
+  }
+  .btn-danger:hover {
+    background: var(--err);
+    color: #fff;
+  }
+  .field {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    font-size: 0.8rem;
+  }
+  .field.inline {
+    flex-direction: row;
+    align-items: center;
+    gap: var(--space-2);
+  }
+  .field input,
+  .field select,
+  .field textarea {
+    font-size: 0.8rem;
+    padding: var(--space-1) var(--space-2);
+    border: 1px solid var(--bd);
+    border-radius: var(--r-code);
+    font-family: inherit;
+    background: var(--bg);
+    color: var(--ink);
+  }
+  .field textarea {
+    resize: vertical;
+  }
+  .badge {
+    font-size: 0.65rem;
+    padding: 0 var(--space-1);
+    border-radius: var(--r-chip);
+    background: var(--acc);
+    color: #fff;
+    margin-left: var(--space-1);
+  }
+  .badge.muted {
+    background: var(--mut);
+  }
+
+  .auto-form {
+    padding: var(--space-3);
+    margin: var(--space-2) var(--space-3);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+  .auto-form h3 {
+    margin: 0 0 var(--space-1);
+    font-size: 0.95rem;
+  }
+  .auto-form fieldset {
+    border: 1px solid var(--bd);
+    border-radius: var(--r-code);
+    padding: var(--space-2);
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+  }
+  .auto-form fieldset legend {
+    font-size: 0.75rem;
+    color: var(--mut);
+    padding: 0 var(--space-1);
+  }
+  .form-actions {
+    display: flex;
+    gap: var(--space-2);
+    align-items: center;
+  }
+
+  .auto-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+  }
+  .auto-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+  }
+  .auto-row.sel {
+    border-color: var(--acc);
+  }
+  .auto-row-main {
+    flex: 1;
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+  .auto-name {
+    font-size: 0.85rem;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+  }
+  .auto-meta {
+    font-size: 0.75rem;
+    color: var(--acc);
+  }
+  .auto-sub {
+    font-size: 0.7rem;
+    color: var(--mut);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .auto-row-actions {
+    display: flex;
+    gap: var(--space-1);
+    flex-shrink: 0;
+  }
+  .auto-row-actions button {
+    padding: var(--space-1) var(--space-2);
+    font-size: 0.75rem;
+    cursor: pointer;
+    background: transparent;
+    color: var(--ink);
+    border: 1px solid var(--bd);
+    border-radius: var(--r-chip);
+  }
+  .auto-row-actions .btn-primary {
+    background: var(--acc);
+    color: #fff;
+    border: none;
   }
 </style>
