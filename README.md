@@ -31,7 +31,7 @@ Windows 11 桌面宠物 + AI 智能体助手。基于 Tauri v2 + Rust + Svelte 5
 - **智能体配置**：保存命名的智能体配置 = Provider + Model + 系统提示词 + 技能 + MCP 配置 + 工作目录
 - **手动创建**：填写名称、描述、Provider、Model（支持探测）、系统提示词、MCP 配置 JSON、工作目录、技能分配
 - **AI 生成（对话式）**：选择 Provider + Model → 描述你想要的智能体 → AI 在对话中流式返回含 `<agent_draft>` JSON 的智能体定义。提供「确认 / 继续修改 / 取消」按钮——确认才调用 `agent_create` 真正创建；继续修改可在对话中追加意见，AI 修订草稿（复用后端原生 session 续接）；取消则丢弃不创建。生成过程在内存中（不污染对话历史）
-- **技能管理**：创建/编辑/删除技能（SKILL.md 正文），分配给智能体（可启用/禁用）
+- **技能管理**：创建/编辑/删除技能（SKILL.md 正文 + 关联脚本文件）。技能可挂多个文本脚本（多层目录，路径如 `scripts/analyze.py`）；运行时物化进对话 cwd 的 provider 原生 skills 目录（claude `.claude/skills/<slug>/`、opencode `.opencode/skills/<slug>/`），CLI 自动发现 + 按各自 SKILL.md 说明调用脚本；codex 物化进临时目录 + 路径注入提示词。跑完清理本轮写的目录（不碰用户已装技能）。二进制文件拒绝、上限 1MiB/文件·8MiB/技能·256 个
 - **MCP 配置**：每个智能体可配置 MCP 服务器（JSON 格式），支持「+ 代办 MCP」一键添加代办接口
 - **对话集成**：对话创建时选智能体 → provider/model/cwd 从智能体拷贝（不可变）；system_prompt/skills/mcp 每次对话实时读取（可更新）
 - **系统提示词接线**：
@@ -201,6 +201,7 @@ sss-pet/
 │   │   ├── reminders.rs           # 提醒调度器 (一次性/周期性/推迟/弹窗)
 │   │   ├── logger.rs              # 文件日志 (按天轮转)
 │   │   ├── agent_gen.rs           # AI 智能体生成 (对话式: agent_gen_start/continue/history/cancel)
+│   │   ├── skill.rs               # 技能运行时 (校验/二进制/上限/slug/frontmatter/物化/清理)
 │   │   └── agent/                 # AI 后端
 │   │       ├── mod.rs             # Backend trait + ExecOptions + 工厂
 │   │       ├── claude.rs          # Claude CLI 后端
@@ -281,6 +282,7 @@ AI 对话界面，支持 Claude / Codex / OpenCode 三个后端。
 
 - **手动创建**：填写名称、Provider、Model、系统提示词、MCP 配置、技能分配
 - **AI 生成（对话式）**：点「✨ AI 生成」→ 选 Provider + Model → 描述需求 → AI 在对话中流式返回含 `<agent_draft>` 的智能体定义。「确认」直接创建智能体；「继续修改」追加意见让 AI 修订草稿；「取消」放弃
+- **技能脚本**：技能编辑表单的「关联脚本」区可新增/编辑/删除文本脚本（路径如 `scripts/analyze.py`，支持多层目录）。保存时整组写入。对话跑起来时脚本随技能物化进 `<cwd>/.claude/skills/<slug>/`（claude）等目录，智能体 CLI 自动发现 + 调用
 - 配置完成后，新建对话时可在下拉中选择智能体
 - 支持「+ 代办 MCP」按钮一键注入 MCP 服务器配置
 
