@@ -64,6 +64,10 @@ pub mod agent_gen;
 /// slug, frontmatter, provider skills-dir mapping, materialize/cleanup).
 /// Pure functions where possible — fully unit-testable without a backend.
 pub mod skill;
+/// Automation: scheduled + manually-triggered agent task execution.
+/// compute_next_fire (pure), run_automation_tick (sync DB prep),
+/// automation_dispatch_async (reuses run_chat_turn), Tauri commands.
+pub mod automation;
 
 /// Toggle click-through on the pet overlay window from the frontend.
 ///
