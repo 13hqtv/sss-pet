@@ -17,6 +17,8 @@
     createSkill,
     updateSkill,
     deleteSkill,
+    skillFileList,
+    skillFileReplaceAll,
     listAgentSkills,
     addAgentSkill,
     removeAgentSkill,
@@ -85,6 +87,13 @@
   let skillFormName: string = $state("");
   let skillFormDescription: string = $state("");
   let skillFormContent: string = $state("");
+  // supporting script files for the skill being edited (working set,
+  // saved as a full-replace on saveSkillForm). formFileEditingIdx: null
+  // = not editing; >=0 = editing that index; -1 = adding a new file.
+  let formSkillFiles: Array<{ path: string; content: string }> = $state([]);
+  let formFileEditingIdx: number | null = $state(null);
+  let formFilePath: string = $state("");
+  let formFileContent: string = $state("");
 
   // -- delete confirmation --
   let pendingDeleteId: string | null = $state(null);
@@ -490,19 +499,34 @@
     skillFormName = "";
     skillFormDescription = "";
     skillFormContent = "";
+    formSkillFiles = [];
+    formFileEditingIdx = null;
+    formFilePath = "";
+    formFileContent = "";
   }
 
-  function startEditSkill(skill: Skill) {
+  async function startEditSkill(skill: Skill) {
     skillFormOpen = true;
     skillEditingId = skill.id;
     skillFormName = skill.name;
     skillFormDescription = skill.description ?? "";
     skillFormContent = skill.content ?? "";
+    formSkillFiles = [];
+    formFileEditingIdx = null;
+    formFilePath = "";
+    formFileContent = "";
+    try {
+      const files = await skillFileList(skill.id);
+      formSkillFiles = files.map((f) => ({ path: f.path, content: f.content }));
+    } catch (e) {
+      console.warn("[skills] load files failed:", e);
+    }
   }
 
   function cancelSkillForm() {
     skillFormOpen = false;
     skillEditingId = null;
+    formFileEditingIdx = null;
   }
 
   async function saveSkillForm() {
@@ -512,6 +536,7 @@
       return;
     }
     try {
+      let skillId = skillEditingId;
       if (skillEditingId !== null) {
         await updateSkill({
           id: skillEditingId,
@@ -520,11 +545,16 @@
           content: skillFormContent.trim() || null,
         });
       } else {
-        await createSkill({
+        skillId = await createSkill({
           name,
           description: skillFormDescription.trim() || null,
           content: skillFormContent.trim() || null,
         });
+      }
+      // Full-replace the supporting files (SKILL.md paths are skipped
+      // server-side — the body lives in skills.content).
+      if (skillId !== null) {
+        await skillFileReplaceAll(skillId, formSkillFiles);
       }
       skillFormOpen = false;
       skillEditingId = null;
@@ -532,6 +562,72 @@
       await refresh();
     } catch (e) {
       errorMsg = `保存技能失败: ${e}`;
+    }
+  }
+
+  // -- skill file manager (inline add/edit/delete) --
+
+  function startAddSkillFile() {
+    formFileEditingIdx = -1;
+    formFilePath = "";
+    formFileContent = "";
+  }
+
+  function startEditSkillFile(idx: number) {
+    formFileEditingIdx = idx;
+    formFilePath = formSkillFiles[idx].path;
+    formFileContent = formSkillFiles[idx].content;
+  }
+
+  function cancelSkillFileEdit() {
+    formFileEditingIdx = null;
+    formFilePath = "";
+    formFileContent = "";
+  }
+
+  function saveSkillFile() {
+    const path = formFilePath.trim();
+    if (!path) {
+      errorMsg = "文件路径不能为空";
+      return;
+    }
+    if (path === "SKILL.md" || path.toLowerCase() === "skill.md") {
+      errorMsg = "SKILL.md 是保留路径（正文在上方的 SKILL.md 编辑区）";
+      return;
+    }
+    const entry = { path, content: formFileContent };
+    if (formFileEditingIdx === -1) {
+      // new — reject duplicate path
+      if (formSkillFiles.some((f) => f.path === path)) {
+        errorMsg = `已存在同路径文件: ${path}`;
+        return;
+      }
+      formSkillFiles = [...formSkillFiles, entry];
+    } else if (formFileEditingIdx !== null) {
+      // editing existing — allow path change if no OTHER file collides
+      const dup = formSkillFiles.findIndex(
+        (f, i) => i !== formFileEditingIdx && f.path === path,
+      );
+      if (dup !== -1) {
+        errorMsg = `已存在同路径文件: ${path}`;
+        return;
+      }
+      const next = [...formSkillFiles];
+      next[formFileEditingIdx] = entry;
+      formSkillFiles = next;
+    }
+    formFileEditingIdx = null;
+    formFilePath = "";
+    formFileContent = "";
+    errorMsg = null;
+  }
+
+  function deleteSkillFile(idx: number) {
+    formSkillFiles = formSkillFiles.filter((_, i) => i !== idx);
+    if (formFileEditingIdx === idx) {
+      formFileEditingIdx = null;
+      formFilePath = "";
+      formFileContent = "";
     }
   }
 
@@ -684,6 +780,54 @@
           class="form-content"
           rows="8"
         ></textarea>
+
+        <!-- Supporting script files: a flat path-keyed list (subdirs via
+             path strings, e.g. scripts/analyze.py). Saved as a full-replace
+             on 保存. SKILL.md is reserved (body is the textarea above). -->
+        <div class="skill-files">
+          <div class="skill-files-head">
+            <span class="skill-files-label">关联脚本</span>
+            {#if formFileEditingIdx === null}
+              <button class="act" onclick={startAddSkillFile}>+ 新增脚本</button>
+            {/if}
+          </div>
+
+          {#if formFileEditingIdx !== null}
+            <!-- add / edit one file -->
+            <div class="skill-file-edit">
+              <input
+                type="text"
+                bind:value={formFilePath}
+                placeholder="相对路径，如 scripts/analyze.py（不可为 SKILL.md）"
+                class="form-desc"
+              />
+              <textarea
+                bind:value={formFileContent}
+                placeholder="脚本内容"
+                class="form-content"
+                rows="6"
+              ></textarea>
+              <div class="form-actions">
+                <button class="act cancel" onclick={cancelSkillFileEdit}>取消</button>
+                <button class="act save" onclick={saveSkillFile} disabled={!formFilePath.trim()}>保存脚本</button>
+              </div>
+            </div>
+          {:else}
+            <!-- file list -->
+            {#if formSkillFiles.length === 0}
+              <div class="skill-files-empty">暂无脚本（技能可仅含 SKILL.md 正文）</div>
+            {:else}
+              {#each formSkillFiles as f, i (i)}
+                <div class="skill-file-row">
+                  <span class="skill-file-path">{f.path}</span>
+                  <button class="act" onclick={() => startEditSkillFile(i)}>编辑</button>
+                  <button class="act del" onclick={() => deleteSkillFile(i)}>删除</button>
+                </div>
+              {/each}
+            {/if}
+          {/if}
+        </div>
+
         <div class="form-actions">
           <button class="act cancel" onclick={cancelSkillForm}>取消</button>
           <button class="act save" onclick={saveSkillForm} disabled={!skillFormName.trim()}>保存</button>
@@ -1307,6 +1451,68 @@
   }
   .form-prompt::placeholder, .form-mcp::placeholder, .form-content::placeholder {
     color: var(--mut);
+  }
+
+  /* -- skill supporting files (script manager) -- */
+  .skill-files {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    padding: var(--space-2);
+    border: 1px dashed var(--bd);
+    border-radius: var(--r-code);
+    background: var(--bg);
+  }
+
+  .skill-files-head {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
+  .skill-files-label {
+    flex: 1;
+    font-size: 0.75rem;
+    color: var(--mut);
+    font-weight: 500;
+  }
+
+  .skill-files-empty {
+    font-size: 0.72rem;
+    color: var(--mut);
+    font-style: italic;
+    padding: var(--space-1) 0;
+  }
+
+  .skill-file-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-1) var(--space-2);
+    background: var(--surface);
+    border: 1px solid var(--bd);
+    border-radius: var(--r-code);
+  }
+
+  .skill-file-path {
+    flex: 1;
+    min-width: 0;
+    font-size: 0.75rem;
+    font-family: var(--mono);
+    color: var(--ink);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .skill-file-edit {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-2);
+    background: var(--surface);
+    border: 1px solid var(--acc);
+    border-radius: var(--r-code);
   }
 
   .mcp-row {

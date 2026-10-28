@@ -187,7 +187,25 @@ export interface Agent {
   updated_at: string;
 }
 
-/** Mirrors `db::Skill`. A reusable skill (SKILL.md body + metadata). */
+/** Mirrors `db::SkillFile`. A supporting script file belonging to a skill.
+ *  `path` is a slash-delimited relative path that may include subdirs
+ *  (e.g. `scripts/analyze.py`); directories are inferred from paths. Text
+ *  only (binary rejected by the backend). Fields are snake_case at the IPC
+ *  boundary (serde default — matches the `Skill` interface). */
+export interface SkillFile {
+  id: string;
+  skill_id: string;
+  path: string;
+  content: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Mirrors `db::Skill`. A reusable skill (SKILL.md body + metadata +
+ *  supporting script files). Skills are assigned to agents via the
+ *  `agent_skills` junction; at chat-turn time each enabled skill is
+ *  materialized to `<cwd>/.<provider>/skills/<slug>/` so the agent CLI
+ *  discovers it natively. */
 export interface Skill {
   id: string;
   name: string;
@@ -287,6 +305,30 @@ export async function updateSkill(params: {
 
 export async function deleteSkill(id: string): Promise<void> {
   await invoke("skill_delete", { id });
+}
+
+// -- Skill files (supporting scripts) --
+
+/** `skill_file_list` — list a skill's supporting files (path + content),
+ *  ordered by path ASC. Called by the skill-form UI on edit. */
+export async function skillFileList(skillId: string): Promise<SkillFile[]> {
+  return invoke<SkillFile[]>("skill_file_list", { skillId });
+}
+
+/** `skill_file_replace_all` — replace the full file set of a skill
+ *  (full-replace-on-save: delete all existing rows then insert the new
+ *  set). The backend takes `Vec<(String, String)>` (tuples serialize as
+ *  JSON arrays), so the wrapper converts `{path, content}` objects to
+ *  `[path, content]` pairs. SKILL.md paths are silently skipped (the body
+ *  lives in `skills.content`); binary/oversize files are rejected. */
+export async function skillFileReplaceAll(
+  skillId: string,
+  files: Array<{ path: string; content: string }>,
+): Promise<void> {
+  await invoke("skill_file_replace_all", {
+    skillId,
+    files: files.map((f) => [f.path, f.content]),
+  });
 }
 
 // -- Agent-Skill assignment --
