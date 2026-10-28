@@ -9,7 +9,8 @@
 
 #![allow(dead_code)] // consumed by Task 3 (materialize) + Task 4 (chat) + db.rs
 
-use std::path::Path;
+use crate::db::{Skill, SkillFile};
+use std::path::{Path, PathBuf};
 
 /// Single-file size cap: 1 MiB (mirrors multica's `maxImportFileSize`).
 pub const MAX_FILE_BYTES: usize = 1024 * 1024;
@@ -170,6 +171,190 @@ pub fn provider_skills_dir(provider: &str) -> Option<&'static str> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Materialize + cleanup (Task 3) — write enabled skills to disk per chat
+// turn so the agent CLI discovers them natively. Mirrors multica's
+// `writeSkillFiles` (execenv/context.go:940).
+// ---------------------------------------------------------------------------
+
+/// The result of materializing one batch of skills for a chat turn.
+/// `created_dirs` records every skill directory written this turn (for
+/// `cleanup_skill_dirs` after the turn). `prompt_section` is the skills
+/// text to append to the agent's system prompt — a name-only index for
+/// providers that discover skills natively (claude/opencode), or the
+/// full skill bodies + script-dir paths for the codex fallback.
+#[derive(Debug, Clone)]
+pub struct MaterializedSkills {
+    pub created_dirs: Vec<PathBuf>,
+    pub prompt_section: String,
+}
+
+/// Materialize each enabled skill as a real directory of files so the
+/// agent CLI can discover + use them:
+/// - claude/opencode: write under `<cwd>/.<provider>/skills/<slug>/`
+///   (the CLI's native skills location); the prompt gets a name-only
+///   index (the CLI reads each SKILL.md itself).
+/// - codex (no native skills dir): write to a per-turn temp dir + inject
+///   the skill body + the script-dir path into the prompt so the agent
+///   can run the scripts.
+///
+/// Collisions — with a user-installed skill dir on disk OR within the
+/// batch (two skills sanitizing to the same slug) — resolve to a `-sss`
+/// suffix, so user-installed skills are never clobbered + cleanup only
+/// touches dirs this turn created. Mirrors multica's
+/// `allocateCollisionFreeSkillDir` (execenv/sidecar_manifest.go:175).
+pub fn materialize_skills(
+    cwd: &Path,
+    provider: &str,
+    skills: &[(Skill, Vec<SkillFile>)],
+) -> Result<MaterializedSkills, String> {
+    let provider_dir = provider_skills_dir(provider);
+    let mut created_dirs: Vec<PathBuf> = Vec::new();
+    let mut used_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut name_index = String::new();
+    let mut codex_sections = String::new();
+
+    for (skill, files) in skills {
+        let base_slug = sanitize_skill_name(&skill.name);
+        let slug = resolve_collision_free_slug(cwd, provider_dir, &base_slug, &used_slugs);
+        used_slugs.insert(slug.clone());
+
+        let (root, is_native) = match provider_dir {
+            Some(rel) => (cwd.join(rel).join(&slug), true),
+            None => {
+                // codex fallback: temp dir, not under cwd (don't pollute the project)
+                let root = std::env::temp_dir()
+                    .join(format!("sss-pet-skill-{}-{}", uuid::Uuid::new_v4(), slug));
+                (root, false)
+            }
+        };
+
+        write_skill_dir(&root, skill, &slug, files)?;
+        created_dirs.push(root.clone());
+
+        if is_native {
+            // name-only index — the CLI discovers + reads SKILL.md itself
+            name_index.push_str(&format!("- **{}**\n", skill.name));
+        } else {
+            // codex fallback: inject the body + the script dir path
+            let mut sec = format!("## Skill: {}\n", skill.name);
+            if let Some(desc) = &skill.description {
+                if !desc.trim().is_empty() {
+                    sec.push_str(desc);
+                    sec.push('\n');
+                }
+            }
+            if let Some(content) = &skill.content {
+                if !content.trim().is_empty() {
+                    sec.push_str(content);
+                }
+            }
+            sec.push_str(&format!("\n\n脚本目录: {}\n", root.display()));
+            codex_sections.push_str(&sec);
+        }
+    }
+
+    let prompt_section = if provider_dir.is_some() {
+        if skills.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "## Skills\n你已安装以下技能（CLI 自动发现，按各自 SKILL.md 说明使用）：\n{}",
+                name_index
+            )
+        }
+    } else {
+        codex_sections
+    };
+
+    Ok(MaterializedSkills {
+        created_dirs,
+        prompt_section,
+    })
+}
+
+/// Pick a slug that doesn't collide with the batch (`used_slugs`) or an
+/// existing non-empty dir on disk (a user-installed skill). First
+/// collision → `{slug}-sss`; further → `{slug}-sss-2`, `-3`, ...
+fn resolve_collision_free_slug(
+    cwd: &Path,
+    provider_dir: Option<&str>,
+    base: &str,
+    used_slugs: &std::collections::HashSet<String>,
+) -> String {
+    let dir_exists_nonempty = |slug: &str| -> bool {
+        let rel = match provider_dir {
+            Some(r) => r,
+            None => return false, // temp dir — never pre-exists
+        };
+        let root = cwd.join(rel).join(slug);
+        if !root.exists() {
+            return false;
+        }
+        std::fs::read_dir(&root)
+            .map(|mut it| it.next().is_some())
+            .unwrap_or(false)
+    };
+    let mut candidate = base.to_string();
+    if !used_slugs.contains(&candidate) && !dir_exists_nonempty(&candidate) {
+        return candidate;
+    }
+    candidate = format!("{base}-sss");
+    let mut n = 2;
+    while used_slugs.contains(&candidate) || dir_exists_nonempty(&candidate) {
+        candidate = format!("{base}-sss-{n}");
+        n += 1;
+    }
+    candidate
+}
+
+/// Write one skill as a directory: `SKILL.md` (from `skill.content` with
+/// synthesized frontmatter) + each supporting file at its nested relative
+/// path (subdirs created as needed). Mirrors multica's `writeSkillFiles`
+/// (execenv/context.go:940).
+fn write_skill_dir(
+    root: &Path,
+    skill: &Skill,
+    slug: &str,
+    files: &[SkillFile],
+) -> Result<(), String> {
+    std::fs::create_dir_all(root)
+        .map_err(|e| format!("create skill dir {}: {e}", root.display()))?;
+    let body = ensure_frontmatter(
+        skill.content.as_deref().unwrap_or(""),
+        slug,
+        skill.description.as_deref(),
+    );
+    std::fs::write(root.join("SKILL.md"), body)
+        .map_err(|e| format!("write SKILL.md {}: {e}", root.display()))?;
+    for f in files {
+        // Defensive: validate before writing (db layer already validated
+        // on replace_all, but this guards direct callers).
+        validate_file_path(&f.path).map_err(|e| format!("skill_file path {:?}: {e}", f.path))?;
+        if is_reserved_skill_md_path(&f.path) {
+            continue; // shouldn't happen (db skips), but be safe
+        }
+        let target = root.join(&f.path);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create subdir {}: {e}", parent.display()))?;
+        }
+        std::fs::write(&target, &f.content)
+            .map_err(|e| format!("write {}: {e}", target.display()))?;
+    }
+    Ok(())
+}
+
+/// Best-effort remove every directory created by `materialize_skills`.
+/// Errors are ignored — a dir left by a crash is harmless (the user can
+/// delete it; it's a valid skill dir). Called from the chat-turn drain
+/// after the turn completes.
+pub fn cleanup_skill_dirs(dirs: &[PathBuf]) {
+    for d in dirs {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,7 +432,130 @@ mod tests {
         assert!(is_reserved_skill_md_path("SKILL.md"));
         assert!(is_reserved_skill_md_path("skill.md"));
         assert!(is_reserved_skill_md_path("./SKILL.md"));
-        assert!(!is_reserved_skill_md_path("scripts/SKILL.md")); // not the final component
+        assert!(!is_reserved_skill_md_path("scripts/SKILL.md")); // nested — not reserved
         assert!(!is_reserved_skill_md_path("a.py"));
+    }
+
+    // -- materialize + cleanup (Task 3) --
+
+    fn now_ts() -> String {
+        chrono::Utc::now().to_rfc3339()
+    }
+
+    fn mk_skill(id: &str, name: &str, desc: Option<&str>, content: Option<&str>) -> Skill {
+        Skill {
+            id: id.into(),
+            name: name.into(),
+            description: desc.map(|s| s.into()),
+            content: content.map(|s| s.into()),
+            created_at: now_ts(),
+            updated_at: now_ts(),
+        }
+    }
+
+    fn mk_file(skill_id: &str, path: &str, content: &str) -> SkillFile {
+        SkillFile {
+            id: format!("f-{path}"),
+            skill_id: skill_id.into(),
+            path: path.into(),
+            content: content.into(),
+            created_at: now_ts(),
+            updated_at: now_ts(),
+        }
+    }
+
+    #[test]
+    fn materialize_claude_writes_skill_md_and_nested_files_under_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill = mk_skill("s1", "Code Review", Some("d"), Some("# review code"));
+        let files = vec![mk_file("s1", "scripts/a.py", "print(1)")];
+        let m = materialize_skills(tmp.path(), "claude", &[(skill, files)]).unwrap();
+        let dir = tmp.path().join(".claude/skills/code-review");
+        assert!(dir.join("SKILL.md").exists(), "SKILL.md not written");
+        let body = std::fs::read_to_string(dir.join("SKILL.md")).unwrap();
+        assert!(body.starts_with("---\nname: code-review"), "frontmatter missing: {body}");
+        assert!(body.contains("# review code"), "content missing: {body}");
+        assert!(dir.join("scripts/a.py").exists(), "nested file not written");
+        // prompt is a name-only index — no content
+        assert!(m.prompt_section.contains("Code Review"));
+        assert!(!m.prompt_section.contains("# review code"));
+        assert_eq!(m.created_dirs, vec![dir.clone()]);
+    }
+
+    #[test]
+    fn materialize_does_not_clobber_user_installed_skill_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let user_dir = tmp.path().join(".claude/skills/code-review");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        std::fs::write(user_dir.join("SKILL.md"), "USER OWNED").unwrap();
+        let skill = mk_skill("s1", "Code Review", None, Some("mine"));
+        let m = materialize_skills(tmp.path(), "claude", &[(skill, vec![])]).unwrap();
+        // original untouched
+        assert_eq!(
+            std::fs::read_to_string(user_dir.join("SKILL.md")).unwrap(),
+            "USER OWNED"
+        );
+        // written to the -sss suffix dir
+        let sss_dir = tmp.path().join(".claude/skills/code-review-sss");
+        assert!(sss_dir.join("SKILL.md").exists(), "sss dir not written");
+        assert_eq!(m.created_dirs, vec![sss_dir]);
+    }
+
+    #[test]
+    fn materialize_codex_fallback_uses_temp_dir_and_injects_content_and_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill = mk_skill("s1", "Code Review", Some("d"), Some("# review"));
+        let files = vec![mk_file("s1", "scripts/a.py", "print(1)")];
+        let m = materialize_skills(tmp.path(), "codex", &[(skill, files)]).unwrap();
+        // codex doesn't write a .codex dir in cwd
+        assert!(!tmp.path().join(".codex").exists());
+        // written to a temp dir (not under the cwd tempdir)
+        assert_eq!(m.created_dirs.len(), 1);
+        let dir = &m.created_dirs[0];
+        assert!(dir.join("SKILL.md").exists());
+        assert!(dir.join("scripts/a.py").exists());
+        assert!(
+            !dir.starts_with(tmp.path()),
+            "codex fallback dir should be outside cwd"
+        );
+        // prompt carries the body + the script dir path
+        assert!(m.prompt_section.contains("# review"), "prompt missing body: {}", m.prompt_section);
+        assert!(
+            m.prompt_section.contains(dir.to_string_lossy().as_ref()),
+            "prompt missing script dir path: {}",
+            m.prompt_section
+        );
+    }
+
+    #[test]
+    fn cleanup_skill_dirs_removes_created_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("x");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("f"), "y").unwrap();
+        cleanup_skill_dirs(&[d.clone()]);
+        assert!(!d.exists());
+    }
+
+    #[test]
+    fn materialize_slug_collision_in_batch_appends_suffix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = materialize_skills(
+            tmp.path(),
+            "claude",
+            &[
+                (mk_skill("s1", "Code Review", None, Some("x")), vec![]),
+                (mk_skill("s2", "Code Review", None, Some("y")), vec![]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(m.created_dirs.len(), 2);
+        let names: Vec<String> = m
+            .created_dirs
+            .iter()
+            .map(|d| d.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(names.contains(&"code-review".to_string()));
+        assert!(names.contains(&"code-review-sss".to_string()));
     }
 }
