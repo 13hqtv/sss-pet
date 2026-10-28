@@ -215,7 +215,18 @@ pub fn materialize_skills(
     let mut codex_sections = String::new();
 
     for (skill, files) in skills {
-        let base_slug = sanitize_skill_name(&skill.name);
+        // Guard against an empty / punctuation-only name sanitizing to ""
+        // — `cwd.join(".claude/skills").join("")` IS the skills dir itself,
+        // so a "" slug would write SKILL.md at the skills-dir level (the
+        // CLI wouldn't discover it) + created_dirs would hold the parent
+        // (cleanup would remove_dir_all the whole skills tree). Substitute
+        // a fallback slug so the skill lands in a real subdir. The UI
+        // rejects empty names, so this is defense-in-depth for direct
+        // callers / future code paths.
+        let mut base_slug = sanitize_skill_name(&skill.name);
+        if base_slug.is_empty() {
+            base_slug = "skill".into();
+        }
         let slug = resolve_collision_free_slug(cwd, provider_dir, &base_slug, &used_slugs);
         used_slugs.insert(slug.clone());
 
@@ -229,7 +240,19 @@ pub fn materialize_skills(
             }
         };
 
-        write_skill_dir(&root, skill, &slug, files)?;
+        // On a mid-batch write failure, clean up the dirs already written
+        // this turn + the failing skill's partial dir, so a routine error
+        // (disk full / permission / bad path) doesn't leave orphans in the
+        // user's project. (Crash-orphans are still possible + harmless —
+        // the doc-comment on cleanup_skill_dirs covers that.)
+        if let Err(e) = write_skill_dir(&root, skill, &slug, files) {
+            cleanup_skill_dirs(&created_dirs);
+            let _ = std::fs::remove_dir_all(&root);
+            return Err(format!(
+                "write_skill_dir for skill '{}': {e}",
+                skill.name
+            ));
+        }
         created_dirs.push(root.clone());
 
         if is_native {
@@ -557,5 +580,60 @@ mod tests {
             .collect();
         assert!(names.contains(&"code-review".to_string()));
         assert!(names.contains(&"code-review-sss".to_string()));
+    }
+
+    // -- review-fix pass: Important #2 (empty-slug clobber) + #3 (partial
+    //    failure orphans). These start RED + go GREEN when the fixes land. --
+
+    #[test]
+    fn materialize_empty_name_skill_uses_fallback_slug_not_skills_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        // An empty / punctuation-only name sanitizes to "" — without the
+        // guard, `cwd.join(".claude/skills").join("")` IS the skills dir
+        // itself, so write_skill_dir writes SKILL.md at the skills-dir
+        // level + created_dirs gets the parent → cleanup would
+        // remove_dir_all the whole .claude/skills tree. The guard must
+        // substitute a fallback slug so the skill lands in a subdir.
+        let skill = mk_skill("s1", "", None, Some("body"));
+        let m = materialize_skills(tmp.path(), "claude", &[(skill, vec![])]).unwrap();
+        assert_eq!(m.created_dirs.len(), 1);
+        let dir = &m.created_dirs[0];
+        let skills_dir = tmp.path().join(".claude/skills");
+        assert_ne!(
+            dir, &skills_dir,
+            "empty-name skill must NOT materialize into the skills dir itself"
+        );
+        assert!(
+            dir.starts_with(&skills_dir),
+            "fallback slug dir should still be under .claude/skills"
+        );
+        assert!(dir.join("SKILL.md").exists());
+    }
+
+    #[test]
+    fn materialize_partial_failure_cleans_up_already_written_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        // First skill valid; second skill has a file with a traversal
+        // path (`..`) — validate_file_path rejects it inside
+        // write_skill_dir, so the second write fails mid-batch. The
+        // first skill's dir must be cleaned up (no orphans in the user's
+        // project), + the failing skill's partial dir too.
+        let good = mk_skill("s1", "Good Skill", None, Some("body"));
+        let bad = mk_skill("s2", "Bad Skill", None, Some("body"));
+        let bad_files = vec![mk_file("s2", "../evil.py", "x")]; // traversal → Err
+        let result = materialize_skills(
+            tmp.path(),
+            "claude",
+            &[(good, vec![]), (bad, bad_files)],
+        );
+        assert!(result.is_err(), "expected materialize to fail on the bad file");
+        assert!(
+            !tmp.path().join(".claude/skills/good-skill").exists(),
+            "orphan dir left after partial failure (good skill not cleaned up)"
+        );
+        assert!(
+            !tmp.path().join(".claude/skills/bad-skill").exists(),
+            "failing skill's partial dir not cleaned up"
+        );
     }
 }

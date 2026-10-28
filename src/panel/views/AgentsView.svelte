@@ -506,21 +506,27 @@
   }
 
   async function startEditSkill(skill: Skill) {
+    // Load the skill's files BEFORE opening the form — if the load fails
+    // (transient IPC/db error), abort + show an error rather than opening
+    // with an empty file list. Otherwise a subsequent 保存 would call
+    // skillFileReplaceAll([]) and silently wipe every existing script.
+    let loadedFiles: Array<{ path: string; content: string }> = [];
+    try {
+      const files = await skillFileList(skill.id);
+      loadedFiles = files.map((f) => ({ path: f.path, content: f.content }));
+    } catch (e) {
+      errorMsg = `加载技能脚本失败，未打开编辑（请重试）: ${e}`;
+      return;
+    }
     skillFormOpen = true;
     skillEditingId = skill.id;
     skillFormName = skill.name;
     skillFormDescription = skill.description ?? "";
     skillFormContent = skill.content ?? "";
-    formSkillFiles = [];
+    formSkillFiles = loadedFiles;
     formFileEditingIdx = null;
     formFilePath = "";
     formFileContent = "";
-    try {
-      const files = await skillFileList(skill.id);
-      formSkillFiles = files.map((f) => ({ path: f.path, content: f.content }));
-    } catch (e) {
-      console.warn("[skills] load files failed:", e);
-    }
   }
 
   function cancelSkillForm() {
