@@ -1554,13 +1554,12 @@ pub fn skill_file_list(conn: &Connection, skill_id: &str) -> rusqlite::Result<Ve
 /// content)` from `files`. Mirrors multica's full-replace-on-save
 /// semantics (simpler than per-file upsert/delete).
 ///
-/// Validation (inline here until Task 2's `crate::skill::` helpers land,
-/// then swapped to call them):
-/// - skips any file whose path cleans to `SKILL.md` (case-insensitive) —
-///   the skill body lives in `skills.content`, not as a file row.
-/// - rejects binary files by extension blacklist.
-/// - rejects files > 1 MiB (single-file cap; the bundle cap is enforced
-///   by `crate::skill::check_caps` in Task 2).
+/// Validation (delegated to `crate::skill::`):
+/// - `check_caps` — file count (256), single-file size (1 MiB), total (8 MiB).
+/// - per non-reserved file: `validate_file_path` (no absolute/rooted/`..`/
+///   reserved `SKILL.md`) + `is_likely_binary` (extension blacklist + NUL).
+/// - a root-level `SKILL.md` path is silently skipped (the body lives in
+///   `skills.content`, not as a file row).
 ///
 /// Returns `Ok(())` on success. On any validation failure the
 /// transaction rolls back (the `Transaction` guard drops on `?`).
@@ -1569,23 +1568,20 @@ pub fn skill_file_replace_all(
     skill_id: &str,
     files: &[(String, String)],
 ) -> rusqlite::Result<()> {
-    const MAX_FILE_BYTES: usize = 1024 * 1024; // 1 MiB
     // Pre-validate before opening the transaction so a rejection doesn't
     // leave the connection in a begun-transaction state.
+    crate::skill::check_caps(files)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
     for (path, content) in files {
-        if is_reserved_skill_md_path(path) {
+        if crate::skill::is_reserved_skill_md_path(path) {
             continue; // silently skip — SKILL.md is the content column
         }
-        if is_binary_extension(path) {
-            return Err(rusqlite::Error::ToSqlConversionFailure(format!(
-                "binary file not allowed: {path}"
-            ).into()));
-        }
-        if content.len() > MAX_FILE_BYTES {
-            return Err(rusqlite::Error::ToSqlConversionFailure(format!(
-                "file > 1 MiB: {path} ({} bytes)",
-                content.len()
-            ).into()));
+        crate::skill::validate_file_path(path)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+        if crate::skill::is_likely_binary(path, content.as_bytes()) {
+            return Err(rusqlite::Error::ToSqlConversionFailure(
+                format!("binary file not allowed: {path}").into(),
+            ));
         }
     }
     let tx = conn.transaction()?;
@@ -1595,7 +1591,7 @@ pub fn skill_file_replace_all(
     )?;
     let now = chrono::Utc::now().to_rfc3339();
     for (path, content) in files {
-        if is_reserved_skill_md_path(path) {
+        if crate::skill::is_reserved_skill_md_path(path) {
             continue;
         }
         let id = uuid::Uuid::new_v4().to_string();
@@ -1607,44 +1603,6 @@ pub fn skill_file_replace_all(
     }
     tx.commit()?;
     Ok(())
-}
-
-/// True iff `path` cleans to `SKILL.md` (case-insensitive) — the reserved
-/// primary-content filename. The skill body lives in `skills.content`, so
-/// a supporting file with this path is silently skipped on replace.
-fn is_reserved_skill_md_path(path: &str) -> bool {
-    use std::path::Path;
-    let cleaned = Path::new(path).components().last();
-    match cleaned {
-        Some(std::path::Component::Normal(name)) => {
-            name.to_string_lossy().eq_ignore_ascii_case("SKILL.md")
-        }
-        _ => false,
-    }
-}
-
-/// True iff the path's extension is in the binary blacklist (images,
-/// fonts, archives, office docs, media, executables, databases). Mirrors
-/// multica's `IsLikelyBinaryFilePath` (server/internal/skill/binary.go).
-/// Task 2's `crate::skill::is_likely_binary` adds the NUL-byte content
-/// check; this db-layer version is extension-only (the content is already
-/// a Rust `String` here, so it cannot contain NUL).
-fn is_binary_extension(path: &str) -> bool {
-    use std::path::Path;
-    let ext = match Path::new(path).extension() {
-        Some(e) => e.to_string_lossy().to_ascii_lowercase(),
-        None => return false,
-    };
-    matches!(
-        ext.as_str(),
-        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "ico" | "webp" | "pdf"
-            | "zip" | "tar" | "gz" | "rar" | "7z"
-            | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx"
-            | "mp3" | "mp4" | "avi" | "mov" | "wav" | "flac"
-            | "exe" | "dll" | "so" | "dylib" | "bin"
-            | "woff" | "woff2" | "ttf" | "otf"
-            | "db" | "sqlite" | "sqlite3"
-    )
 }
 
 /// List all skills assigned to an agent, with their enabled flag.

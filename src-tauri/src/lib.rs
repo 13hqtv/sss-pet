@@ -60,6 +60,10 @@ pub mod logger;
 /// `agent_gen_result` event stream the AgentsView generation panel
 /// consumes. No DB persistence (generation is short-lived + interactive).
 pub mod agent_gen;
+/// Skill runtime helpers (path validation, binary detection, caps,
+/// slug, frontmatter, provider skills-dir mapping, materialize/cleanup).
+/// Pure functions where possible — fully unit-testable without a backend.
+pub mod skill;
 
 /// Toggle click-through on the pet overlay window from the frontend.
 ///
