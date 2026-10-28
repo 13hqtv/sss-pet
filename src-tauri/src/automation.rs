@@ -9,7 +9,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use chrono::{DateTime, Duration, Local, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Duration, Local, TimeZone, Utc};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Runtime, State};
@@ -516,7 +516,7 @@ pub async fn automation_run_messages(
 mod tests {
     use super::*;
     use crate::db;
-    use chrono::Utc;
+    use chrono::{NaiveDate, Utc};
     use rusqlite::Connection;
 
     fn local_dt(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Local> {
