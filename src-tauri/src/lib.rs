@@ -850,6 +850,18 @@ pub fn run() {
             agent_gen::agent_gen_continue,
             agent_gen::agent_gen_history,
             agent_gen::agent_gen_cancel,
+            // Automation sub-tab: automation CRUD + manual run-now + run
+            // history + run-detail (loads the run's conversation messages).
+            // Schedule dispatch is wired in reminders::spawn_reminder_scheduler
+            // (a sibling run_automation_tick call — no new thread).
+            automation::automation_list,
+            automation::automation_create,
+            automation::automation_update,
+            automation::automation_delete,
+            automation::automation_set_enabled,
+            automation::automation_run_now,
+            automation::automation_run_list,
+            automation::automation_run_messages,
             config::settings_get,
             settings_set_with_focus,
             dismiss_pet_alert,

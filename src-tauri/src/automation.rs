@@ -7,10 +7,14 @@
 //! agent turn and records the run via the emit accumulator. See
 //! docs/superpowers/specs/2026-10-26-automation-design.md.
 
+use std::sync::{Arc, Mutex};
+
 use chrono::{DateTime, Duration, Local, NaiveDate, TimeZone, Utc};
 use rusqlite::Connection;
+use serde_json::{json, Value};
+use tauri::{AppHandle, Emitter, Runtime, State};
 
-use crate::agent::conversation::StoredMessage;
+use crate::agent::{self, conversation::StoredMessage, BackendConfig};
 use crate::db;
 
 /// Compute the next fire moment in local time.
@@ -229,6 +233,285 @@ pub fn finalize_run_on_error(conn: &mut Connection, run_id: &str, error: &str) -
     Ok(())
 }
 
+/// Initial `next_fire_at` (UTC RFC3339) for a freshly created/updated
+/// automation: `None` if disabled, otherwise `compute_next_fire` from now.
+/// Called by the create/update/set_enabled commands so a new enabled
+/// automation is immediately discoverable by the tick.
+pub fn compute_initial_next_fire(
+    trigger_type: &str,
+    trigger_config: &str,
+    enabled: bool,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    if !enabled {
+        return None;
+    }
+    let now_local = now.with_timezone(&Local);
+    compute_next_fire(trigger_type, trigger_config, now_local)
+        .map(|dt| dt.with_timezone(&Utc).to_rfc3339())
+}
+
+/// Manual "run now" prep: load the automation + `prepare_dispatch` with
+/// `source="manual"`. Does NOT check overlap (manual may run alongside a
+/// scheduled run) and does NOT touch `next_fire_at`/`last_run_at` (manual
+/// runs don't advance the schedule). The command spawns
+/// `automation_dispatch_async` on the returned dispatch.
+pub fn automation_dispatch_now_prep(
+    conn: &mut Connection,
+    id: &str,
+    now: DateTime<Utc>,
+) -> Result<(db::AutomationRun, AutomationDispatch), String> {
+    let auto = db::automation_get(conn, id)
+        .map_err(|e| format!("automation_get: {e}"))?
+        .ok_or_else(|| format!("automation {id} not found"))?;
+    prepare_dispatch(conn, &auto, "manual", now)
+}
+
+/// Execute one agent turn for a dispatch (created under the scheduler lock
+/// by `run_automation_tick` or `automation_dispatch_now_prep`). Mirrors
+/// `chat::chat_send`'s skill assembly + `run_chat_turn` call, but the emit
+/// closure is a stateful translator: it re-emits `automation_run_*` events
+/// to the panel AND finalizes the run row on `chat_result`/`chat_error`
+/// (loading the persisted messages via `load_messages`, since the drain
+/// task saves before emitting `chat_result`). Generic in `R` so both the
+/// generic reminders scheduler and the concrete-Wry manual command can
+/// call it.
+pub async fn automation_dispatch_async<R: Runtime + 'static>(
+    app: AppHandle<R>,
+    db_state: Arc<Mutex<Connection>>,
+    dispatch: AutomationDispatch,
+) {
+    let automation_id = dispatch.automation_id.clone();
+    let cwd = std::path::PathBuf::from(&dispatch.cwd);
+
+    // Materialize skills outside the db lock (mirrors chat_send).
+    let materialized =
+        match crate::skill::materialize_skills(&cwd, &dispatch.provider, &dispatch.enabled_skills) {
+            Ok(m) => m,
+            Err(e) => {
+                log::error!("[automation] materialize_skills {automation_id}: {e}");
+                if let Ok(mut conn) = db_state.lock() {
+                    let _ = finalize_run_on_error(&mut conn, &dispatch.run_id, &format!("materialize_skills: {e}"));
+                }
+                let _ = app.emit_to("panel", "automation_runs_changed", json!({"automationId": automation_id}));
+                return;
+            }
+        };
+    let system_prompt = match (dispatch.system_prompt.clone(), materialized.prompt_section.as_str()) {
+        (Some(base), sec) if !sec.is_empty() => Some(format!("{base}\n\n{sec}")),
+        (Some(base), _) => Some(base),
+        (None, sec) if !sec.is_empty() => Some(sec.to_string()),
+        _ => None,
+    };
+
+    let cfg = BackendConfig::default();
+    let backend = match agent::new(&dispatch.provider, cfg) {
+        Ok(b) => b,
+        Err(e) => {
+            log::error!("[automation] agent::new {} (automation {automation_id}): {e}", dispatch.provider);
+            crate::skill::cleanup_skill_dirs(&materialized.created_dirs);
+            if let Ok(mut conn) = db_state.lock() {
+                let _ = finalize_run_on_error(&mut conn, &dispatch.run_id, &format!("agent::new: {e}"));
+            }
+            let _ = app.emit_to("panel", "automation_runs_changed", json!({"automationId": automation_id}));
+            return;
+        }
+    };
+
+    let run_id = dispatch.run_id.clone();
+    let conv_id = dispatch.conv_id.clone();
+    let db_arc = db_state.clone();
+    let app_clone = app.clone();
+    let automation_id_closure = automation_id.clone();
+    // The emit accumulator: Fn (called per streamed message + once on
+    // result/error). Borrows its captures in json! / finalize calls, so it
+    // is Fn, not FnOnce — matches run_chat_turn's emit bound.
+    let emit = move |event: &str, payload: Value| match event {
+        "chat_message" => {
+            let msg = payload.get("message").cloned().unwrap_or(Value::Null);
+            let _ = app_clone.emit_to(
+                "panel",
+                "automation_run_message",
+                json!({"runId": run_id, "automationId": automation_id_closure, "message": msg}),
+            );
+        }
+        "chat_result" => {
+            // drain task already persisted via save_turn_record; load + finalize.
+            let cid = payload.get("conv_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if let Ok(mut conn) = db_arc.lock() {
+                let msgs = db::load_messages(&conn, &cid).unwrap_or_default();
+                let _ = finalize_run_on_result(&mut conn, &run_id, &msgs);
+            }
+            let result = payload.get("result").cloned().unwrap_or(Value::Null);
+            let _ = app_clone.emit_to(
+                "panel",
+                "automation_run_result",
+                json!({"runId": run_id, "automationId": automation_id_closure, "result": result}),
+            );
+            let _ = app_clone.emit_to(
+                "panel",
+                "automation_runs_changed",
+                json!({"automationId": automation_id_closure}),
+            );
+        }
+        "chat_error" => {
+            let msg = payload
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error")
+                .to_string();
+            if let Ok(mut conn) = db_arc.lock() {
+                let _ = finalize_run_on_error(&mut conn, &run_id, &msg);
+            }
+            let _ = app_clone.emit_to(
+                "panel",
+                "automation_run_error",
+                json!({"runId": run_id, "automationId": automation_id_closure, "message": msg}),
+            );
+            let _ = app_clone.emit_to(
+                "panel",
+                "automation_runs_changed",
+                json!({"automationId": automation_id_closure}),
+            );
+        }
+        _ => {}
+    };
+
+    let prompt = dispatch.prompt.clone();
+    let mcp = dispatch.mcp_config.clone();
+    let created_dirs = materialized.created_dirs;
+    if let Err(e) =
+        crate::chat::run_chat_turn(backend.as_ref(), emit, db_state.clone(), &conv_id, &prompt, &cwd, system_prompt, mcp, created_dirs)
+            .await
+    {
+        // run_chat_turn returns Err only on pre-drain setup failure.
+        log::error!("[automation] run_chat_turn {automation_id}: {e}");
+        if let Ok(mut conn) = db_state.lock() {
+            let _ = finalize_run_on_error(&mut conn, &dispatch.run_id, &format!("run_chat_turn: {e}"));
+        }
+        let _ = app.emit_to("panel", "automation_runs_changed", json!({"automationId": automation_id}));
+    }
+}
+
+// ===========================================================================
+// Tauri commands (panel-facing). Thin wrappers over db + automation helpers.
+// ===========================================================================
+
+#[tauri::command]
+pub async fn automation_list(
+    db: State<'_, Arc<Mutex<Connection>>>,
+) -> Result<Vec<db::Automation>, String> {
+    let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+    db::automation_list(&conn).map_err(|e| format!("automation_list: {e}"))
+}
+
+#[tauri::command]
+pub async fn automation_create(
+    db: State<'_, Arc<Mutex<Connection>>>,
+    name: String,
+    agent_id: String,
+    prompt: String,
+    trigger_type: String,
+    trigger_config: String,
+    enabled: bool,
+) -> Result<db::Automation, String> {
+    let now = Utc::now();
+    let next_fire = compute_initial_next_fire(&trigger_type, &trigger_config, enabled, now);
+    let mut conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+    db::automation_create(&mut conn, &name, &agent_id, &prompt, &trigger_type, &trigger_config, enabled, next_fire)
+        .map_err(|e| format!("automation_create: {e}"))
+}
+
+#[tauri::command]
+pub async fn automation_update(
+    db: State<'_, Arc<Mutex<Connection>>>,
+    id: String,
+    name: String,
+    agent_id: String,
+    prompt: String,
+    trigger_type: String,
+    trigger_config: String,
+    enabled: bool,
+) -> Result<db::Automation, String> {
+    let now = Utc::now();
+    let next_fire = compute_initial_next_fire(&trigger_type, &trigger_config, enabled, now);
+    let mut conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+    db::automation_update(&mut conn, &id, &name, &agent_id, &prompt, &trigger_type, &trigger_config, enabled, next_fire)
+        .map_err(|e| format!("automation_update: {e}"))
+}
+
+#[tauri::command]
+pub async fn automation_delete(
+    db: State<'_, Arc<Mutex<Connection>>>,
+    id: String,
+) -> Result<(), String> {
+    let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+    db::automation_delete(&conn, &id).map_err(|e| format!("automation_delete: {e}"))
+}
+
+#[tauri::command]
+pub async fn automation_set_enabled(
+    db: State<'_, Arc<Mutex<Connection>>>,
+    id: String,
+    enabled: bool,
+) -> Result<db::Automation, String> {
+    let now = Utc::now();
+    let mut conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+    let auto = db::automation_get(&conn, &id)
+        .map_err(|e| format!("automation_get: {e}"))?
+        .ok_or_else(|| format!("automation {id} not found"))?;
+    // Enabling → recompute next_fire from now. Disabling → pass None
+    // (COALESCE preserves the stale value, harmless: get_due filters enabled=1).
+    let next_fire = if enabled {
+        compute_initial_next_fire(&auto.trigger_type, &auto.trigger_config, true, now)
+    } else {
+        None
+    };
+    db::automation_update(&mut conn, &id, &auto.name, &auto.agent_id, &auto.prompt,
+        &auto.trigger_type, &auto.trigger_config, enabled, next_fire)
+        .map_err(|e| format!("automation_update: {e}"))
+}
+
+#[tauri::command]
+pub async fn automation_run_now(
+    app: AppHandle,
+    db: State<'_, Arc<Mutex<Connection>>>,
+    id: String,
+) -> Result<db::AutomationRun, String> {
+    let now = Utc::now();
+    let db_arc = db.inner().clone();
+    let (run, dispatch) = {
+        let mut conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+        automation_dispatch_now_prep(&mut conn, &id, now)?
+    };
+    tauri::async_runtime::spawn(automation_dispatch_async(app, db_arc, dispatch));
+    Ok(run)
+}
+
+#[tauri::command]
+pub async fn automation_run_list(
+    db: State<'_, Arc<Mutex<Connection>>>,
+    automation_id: String,
+) -> Result<Vec<db::AutomationRun>, String> {
+    let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+    db::automation_run_list(&conn, &automation_id).map_err(|e| format!("automation_run_list: {e}"))
+}
+
+#[tauri::command]
+pub async fn automation_run_messages(
+    db: State<'_, Arc<Mutex<Connection>>>,
+    run_id: String,
+) -> Result<Vec<StoredMessage>, String> {
+    let conn = db.lock().map_err(|e| format!("db lock: {e}"))?;
+    let run = db::automation_run_get(&conn, &run_id)
+        .map_err(|e| format!("automation_run_get: {e}"))?
+        .ok_or_else(|| format!("run {run_id} not found"))?;
+    match run.conversation_id {
+        Some(cid) => db::load_messages(&conn, &cid).map_err(|e| format!("load_messages: {e}")),
+        None => Ok(Vec::new()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,5 +697,34 @@ mod tests {
         let got = db::automation_run_get(&conn, &rid).unwrap().unwrap();
         assert_eq!(got.status, "failed");
         assert_eq!(got.error.as_deref(), Some("agent::new failed"));
+    }
+
+    // -- dispatch_now_prep + compute_initial_next_fire (Task 6) --
+
+    #[test]
+    fn dispatch_now_prep_ignores_running_overlap() {
+        let (_t, _g, mut conn) = fresh_db();
+        let aid = seed_agent(&conn);
+        let a = db::automation_create(&mut conn, "n", &aid, "p", "interval", "60", true, None).unwrap();
+        // a schedule run already in flight — manual must NOT skip
+        db::automation_run_create(&mut conn, &a.id, None, "schedule", "running",
+            &Utc::now().to_rfc3339()).unwrap();
+        let (run, _dispatch) = automation_dispatch_now_prep(&mut conn, &a.id, Utc::now()).unwrap();
+        assert_eq!(run.source, "manual");
+        assert_eq!(run.status, "running");
+        let runs = db::automation_run_list(&conn, &a.id).unwrap();
+        assert_eq!(runs.len(), 2); // schedule(running) + manual(running)
+        assert_eq!(runs.iter().filter(|r| r.source == "manual").count(), 1);
+        // manual touches neither next_fire nor last_run
+        let a2 = db::automation_get(&conn, &a.id).unwrap().unwrap();
+        assert!(a2.next_fire_at.is_none());
+        assert!(a2.last_run_at.is_none());
+    }
+
+    #[test]
+    fn automation_create_command_sets_next_fire() {
+        let now = Utc::now();
+        assert!(compute_initial_next_fire("daily", "09:00", true, now).is_some());
+        assert!(compute_initial_next_fire("daily", "09:00", false, now).is_none());
     }
 }
