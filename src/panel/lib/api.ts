@@ -404,3 +404,110 @@ export async function agentGenHistory(genId: string): Promise<GenMessage[]> {
 export async function agentGenCancel(genId: string): Promise<void> {
   await invoke("agent_gen_cancel", { genId });
 }
+
+// ---------------------------------------------------------------------------
+// Automation sub-tab — `automation_*` commands. An automation binds a saved
+// agent + a prompt + a trigger (daily HH:MM local, or every-N-minutes); the
+// reminders scheduler tick fires due automations, and each run creates a
+// first-class conversation (🤖 title prefix) whose messages are the run's
+// transcript. See docs/superpowers/specs/2026-10-26-automation-design.md.
+
+/** Mirrors `db::Automation` (snake_case fields at the IPC boundary). */
+export interface Automation {
+  id: string;
+  name: string;
+  agent_id: string;
+  prompt: string;
+  trigger_type: "daily" | "interval";
+  /** daily: "HH:MM" (local 24h); interval: integer-minutes string. */
+  trigger_config: string;
+  enabled: boolean;
+  last_run_at: string | null;
+  next_fire_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Mirrors `db::AutomationRun`. `conversation_id` links to the run's
+ *  transcript (loaded via `automationRunMessages` for the run-detail view). */
+export interface AutomationRun {
+  id: string;
+  automation_id: string;
+  conversation_id: string | null;
+  source: "schedule" | "manual";
+  status: "running" | "completed" | "failed";
+  started_at: string;
+  finished_at: string | null;
+  error: string | null;
+  result_summary: string | null;
+  created_at: string;
+}
+
+export async function automationList(): Promise<Automation[]> {
+  return invoke<Automation[]>("automation_list");
+}
+
+export async function automationCreate(params: {
+  name: string;
+  agentId: string;
+  prompt: string;
+  triggerType: "daily" | "interval";
+  triggerConfig: string;
+  enabled: boolean;
+}): Promise<Automation> {
+  return invoke<Automation>("automation_create", {
+    name: params.name,
+    agentId: params.agentId,
+    prompt: params.prompt,
+    triggerType: params.triggerType,
+    triggerConfig: params.triggerConfig,
+    enabled: params.enabled,
+  });
+}
+
+export async function automationUpdate(params: {
+  id: string;
+  name: string;
+  agentId: string;
+  prompt: string;
+  triggerType: "daily" | "interval";
+  triggerConfig: string;
+  enabled: boolean;
+}): Promise<Automation> {
+  return invoke<Automation>("automation_update", {
+    id: params.id,
+    name: params.name,
+    agentId: params.agentId,
+    prompt: params.prompt,
+    triggerType: params.triggerType,
+    triggerConfig: params.triggerConfig,
+    enabled: params.enabled,
+  });
+}
+
+export async function automationDelete(id: string): Promise<void> {
+  await invoke("automation_delete", { id });
+}
+
+export async function automationSetEnabled(
+  id: string,
+  enabled: boolean,
+): Promise<Automation> {
+  return invoke<Automation>("automation_set_enabled", { id, enabled });
+}
+
+export async function automationRunNow(id: string): Promise<AutomationRun> {
+  return invoke<AutomationRun>("automation_run_now", { id });
+}
+
+export async function automationRunList(
+  automationId: string,
+): Promise<AutomationRun[]> {
+  return invoke<AutomationRun[]>("automation_run_list", { automationId });
+}
+
+export async function automationRunMessages(
+  runId: string,
+): Promise<StoredMessage[]> {
+  return invoke<StoredMessage[]>("automation_run_messages", { runId });
+}

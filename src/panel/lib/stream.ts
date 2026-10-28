@@ -225,3 +225,96 @@ export async function subscribeAgentGenStream(
     }
   };
 }
+
+// ---------------------------------------------------------------------------
+// Automation run stream — `automation_run_message` / `automation_run_result`
+// / `automation_run_error` / `automation_runs_changed`. Emitted by
+// `automation::automation_dispatch_async`'s emit accumulator (which re-emits
+// the underlying `chat_*` events as `automation_run_*` + finalizes the run
+// row on result/error). The automation sub-tab subscribes for the lifetime
+// of the panel: `onMessage` feeds the live-progress view, `onRunsChanged`
+// refreshes the history list, `onResult`/`onError` close out a run.
+//
+// Event payloads use camelCase keys (the backend emits `json!({"runId": …})`
+// — string-literal keys are preserved verbatim).
+
+export interface AutomationRunMessageEvent {
+  runId: string;
+  automationId: string;
+  message: Message;
+}
+export interface AutomationRunResultEvent {
+  runId: string;
+  automationId: string;
+  result: ExecResult;
+}
+export interface AutomationRunErrorEvent {
+  runId: string;
+  automationId: string;
+  message: string;
+}
+export interface AutomationRunsChangedEvent {
+  automationId: string;
+}
+
+export interface AutomationStreamHandlers {
+  onMessage?: (runId: string, automationId: string, message: Message) => void;
+  onResult?: (runId: string, automationId: string, result: ExecResult) => void;
+  onError?: (runId: string, automationId: string, message: string) => void;
+  onRunsChanged?: (automationId: string) => void;
+}
+
+/** Subscribe to the automation run events. Returns an `unlisten` fn (call
+ *  on component destroy — Svelte 5's `$effect` cleanup is the canonical
+ *  place). Handlers are optional — subscribe only to the events you need. */
+export async function subscribeAutomationRunStream(
+  handlers: AutomationStreamHandlers,
+): Promise<() => void> {
+  const unsubs: Array<() => void> = [];
+
+  if (handlers.onMessage) {
+    const h = handlers.onMessage;
+    unsubs.push(
+      await listen<AutomationRunMessageEvent>("automation_run_message", (e) => {
+        const { runId, automationId, message } = e.payload;
+        h(runId, automationId, message);
+      }),
+    );
+  }
+  if (handlers.onResult) {
+    const h = handlers.onResult;
+    unsubs.push(
+      await listen<AutomationRunResultEvent>("automation_run_result", (e) => {
+        const { runId, automationId, result } = e.payload;
+        h(runId, automationId, result);
+      }),
+    );
+  }
+  if (handlers.onError) {
+    const h = handlers.onError;
+    unsubs.push(
+      await listen<AutomationRunErrorEvent>("automation_run_error", (e) => {
+        const { runId, automationId, message } = e.payload;
+        h(runId, automationId, message);
+      }),
+    );
+  }
+  if (handlers.onRunsChanged) {
+    const h = handlers.onRunsChanged;
+    unsubs.push(
+      await listen<AutomationRunsChangedEvent>("automation_runs_changed", (e) => {
+        h(e.payload.automationId);
+      }),
+    );
+  }
+
+  return () => {
+    for (const u of unsubs) {
+      try {
+        u();
+      } catch {
+        // Swallow — the webview may already be gone.
+      }
+    }
+  };
+}
