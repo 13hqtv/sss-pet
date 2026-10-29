@@ -94,6 +94,13 @@
   let liveMsgs: Message[] = $state([]);
 
   // -- agent form --
+  // One named MCP server entry in the agent form: `name` is the server key
+  // inside the stored `{"mcpServers": {<name>: <entry>}}` blob; `config` is
+  // that entry's JSON text (e.g. {"command":"npx","args":[...],"env":{}}).
+  interface McpEntry {
+    name: string;
+    config: string;
+  }
   let formOpen: boolean = $state(false);
   let editingId: string | null = $state(null);
   let formName: string = $state("");
@@ -102,6 +109,11 @@
   let formModel: string = $state("");
   let formSystemPrompt: string = $state("");
   let formMcpConfig: string = $state("");
+  // Named MCP server entries parsed from formMcpConfig. The UI edits these
+  // (name + per-server JSON config); formMcpConfig is re-serialized from
+  // them on change so save/load stay shape-compatible with the stored
+  // {"mcpServers": {<name>: {<entry>}}} blob.
+  let mcpEntries: McpEntry[] = $state([]);
   let formCwd: string = $state("");
   // skill assignment for the current form
   let formSkillIds: Set<string> = $state(new Set());
@@ -234,6 +246,7 @@
     formModel = "";
     formSystemPrompt = "";
     formMcpConfig = "";
+    mcpEntries = [];
     formCwd = "";
     formSkillIds = new Set();
     modelList = [];
@@ -250,6 +263,7 @@
     formModel = agent.model ?? "";
     formSystemPrompt = agent.system_prompt ?? "";
     formMcpConfig = agent.mcp_config ?? "";
+    mcpEntries = parseMcpEntries(formMcpConfig);
     formCwd = agent.cwd ?? "";
     formSkillIds = new Set();
     // Load skill assignments
@@ -273,6 +287,17 @@
     const name = formName.trim();
     if (!name) {
       errorMsg = "名称不能为空";
+      return;
+    }
+    // Re-serialize the named-entry editor into the stored blob, and refuse
+    // to save while any filled-in entry has invalid JSON config (the user
+    // would silently lose that server on save).
+    syncMcpConfig();
+    const hasInvalidMcp = mcpEntries.some(
+      (e) => e.name.trim() !== "" && !entryConfigValid(e.config),
+    );
+    if (hasInvalidMcp) {
+      errorMsg = "存在 JSON 格式错误的 MCP 配置，请修正后再保存";
       return;
     }
     try {
@@ -518,28 +543,84 @@
     void probeModels(formProvider);
   }
 
-  /** Auto-inject the sss-pet-todos MCP server into the mcp_config JSON.
-   *  Gets the current exe path and builds the server config. Merges
-   *  into existing mcp_config if present, or creates a new one. */
+  /** Parse the stored {"mcpServers": {name: cfg, ...}} blob into named
+   *  entries for editing. Returns [] when the blob is empty / invalid /
+   *  has no mcpServers object — the form then starts with an empty list. */
+  function parseMcpEntries(json: string): McpEntry[] {
+    const trimmed = json.trim();
+    if (!trimmed) return [];
+    try {
+      const parsed = JSON.parse(trimmed);
+      const servers = parsed?.mcpServers;
+      if (!servers || typeof servers !== "object") return [];
+      return Object.entries(servers).map(([name, cfg]) => ({
+        name,
+        config: JSON.stringify(cfg, null, 2),
+      }));
+    } catch {
+      return [];
+    }
+  }
+
+  /** Serialize named entries back into the {"mcpServers": {name: cfg}} blob.
+   *  Entries with an empty name or invalid JSON config are skipped (the
+   *  entry itself flags the error in the UI). Returns "" when no valid
+   *  entries remain, so save sends `null` (no MCP override). */
+  function serializeMcpEntries(entries: McpEntry[]): string {
+    const mcpServers: Record<string, unknown> = {};
+    for (const e of entries) {
+      const name = e.name.trim();
+      if (!name) continue;
+      try {
+        mcpServers[name] = JSON.parse(e.config);
+      } catch {
+        // invalid JSON — skipped; the entry shows its own error
+      }
+    }
+    if (Object.keys(mcpServers).length === 0) return "";
+    return JSON.stringify({ mcpServers }, null, 2);
+  }
+
+  /** Re-serialize mcpEntries into formMcpConfig (the field save reads). */
+  function syncMcpConfig() {
+    formMcpConfig = serializeMcpEntries(mcpEntries);
+  }
+
+  /** A config box is valid when empty (skipped on save) or parses as JSON. */
+  function entryConfigValid(config: string): boolean {
+    if (!config.trim()) return true;
+    try {
+      JSON.parse(config);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function addMcpEntry() {
+    mcpEntries.push({ name: "", config: "" });
+    syncMcpConfig();
+  }
+
+  function removeMcpEntry(i: number) {
+    mcpEntries.splice(i, 1);
+    syncMcpConfig();
+  }
+
+  /** Auto-inject the sss-pet-todos MCP server as a named entry. Gets the
+   *  current exe path and builds the server config; replaces an existing
+   *  "sss-pet-todos" entry or adds a new one. */
   async function addTodoMcp() {
     try {
       const exePath = await getExePath();
-      const serverConfig = { command: exePath, args: ["mcp-server"] };
-      let config: Record<string, unknown> = {};
-      if (formMcpConfig.trim()) {
-        try {
-          config = JSON.parse(formMcpConfig);
-        } catch {
-          // not valid JSON — start fresh
-          config = {};
-        }
+      const cfg = JSON.stringify({ command: exePath, args: ["mcp-server"] }, null, 2);
+      const i = mcpEntries.findIndex((e) => e.name === "sss-pet-todos");
+      if (i >= 0) {
+        mcpEntries[i].config = cfg;
+      } else {
+        mcpEntries.push({ name: "sss-pet-todos", config: cfg });
       }
-      // Ensure mcpServers key exists
-      if (!config.mcpServers || typeof config.mcpServers !== "object") {
-        config.mcpServers = {};
-      }
-      (config.mcpServers as Record<string, unknown>)["sss-pet-todos"] = serverConfig;
-      formMcpConfig = JSON.stringify(config, null, 2);
+      syncMcpConfig();
     } catch (e) {
       errorMsg = `获取 exe 路径失败: ${e}`;
     }
@@ -1429,16 +1510,58 @@
       class="form-prompt"
       rows="6"
     ></textarea>
-    <div class="mcp-row">
-      <textarea
-        bind:value={formMcpConfig}
-        placeholder='MCP 配置（JSON 格式，可选）'
-        class="form-mcp"
-        rows="3"
-      ></textarea>
-      <button class="mcp-add-btn" onclick={addTodoMcp} title="自动添加代办 MCP 服务器配置">
-        + 代办 MCP
-      </button>
+    <div class="mcp-section">
+      <div class="mcp-head">
+        <span class="mcp-title">MCP 服务器</span>
+        <div class="mcp-head-actions">
+          <button class="mcp-mini-btn" onclick={addMcpEntry}>+ 添加</button>
+          <button
+            class="mcp-mini-btn"
+            onclick={addTodoMcp}
+            title="自动添加代办 MCP 服务器配置"
+          >
+            + 代办 MCP
+          </button>
+        </div>
+      </div>
+      {#if mcpEntries.length === 0}
+        <div class="mcp-empty">尚未配置 MCP 服务器</div>
+      {:else}
+        <div class="mcp-list">
+          {#each mcpEntries as entry, i (i)}
+            <div class="mcp-entry">
+              <div class="mcp-entry-row">
+                <input
+                  type="text"
+                  class="mcp-name"
+                  bind:value={entry.name}
+                  placeholder="名称（如 my-server）"
+                  onchange={syncMcpConfig}
+                />
+                <button
+                  class="mcp-del"
+                  onclick={() => removeMcpEntry(i)}
+                  title="删除此 MCP 服务器"
+                  aria-label="删除此 MCP 服务器"
+                >
+                  ×
+                </button>
+              </div>
+              <textarea
+                class="mcp-cfg"
+                class:invalid={!entryConfigValid(entry.config)}
+                bind:value={entry.config}
+                placeholder={'JSON 配置，如 {"command":"npx","args":["-y","srv"],"env":{}}'}
+                rows="3"
+                onchange={syncMcpConfig}
+              ></textarea>
+              {#if !entryConfigValid(entry.config)}
+                <div class="mcp-err">JSON 格式错误</div>
+              {/if}
+            </div>
+          {/each}
+        </div>
+      {/if}
     </div>
 
     <!-- Skill assignment -->
@@ -1949,7 +2072,7 @@
     font-style: italic;
   }
 
-  .form-prompt, .form-mcp, .form-content {
+  .form-prompt, .form-content {
     font-size: 0.78rem;
     padding: var(--space-1) var(--space-2);
     border: 1px solid var(--bd);
@@ -1960,11 +2083,11 @@
     resize: vertical;
     transition: border-color var(--t-fast);
   }
-  .form-prompt:focus, .form-mcp:focus, .form-content:focus {
+  .form-prompt:focus, .form-content:focus {
     border-color: var(--acc);
     outline: none;
   }
-  .form-prompt::placeholder, .form-mcp::placeholder, .form-content::placeholder {
+  .form-prompt::placeholder, .form-content::placeholder {
     color: var(--mut);
   }
 
@@ -2030,18 +2153,124 @@
     border-radius: var(--r-code);
   }
 
-  .mcp-row {
+  .mcp-section {
     display: flex;
+    flex-direction: column;
     gap: var(--space-2);
-    align-items: flex-start;
+    border: 1px solid var(--bd);
+    border-radius: var(--r-code);
+    padding: var(--space-2);
+    background: var(--surface);
   }
 
-  .mcp-row .form-mcp {
+  .mcp-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+  }
+
+  .mcp-title {
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: var(--mut);
+  }
+
+  .mcp-head-actions {
+    display: flex;
+    gap: var(--space-1);
+  }
+
+  .mcp-empty {
+    font-size: 0.72rem;
+    color: var(--mut);
+    padding: var(--space-1) 0;
+  }
+
+  .mcp-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+
+  .mcp-entry {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    border: 1px solid var(--bd);
+    border-radius: var(--r-code);
+    padding: var(--space-2);
+    background: var(--bg);
+  }
+
+  .mcp-entry-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
+  .mcp-name {
     flex: 1;
+    font-size: 0.78rem;
+    padding: var(--space-1) var(--space-2);
+    border: 1px solid var(--bd);
+    border-radius: var(--r-code);
+    background: var(--bg);
+    color: var(--ink);
   }
 
-  .mcp-add-btn {
+  .mcp-name:focus {
+    border-color: var(--acc);
+    outline: none;
+  }
+
+  .mcp-cfg {
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    padding: var(--space-1) var(--space-2);
+    border: 1px solid var(--bd);
+    border-radius: var(--r-code);
+    background: var(--bg);
+    color: var(--ink);
+    resize: vertical;
+    width: 100%;
+    box-sizing: border-box;
+  }
+
+  .mcp-cfg:focus {
+    border-color: var(--acc);
+    outline: none;
+  }
+
+  .mcp-cfg.invalid {
+    border-color: var(--err);
+  }
+
+  .mcp-err {
+    font-size: 0.68rem;
+    color: var(--err);
+  }
+
+  .mcp-del {
     flex-shrink: 0;
+    width: 22px;
+    height: 22px;
+    line-height: 1;
+    padding: 0;
+    cursor: pointer;
+    background: transparent;
+    color: var(--mut);
+    border: 1px solid var(--bd);
+    border-radius: var(--r-code);
+    transition: all var(--t-fast);
+  }
+
+  .mcp-del:hover {
+    color: var(--err);
+    border-color: var(--err);
+  }
+
+  .mcp-mini-btn {
     font-size: 0.68rem;
     padding: var(--space-1) var(--space-2);
     cursor: pointer;
@@ -2051,10 +2280,9 @@
     border-radius: var(--r-code);
     transition: all var(--t-fast);
     white-space: nowrap;
-    margin-top: 2px;
   }
 
-  .mcp-add-btn:hover {
+  .mcp-mini-btn:hover {
     background: var(--acc);
     color: #fff;
     border-color: var(--acc);

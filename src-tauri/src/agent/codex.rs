@@ -392,6 +392,32 @@ pub(crate) fn build_initialize_request(id: u64) -> Value {
     })
 }
 
+/// Translate the stored MCP config blob into the shape codex's app-server
+/// expects on the `thread/start` / `thread/resume` `config` field.
+///
+/// The UI stores Claude-style `{"mcpServers": {...}}` (camelCase). Codex's
+/// `Config` struct deserialises MCP servers from the `mcp_servers` field
+/// (snake_case — matching `~/.codex/config.toml`'s `[mcp_servers.<name>]`
+/// tables), so a camelCase `mcpServers` key is silently dropped and no
+/// server is registered. Only the wrapper key differs; the per-server entry
+/// shape (`command`/`args`/`env` for stdio, `url`/`headers` for http) is
+/// identical between the two. Sibling keys (e.g. `version`) are preserved.
+///
+/// Returns `Value::Null` when `raw` is `None` or unparseable — the
+/// `config` field is `null` and the app-server falls back to its default.
+fn translate_mcp_for_codex(raw: Option<&str>) -> Value {
+    let Some(raw) = raw else { return Value::Null };
+    let Ok(mut v) = serde_json::from_str::<Value>(raw) else {
+        return Value::Null;
+    };
+    if let Value::Object(ref mut map) = v {
+        if let Some(servers) = map.remove("mcpServers") {
+            map.insert("mcp_servers".to_string(), servers);
+        }
+    }
+    v
+}
+
 /// Build the `thread/start` JSON-RPC request (id=`id`). Per the task spec
 /// the request carries the prompt (as `input` text content) alongside the
 /// `cwd` and optional `model`. Mirrors multica codex.go:2069-2083 for the
@@ -427,9 +453,9 @@ pub(crate) fn build_thread_start_request(
         .unwrap_or(Value::Null);
     let base_instructions = system_prompt.map(|s| Value::String(s.to_string())).unwrap_or(Value::Null);
     let dev_instructions = system_prompt.map(|s| Value::String(s.to_string())).unwrap_or(Value::Null);
-    let config_val = mcp_config
-        .and_then(|s| serde_json::from_str::<Value>(s).ok())
-        .unwrap_or(Value::Null);
+    // codex's Config key is `mcp_servers` (snake_case) — translate the
+    // stored camelCase `mcpServers` wrapper so servers are registered.
+    let config_val = translate_mcp_for_codex(mcp_config);
     json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -478,9 +504,9 @@ pub(crate) fn build_thread_resume_request(
         .map(Value::String)
         .unwrap_or(Value::Null);
     let dev_instructions = system_prompt.map(|s| Value::String(s.to_string())).unwrap_or(Value::Null);
-    let config_val = mcp_config
-        .and_then(|s| serde_json::from_str::<Value>(s).ok())
-        .unwrap_or(Value::Null);
+    // codex's Config key is `mcp_servers` (snake_case) — translate the
+    // stored camelCase `mcpServers` wrapper so servers are registered.
+    let config_val = translate_mcp_for_codex(mcp_config);
     json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -1205,6 +1231,52 @@ mod tests {
     fn build_thread_resume_request_with_model() {
         let req = build_thread_resume_request(2, "th_prior", "hi", "/tmp", Some("o3"), None, None);
         assert_eq!(req["params"]["model"], "o3");
+    }
+
+    // ── MCP config translation (mcpServers → mcp_servers) ──
+
+    #[test]
+    fn build_thread_start_request_translates_mcp_to_snake_case() {
+        let mcp = r#"{"mcpServers":{"todos":{"command":"x","args":["y"]}}}"#;
+        let req = build_thread_start_request(2, "hi", "/tmp", None, None, Some(mcp));
+        let config = &req["params"]["config"];
+        assert!(config.is_object(), "config must be an object when mcp set");
+        assert!(
+            config.get("mcp_servers").is_some(),
+            "config must use the snake_case mcp_servers key codex reads"
+        );
+        assert!(
+            config.get("mcpServers").is_none(),
+            "camelCase wrapper must be removed (codex would otherwise drop it)"
+        );
+        assert_eq!(config["mcp_servers"]["todos"]["command"], "x");
+        assert_eq!(config["mcp_servers"]["todos"]["args"][0], "y");
+    }
+
+    #[test]
+    fn build_thread_resume_request_translates_mcp_to_snake_case() {
+        let mcp = r#"{"mcpServers":{"todos":{"command":"x","args":[]}}}"#;
+        let req = build_thread_resume_request(2, "th", "hi", "/tmp", None, None, Some(mcp));
+        let config = &req["params"]["config"];
+        assert!(config.get("mcp_servers").is_some());
+        assert!(config.get("mcpServers").is_none());
+    }
+
+    #[test]
+    fn build_thread_start_request_null_config_when_mcp_absent() {
+        let req = build_thread_start_request(2, "hi", "/tmp", None, None, None);
+        assert_eq!(req["params"]["config"], Value::Null);
+    }
+
+    #[test]
+    fn build_thread_start_request_preserves_sibling_keys() {
+        // A `version` sibling key rides along unchanged; only the wrapper
+        // key is renamed.
+        let mcp = r#"{"version":1,"mcpServers":{"todos":{"command":"x"}}}"#;
+        let req = build_thread_start_request(2, "hi", "/tmp", None, None, Some(mcp));
+        let config = &req["params"]["config"];
+        assert_eq!(config["version"], 1);
+        assert!(config.get("mcp_servers").is_some());
     }
 
     // ── extract_session_id ──

@@ -469,6 +469,32 @@ mod tests {
     }
 
     #[test]
+    fn build_args_with_mcp_config_appends_flag_and_writes_temp_file() {
+        // Claude is the one backend that already wired MCP through: the
+        // stored {"mcpServers": {...}} blob is written verbatim to a temp
+        // file and `--mcp-config <path>` is appended. This test pins that
+        // behavior (it had zero coverage before).
+        let mcp = r#"{"mcpServers":{"todos":{"command":"x","args":["y"]}}}"#;
+        let opts = ExecOptions {
+            cwd: PathBuf::from("/tmp"),
+            model: None,
+            resume_session_id: None,
+            timeout: None,
+            system_prompt: None,
+            mcp_config: Some(mcp.into()),
+        };
+        let args = build_args(&opts);
+        let idx = args
+            .iter()
+            .position(|a| a == "--mcp-config")
+            .expect("--mcp-config flag must be appended when mcp_config is set");
+        let path = &args[idx + 1];
+        // The temp file must exist and contain the raw MCP JSON verbatim.
+        let content = std::fs::read_to_string(path).expect("temp mcp file is readable");
+        assert_eq!(content, mcp);
+    }
+
+    #[test]
     fn build_input_shape_matches_multica() {
         // The wire shape must mirror multica's buildClaudeInput (claude.go:1149).
         let input = build_input("hello");

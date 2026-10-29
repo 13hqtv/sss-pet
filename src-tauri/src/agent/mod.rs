@@ -139,9 +139,15 @@ pub struct ExecOptions {
     /// `--append-system-prompt`, codex `baseInstructions`/`developerInstructions`,
     /// opencode prepended to the prompt text.
     pub system_prompt: Option<String>,
-    /// MCP server config as a JSON string (the `mcpServers` object).
-    /// Threaded into the provider CLI's native MCP mechanism: claude
-    /// `--mcp-config <file>`, codex `config` field. `None` = no MCP override.
+    /// MCP server config as a JSON string (Claude-style
+    /// `{"mcpServers": {"<name>": {<entry>}}}`). Each backend translates it
+    /// into its native MCP mechanism: claude writes the blob to a temp file
+    /// and passes `--mcp-config <file>`; codex renames the wrapper key to
+    /// `mcp_servers` (snake_case) and sends it in the `thread/start`
+    /// `config` field; opencode translates each entry to
+    /// `{"type":"local","command":[...],"environment":{}}` and injects the
+    /// `{"mcp":{...}}` document via the `OPENCODE_CONFIG_CONTENT` env var.
+    /// `None` = no MCP override.
     pub mcp_config: Option<String>,
 }
 

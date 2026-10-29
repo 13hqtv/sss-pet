@@ -72,6 +72,92 @@ pub(crate) fn build_args(opts: &ExecOptions) -> Vec<String> {
     args
 }
 
+/// Translate the stored Claude-style MCP config blob into opencode's native
+/// config shape, wrapped as opencode expects: `{"mcp": {<name>: <entry>}}`.
+///
+/// opencode's `mcp` entries diverge from the Claude/codex shape:
+/// - stdio: `type:"local"`, `command` is a single array (`[exe, ...args]`),
+///   and the env map is `environment` (not `env`).
+/// - remote: `type:"remote"` with `url` (+ optional `headers`).
+///
+/// This mirrors multica's `translateMCPConfigForOpenCode`
+/// (`server/pkg/agent/opencode_mcp.go:122`). The result is fed to the
+/// opencode CLI via the `OPENCODE_CONFIG_CONTENT` env var (see
+/// [`env_with_mcp`]) — no config file is written.
+///
+/// Returns `None` when `raw` is empty / unparseable / carries no servers, so
+/// the caller leaves the env unset and opencode falls back to its default.
+fn translate_mcp_for_opencode(raw: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(raw).ok()?;
+    let servers = v.get("mcpServers")?.as_object()?;
+    if servers.is_empty() {
+        return None;
+    }
+    let mut out = serde_json::Map::new();
+    for (name, entry) in servers {
+        let Some(entry) = entry.as_object() else { continue };
+        let is_remote = entry.contains_key("url")
+            || matches!(
+                entry.get("type").and_then(|t| t.as_str()),
+                Some("http") | Some("sse") | Some("remote") | Some("streamable-http")
+            );
+        let translated = if is_remote {
+            let mut t = serde_json::Map::new();
+            t.insert("type".into(), Value::String("remote".into()));
+            if let Some(url) = entry.get("url") {
+                t.insert("url".into(), url.clone());
+            }
+            if let Some(headers) = entry.get("headers") {
+                t.insert("headers".into(), headers.clone());
+            }
+            Value::Object(t)
+        } else {
+            let mut t = serde_json::Map::new();
+            t.insert("type".into(), Value::String("local".into()));
+            // `command` (string) + `args` (array) → single command array.
+            let mut cmd: Vec<Value> = Vec::new();
+            if let Some(c) = entry.get("command") {
+                match c {
+                    Value::String(s) => cmd.push(Value::String(s.clone())),
+                    Value::Array(arr) => cmd.extend(arr.iter().cloned()),
+                    _ => {}
+                }
+            }
+            if let Some(args) = entry.get("args").and_then(|a| a.as_array()) {
+                cmd.extend(args.iter().cloned());
+            }
+            t.insert("command".into(), Value::Array(cmd));
+            if let Some(env) = entry.get("env") {
+                t.insert("environment".into(), env.clone());
+            }
+            Value::Object(t)
+        };
+        out.insert(name.clone(), translated);
+    }
+    if out.is_empty() {
+        return None;
+    }
+    let wrapped = serde_json::json!({ "mcp": Value::Object(out) });
+    serde_json::to_string(&wrapped).ok()
+}
+
+/// Build the env map for the opencode spawn, injecting the translated MCP
+/// config via `OPENCODE_CONFIG_CONTENT` when `mcp_config` is set. opencode
+/// reads this env var as inline config content (no file written) — mirrors
+/// multica's opencode MCP injection. When `mcp_config` is absent or
+/// translates to nothing, the env is returned unchanged.
+fn env_with_mcp(
+    mut env: HashMap<String, String>,
+    mcp_config: Option<&str>,
+) -> HashMap<String, String> {
+    if let Some(raw) = mcp_config {
+        if let Some(content) = translate_mcp_for_opencode(raw) {
+            env.insert("OPENCODE_CONFIG_CONTENT".into(), content);
+        }
+    }
+    env
+}
+
 /// Parse one opencode json event line into a [`Message`].
 ///
 /// Mapping (per multica opencode.go's event vocabulary):
@@ -404,7 +490,12 @@ impl Backend for OpencodeBackend {
             .ok_or_else(|| BackendError::Exec("opencode not found".into()))?;
 
         let args = build_args(&opts);
-        let mut child = exec::spawn(exe_path, args, self.cfg.env.clone(), opts.cwd.clone())
+        // Inject the agent's MCP config (translated to opencode's native
+        // shape) via OPENCODE_CONFIG_CONTENT — opencode reads this env var
+        // as inline config content. Without this opencode agents never see
+        // configured MCP servers (opts.mcp_config was previously dropped).
+        let env = env_with_mcp(self.cfg.env.clone(), opts.mcp_config.as_deref());
+        let mut child = exec::spawn(exe_path, args, env, opts.cwd.clone())
             .map_err(|e| BackendError::Exec(format!("spawn opencode: {e}")))?;
 
         let mut stdin = child
@@ -457,6 +548,7 @@ impl Backend for OpencodeBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::path::PathBuf;
 
     /// Absolute path to the committed fixture (one real-shape opencode json
@@ -752,6 +844,62 @@ mod tests {
             build_args(&opts),
             vec!["run", "--format", "json", "--auto", "--model", "aliyun/glm-5.2", "--session", "ses_abc"]
         );
+    }
+
+    // ── MCP translation (Claude-style → opencode-native) ──
+
+    #[test]
+    fn translate_mcp_for_opencode_stdio_merges_command_and_args() {
+        let raw = r#"{"mcpServers":{"todos":{"command":"npx","args":["-y","todo-mcp"],"env":{"K":"v"}}}}"#;
+        let out = translate_mcp_for_opencode(raw).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let entry = &v["mcp"]["todos"];
+        assert_eq!(entry["type"], "local");
+        // command (string) + args (array) folded into a single command array.
+        assert_eq!(entry["command"], json!(["npx", "-y", "todo-mcp"]));
+        // env → environment (opencode's key).
+        assert_eq!(entry["environment"]["K"], "v");
+    }
+
+    #[test]
+    fn translate_mcp_for_opencode_http_becomes_remote() {
+        let raw = r#"{"mcpServers":{"docs":{"type":"http","url":"https://x.test/mcp","headers":{"A":"b"}}}}"#;
+        let out = translate_mcp_for_opencode(raw).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let entry = &v["mcp"]["docs"];
+        assert_eq!(entry["type"], "remote");
+        assert_eq!(entry["url"], "https://x.test/mcp");
+        assert_eq!(entry["headers"]["A"], "b");
+    }
+
+    #[test]
+    fn translate_mcp_for_opencode_none_when_empty_or_invalid() {
+        assert!(translate_mcp_for_opencode("").is_none());
+        assert!(translate_mcp_for_opencode("not json").is_none());
+        assert!(translate_mcp_for_opencode(r#"{"mcpServers":{}}"#).is_none());
+        // Missing mcpServers wrapper → None.
+        assert!(translate_mcp_for_opencode(r#"{"foo":"bar"}"#).is_none());
+    }
+
+    #[test]
+    fn env_with_mcp_injects_config_content() {
+        let mut base = HashMap::new();
+        base.insert("FOO".into(), "bar".into());
+        let raw = r#"{"mcpServers":{"todos":{"command":"x","args":[]}}}"#;
+        let env = env_with_mcp(base, Some(raw));
+        // Existing env preserved.
+        assert_eq!(env.get("FOO").map(|s| s.as_str()), Some("bar"));
+        // MCP config injected under the env var opencode reads.
+        let content = env.get("OPENCODE_CONFIG_CONTENT").expect("env injected");
+        let v: Value = serde_json::from_str(content).unwrap();
+        assert!(v["mcp"]["todos"].is_object());
+    }
+
+    #[test]
+    fn env_with_mcp_no_inject_when_absent() {
+        let base: HashMap<String, String> = HashMap::new();
+        let env = env_with_mcp(base, None);
+        assert!(!env.contains_key("OPENCODE_CONFIG_CONTENT"));
     }
 
     // -- extract_session_id --
